@@ -1,0 +1,33 @@
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 密钥与本地配置：绝不能进镜像
+.env
+.env.local
+.tok
+*.pem
+*.key
+
+# 运行时数据（由 compose 挂载卷提供）
+storage/
+logs/
+*.log
+
+# 开发/测试残留
+testfiles/
+requirements.txt
+Dockerfile
+.dockerignore
+README.md
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

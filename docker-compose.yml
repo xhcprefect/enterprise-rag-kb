@@ -1,0 +1,105 @@
+# 生产部署编排：db + api + worker + web，一条命令拉起。
+#
+# 数据全部落在宿主机 ${DATA_DIR}（默认 ./data）下，便于：
+#   1. 挂到独立数据盘 —— 机器若被回收，换台机器把目录拷过去即可恢复；
+#   2. 备份脚本直接按目录打包，不用进容器。
+#
+# 首次部署：
+#   cp backend/.env.example backend/.env    # 填写密钥，改 JWT_SECRET / ADMIN_PASSWORD
+#   ./deploy/init.sh                        # 建数据目录、检查配置
+#   docker compose up -d --build
+
+name: rag-kb
+
+services:
+  db:
+    image: pgvector/pgvector:pg18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在根目录 .env 里设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+      # 显式固定数据目录：pg18 镜像默认是 /var/lib/postgresql/18/docker，
+      # 这个路径带大版本号，写死会在升级镜像时悄悄换到新目录，导致"数据不见了"。
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - ${DATA_DIR:-./data}/pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # 用 pg_isready 而不是 psql：镜像里一定有它，且不依赖库名
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ragdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # 不对外暴露端口：只有 compose 网络内的 api/worker 需要访问
+    expose:
+      - "5432"
+    networks: [internal]
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      # 覆盖 .env 里面向本机开发的连接串与相对路径
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
+      UPLOAD_DIR: /data/uploads
+      LOG_DIR: /data/logs
+    volumes:
+      # 必须与 worker 共用同一个上传目录：worker 要读取 api 落盘的文件，
+      # 分片上传的 os.replace 也要求两边看到同一个文件系统
+      - ${DATA_DIR:-./data}/uploads:/data/uploads
+      - ${DATA_DIR:-./data}/logs:/data/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks: [internal]
+
+  worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ["python", "worker.py"]
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
+      UPLOAD_DIR: /data/uploads
+      LOG_DIR: /data/logs
+    volumes:
+      - ${DATA_DIR:-./data}/uploads:/data/uploads
+      - ${DATA_DIR:-./data}/logs:/data/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      # 等 API 起来再启动：API 负责建初始管理员，worker 只建表。
+      # 让 worker 先起会抢建 admin，导致 .env 里的 ADMIN_PASSWORD 不生效。
+      api:
+        condition: service_healthy
+    # 可按需多开做并发消费（领取任务用 FOR UPDATE SKIP LOCKED）。
+    # 注意：日志用 RotatingFileHandler 写同一个 app.log，多副本时切割会互相干扰，
+    # 若要 scale，先把 LOG_DIR 指到各副本独立的目录或改成只输出 stdout。
+    networks: [internal]
+
+  web:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-80}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
