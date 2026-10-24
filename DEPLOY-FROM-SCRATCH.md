@@ -311,11 +311,34 @@ grep '^POSTGRES_PASSWORD=' .env
 > **用 `sed` 而不是 `nano`**：交互式编辑器在慢速 SSH 下容易产生控制字符，
 > 曾出现过文件开头被写入乱码导致 `unexpected character` 的情况。改配置优先 `sed`。
 
-`DATA_DIR` 建议指向独立数据盘（若有）：
+#### `DATA_DIR`：默认别动
+
+**单块系统盘的机器保持 `./data` 就好**，不要改成 `/data/...`。
+`/data` 在根分区下、属于 root，`init.sh` 里的 `mkdir` 会直接
+`Permission denied`。
+
+确认是否挂了独立数据盘：
 
 ```bash
+lsblk                              # 除了系统盘是否还有一块
+df -h | grep -E '/data|/mnt'       # 独立盘通常已挂在 /data 或 /mnt
+```
+
+- **没有独立盘** → 保持 `DATA_DIR=./data`，什么都不用做。
+- **有独立盘且要用**：
+
+```bash
+sudo mkdir -p /data/rag-kb
+sudo chown -R ubuntu:ubuntu /data/rag-kb     # 这步不能省
 sed -i 's|^DATA_DIR=.*|DATA_DIR=/data/rag-kb|' .env
 ```
+
+> 为什么要 `chown`：容器内的进程以 **uid 1000** 运行。`init.sh` 会自动
+> `chown 1000:1000` 上传与日志目录，但**只在以 root 身份运行时**才做。
+> 你以 `ubuntu` 跑脚本时这一步被跳过；而 root 建出来的 `/data` 属主是 root，
+> uid 1000 写不进去。后果是「文档记录能创建、上传却失败」，比 mkdir 报错难查得多。
+>
+> Ubuntu 云镜像的 `ubuntu` 用户 uid 通常就是 1000，所以 `./data` 天然正确。
 
 （本文后续命令假设使用默认 `./data`，若改成绝对路径，备份/恢复脚本会自动跟随。）
 
@@ -800,6 +823,8 @@ docker compose up -d --build
 | 构建卡在 `apt-get update` 数分钟 | apt 镜像未生效 | `docker compose build --build-arg APT_MIRROR=mirrors.cloud.tencent.com api` |
 | `npm ci` 报 `can only install with an existing package-lock.json` | Dockerfile 缺 `COPY package.json package-lock.json ./` | 拉最新代码，仓库已修复 |
 | `./deploy/init.sh` 报 `Permission denied` | 执行位丢失 | `chmod +x deploy/*.sh` |
+| `init.sh` 输出多行 `mkdir: Permission denied` | `DATA_DIR` 指向了无写权限的路径（如 `/data`，属 root） | 改回 `DATA_DIR=./data`，或 `sudo chown -R ubuntu:ubuntu /data/rag-kb` |
+| 上传成功但文档 `failed`，日志提示写入失败 | `DATA_DIR` 属主不是 uid 1000 | `sudo chown -R 1000:1000 <DATA_DIR>/{uploads,logs}` |
 | 数据量大后问答明显变慢 | 没有向量索引，走全表扫描 | 见 [§12.4](#124-向量索引默认没有需要手工补) |
 | `init.sh` 报 `JWT_SECRET 仍是占位值` | 根 `.env` 未改 | 见 [§5.2](#52-backendenv应用配置)，两处都要改 |
 | `failed to read backend/.env: unexpected character` | 文件被编辑器写入控制字符 | `cp .env.bak .env` 恢复，改用 `sed` 修改 |
