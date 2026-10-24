@@ -156,9 +156,21 @@ docker compose logs -f api        # 看启动日志
 
 1. 登录成功，能进问答页
 2. 新建知识库 → 上传一个 txt → 状态从 `pending` → `processing` → `ready`
-3. 针对该文档提问，能返回答案并带 `[1]` 引用
-4. `curl http://localhost/health` 里 `worker` 不是 `stale`
-5. 重启后数据还在（见下节）
+3. **建 HNSW 索引**（见下方说明，漏了不报错，只是检索会退化成全表扫描）
+4. 针对该文档提问，能返回答案并带 `[1]` 引用
+5. `curl http://localhost/health` 里 `worker` 不是 `stale`
+6. 重启后数据还在（见下节）
+
+> **第 3 步不能省**：入库表由 `langchain-postgres` 自己建，`init_db()` 不管它，
+> 所以新库、老库都要手工跑一次。**第一个文档入库之后**执行：
+>
+> ```bash
+> docker compose exec api python -m scripts.migrate_vector_index --dry-run   # 只看
+> docker compose exec api python -m scripts.migrate_vector_index             # 执行
+> ```
+>
+> 数据量小的时候建不建都一样快，等文档多了才发现是全表扫描，排查成本高。
+> 索引用 `CREATE INDEX CONCURRENTLY` 建，不阻塞读写；重复执行是幂等的。
 
 ## 数据与备份
 
@@ -297,6 +309,7 @@ docker compose up -d --scale worker=2
 | 问答报鉴权失败 | `backend/.env` 的 `*_API_KEY` 失效或余额不足，错误信息里会带服务商域名 |
 | 页面 404 | 检查 Nginx 的 SPA fallback；或访问路径不在路由表内 |
 | 上传卡住 | `client_max_body_size`、磁盘空间；`docker compose logs api` |
+| 文档一多，问答明显变慢 | 大概率是缺 HNSW 索引，检索在走全表扫描：见下方检查命令，缺了就跑 `migrate_vector_index` |
 
 ### 常用检查命令
 
@@ -309,9 +322,15 @@ docker compose exec db psql -U postgres -d ragdb \
 docker compose exec db psql -U postgres -d ragdb \
   -c "select status, count(*) from documents group by 1"
 
-# 确认 HNSW 索引存在
+# 确认 HNSW 索引存在（没有输出 = 缺索引，跑 migrate_vector_index 补建）
 docker compose exec db psql -U postgres -d ragdb \
   -c "\di ix_langchain_pg_embedding_hnsw"
+
+# 确认检索确实走了索引（要看到 Index Scan using ix_langchain_pg_embedding_hnsw）
+docker compose exec db psql -U postgres -d ragdb -c \
+  "set enable_seqscan=off;
+   explain (costs off) select id from langchain_pg_embedding
+   order by embedding <=> (select embedding from langchain_pg_embedding limit 1) limit 6;"
 ```
 
 ## HTTPS
@@ -343,4 +362,6 @@ docker compose exec db psql -U postgres -d ragdb \
   （瓶颈在云端 API 延迟），需要时再调。
 - **向量维度假定为 1024**（`vector_store.py` 的 `EMBEDDING_DIM`）。
   换成其他维度的向量模型时必须重建索引，否则写入会因类型不匹配失败。
+- **HNSW 索引不在 `init_db()` 里**：入库表由 `langchain-postgres` 自建，应用不管它的结构，
+  索引要手工跑 `scripts/migrate_vector_index`（新库上线验收清单第 3 条）。
 - **备份不含 Docker 镜像**，回滚依赖重新 `build`。
