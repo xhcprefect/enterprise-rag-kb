@@ -14,8 +14,12 @@ from app.services.cloud_models import get_cloud_embeddings
 logger = logging.getLogger(__name__)
 
 # 向量维度必须显式声明，否则 langchain-postgres 会把列建成无维度的 ``vector``，
-# 而 pgvector 不允许给无维度列建 HNSW/IVFFlat 索引（检索退化为全表顺序扫描）。
+# 而 pgvector 不允许给无维度列建 HNSW/IVFFlat 索引。
 # bge-m3（云端与本地）都是 1024 维。
+#
+# 注意：embedding_length 只决定列类型是 vector(1024) 还是 vector，
+# langchain-postgres 0.0.19 的 PGVector 不会自己建索引——它只建表与集合。
+# 索引需要跑 scripts/migrate_vector_index.py 手工补，否则检索走全表顺序扫描。
 EMBEDDING_DIM = 1024
 
 

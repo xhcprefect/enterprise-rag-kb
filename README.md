@@ -218,7 +218,11 @@ npm run dev
 
 ## 生产部署
 
-见 [DEPLOY.md](DEPLOY.md)。一条命令拉起全部组件：
+- **从零开始**（买服务器 → 配安全组 → 装 Docker → 上线验收）：
+  [DEPLOY-FROM-SCRATCH.md](DEPLOY-FROM-SCRATCH.md)
+- **已有服务器、只想更新代码**：[DEPLOY.md](DEPLOY.md)
+
+一条命令拉起全部组件：
 
 ```bash
 cp .env.example .env && cp backend/.env.example backend/.env   # 填密钥
