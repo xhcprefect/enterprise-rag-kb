@@ -11,8 +11,15 @@ from sqlalchemy.orm import Session as DBSession
 
 from app.api.deps import get_current_user, write_audit
 from app.db.session import SessionLocal, get_db
-from app.models import Conversation, KnowledgeBase, Message, User
-from app.schemas.chat import ChatRequest, ConversationDetail, ConversationRead
+from app.models import (
+    CONVERSATION_MODE_CHAT,
+    CONVERSATION_MODE_RAG,
+    Conversation,
+    KnowledgeBase,
+    Message,
+    User,
+)
+from app.schemas.chat import ChatMode, ChatRequest, ConversationDetail, ConversationRead
 from app.schemas.common import ApiResponse
 from app.services import rag
 
@@ -45,12 +52,15 @@ def _get_kb(db: DBSession, kb_id: uuid.UUID, user: User) -> KnowledgeBase:
 )
 def list_conversations(
     kb_id: uuid.UUID | None = None,
+    mode: ChatMode | None = None,
     db: DBSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     stmt = select(Conversation).where(Conversation.user_id == user.id)
     if kb_id:
         stmt = stmt.where(Conversation.kb_id == kb_id)
+    if mode:
+        stmt = stmt.where(Conversation.mode == mode)
     rows = db.scalars(stmt.order_by(Conversation.updated_at.desc()).limit(100)).all()
     return ApiResponse(data=[ConversationRead.model_validate(r) for r in rows])
 
@@ -91,14 +101,41 @@ def chat_stream(
     db: DBSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    kb = _get_kb(db, payload.kb_id, user)
-
-    # 准备/创建会话
+    # 模式与会话绑定：续聊一律以会话已存的模式为准，请求体的 mode 只在新建时生效。
+    # 否则把 RAG 会话当普通对话续写（或反过来），历史会与生成方式错配。
     if payload.conversation_id:
         conv = _get_conversation(db, payload.conversation_id, user)
+        mode = conv.mode
+        if mode == CONVERSATION_MODE_RAG:
+            if conv.kb_id is None:
+                raise HTTPException(status_code=409, detail="该会话缺少知识库，无法继续")
+            # 以会话上的知识库为准，顺带堵住"用 A 库会话检索 B 库"的口子
+            if payload.kb_id and payload.kb_id != conv.kb_id:
+                raise HTTPException(status_code=400, detail="会话与知识库不匹配")
+            kb = _get_kb(db, conv.kb_id, user)
+        else:
+            kb = None
+            if payload.kb_id:
+                logger.warning("普通对话会话收到 kb_id，已忽略: conv=%s", conv.id)
     else:
+        mode = payload.mode
+        if mode == CONVERSATION_MODE_RAG:
+            if payload.kb_id is None:
+                raise HTTPException(status_code=400, detail="知识库问答需要指定知识库")
+            kb = _get_kb(db, payload.kb_id, user)
+        else:
+            # 前端切模式后可能仍带着旧 kbId，静默忽略而不是报错打断用户
+            kb = None
+            if payload.kb_id:
+                logger.warning("新建普通对话收到 kb_id，已忽略")
+
         title = payload.question.strip()[:30] or "新会话"
-        conv = Conversation(user_id=user.id, kb_id=kb.id, title=title)
+        conv = Conversation(
+            user_id=user.id,
+            kb_id=kb.id if kb else None,
+            mode=mode,
+            title=title,
+        )
         db.add(conv)
         db.commit()
         db.refresh(conv)
@@ -116,40 +153,48 @@ def chat_stream(
     db.commit()
 
     conv_id = str(conv.id)
-    collection = kb.collection_name
+    collection = kb.collection_name if kb else None
+    kb_name = kb.name if kb else "普通对话"
+    kb_id_str = str(kb.id) if kb else None
     question = payload.question
     top_k = payload.top_k
     user_id = user.id
+
+    scope = f"kb={collection}" if collection else f"mode={mode}"
 
     def event_stream() -> Iterator[str]:
         started = time.perf_counter()
         answer_parts: list[str] = []
         citations: list[dict] = []
+        docs: list = []
         retrieve_ms = 0.0
         llm_ms = 0.0
 
         try:
-            t_retrieve = time.perf_counter()
-            docs = rag.retrieve(collection, question, top_k)
-            retrieve_ms = (time.perf_counter() - t_retrieve) * 1000
-            citations = rag.to_citations(docs)
-            logger.info(
-                "问答检索: kb=%s user=%s top_k=%d 命中 %d 条 (%.0fms) 问题=%r",
-                collection, user.username, top_k, len(docs), retrieve_ms, question[:60],
-            )
-            if not docs:
-                logger.warning("问答未检索到任何资料: kb=%s 问题=%r", collection, question[:60])
+            # 普通对话不做检索：省掉一次向量化与一次 pgvector 查询
+            if mode == CONVERSATION_MODE_RAG:
+                t_retrieve = time.perf_counter()
+                docs = rag.retrieve(collection, question, top_k)
+                retrieve_ms = (time.perf_counter() - t_retrieve) * 1000
+                citations = rag.to_citations(docs)
+                logger.info(
+                    "问答检索: %s user=%s top_k=%d 命中 %d 条 (%.0fms) 问题=%r",
+                    scope, user.username, top_k, len(docs), retrieve_ms, question[:60],
+                )
+                if not docs:
+                    logger.warning("问答未检索到任何资料: %s 问题=%r", scope, question[:60])
 
             yield _sse(
                 "meta",
                 {
                     "conversation_id": conv_id,
                     "citations": citations,
+                    "mode": mode,
                 },
             )
 
             t_llm = time.perf_counter()
-            for token in rag.answer_stream(question, docs, history):
+            for token in rag.answer_stream(question, docs, history, mode=mode):
                 answer_parts.append(token)
                 yield _sse("delta", {"content": token})
             llm_ms = (time.perf_counter() - t_llm) * 1000
@@ -157,47 +202,44 @@ def chat_stream(
             answer = "".join(answer_parts).strip() or "抱歉，未能生成回答。"
             latency = int((time.perf_counter() - started) * 1000)
             logger.info(
-                "问答完成: kb=%s user=%s conv=%s 检索 %.0fms + 生成 %.0fms = %.1fs "
+                "问答完成: %s user=%s conv=%s 检索 %.0fms + 生成 %.0fms = %.1fs "
                 "引用 %d 条 答案 %d 字",
-                collection, user.username, conv_id, retrieve_ms, llm_ms,
+                scope, user.username, conv_id, retrieve_ms, llm_ms,
                 latency / 1000, len(citations), len(answer),
             )
             if not answer_parts:
                 logger.warning(
-                    "模型未返回任何内容: kb=%s 问题=%r 检索条数=%d",
-                    collection, question[:60], len(docs),
+                    "模型未返回任何内容: %s 问题=%r 检索条数=%d",
+                    scope, question[:60], len(docs),
                 )
 
             # 用独立会话落库，避免流式期间请求会话已关闭
             session: DBSession = SessionLocal()
             try:
                 db_user = session.get(User, user_id)
+                detail = {"mode": mode, "conversation_id": conv_id}
+                if kb_id_str:
+                    detail["kb_id"] = kb_id_str
                 session.add(
                     Message(
                         conversation_id=uuid.UUID(conv_id),
                         role="assistant",
                         content=answer,
-                        citations=citations,
+                        # 普通对话存 NULL 而不是 []：语义是"本来就没有引用"
+                        citations=citations or None,
                         latency_ms=latency,
                     )
                 )
                 session.commit()
-                write_audit(
-                    session,
-                    request,
-                    db_user,
-                    "chat_query",
-                    kb.name,
-                    {"kb_id": str(kb.id), "conversation_id": conv_id},
-                )
+                write_audit(session, request, db_user, "chat_query", kb_name, detail)
             finally:
                 session.close()
 
             yield _sse("done", {"latency_ms": latency})
         except Exception as exc:  # noqa: BLE001 - 流内异常需回传给前端
             logger.exception(
-                "问答失败: kb=%s user=%s 问题=%r 已生成 %d 字",
-                collection, user.username, question[:60], sum(len(p) for p in answer_parts),
+                "问答失败: %s user=%s 问题=%r 已生成 %d 字",
+                scope, user.username, question[:60], sum(len(p) for p in answer_parts),
             )
             yield _sse("error", {"message": str(exc)[:500]})
 

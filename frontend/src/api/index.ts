@@ -53,9 +53,14 @@ export interface MessageItem {
   created_at: string
 }
 
+/** 会话模式：按会话固定，续聊时由后端以会话已存的值为准。 */
+export type ChatMode = 'rag' | 'chat'
+
 export interface Conversation {
   id: string
-  kb_id: string
+  /** 普通对话（mode=chat）没有知识库 */
+  kb_id: string | null
+  mode: ChatMode
   title: string
   created_at: string
   updated_at: string
@@ -167,8 +172,11 @@ export const docApi = {
 
 // ---------- 问答 ----------
 export const chatApi = {
-  conversations: (kbId?: string) =>
-    client.get<Conversation[]>('/chat/conversations', { params: { kb_id: kbId } }),
+  /** kbId 与 mode 都可选：普通对话只传 mode，RAG 两个都传。 */
+  conversations: (params?: { kbId?: string; mode?: ChatMode }) =>
+    client.get<Conversation[]>('/chat/conversations', {
+      params: { kb_id: params?.kbId, mode: params?.mode }
+    }),
   conversation: (id: string) => client.get<ConversationDetail>(`/chat/conversations/${id}`),
   removeConversation: (id: string) => client.delete(`/chat/conversations/${id}`)
 }
@@ -177,9 +185,17 @@ export const chatApi = {
  * SSE 流式问答。fetch 无法使用 axios 拦截器，这里手动带 token。
  */
 export async function streamChat(
-  payload: { kb_id: string; question: string; conversation_id?: string | null; top_k?: number },
+  payload: {
+    /** 普通对话不传 */
+    kb_id?: string
+    question: string
+    conversation_id?: string | null
+    top_k?: number
+    /** 只在新建会话时生效，续聊以会话已存的模式为准 */
+    mode?: ChatMode
+  },
   handlers: {
-    onMeta?: (data: { conversation_id: string; citations: Citation[] }) => void
+    onMeta?: (data: { conversation_id: string; citations: Citation[]; mode?: ChatMode }) => void
     onDelta?: (text: string) => void
     onDone?: (data: { latency_ms: number }) => void
     onError?: (message: string) => void

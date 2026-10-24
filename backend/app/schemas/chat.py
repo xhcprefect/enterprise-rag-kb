@@ -1,14 +1,20 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+ChatMode = Literal["rag", "chat"]
+
 
 class ChatRequest(BaseModel):
-    kb_id: uuid.UUID
+    # 普通对话（mode=chat）不需要知识库
+    kb_id: uuid.UUID | None = None
     question: str = Field(min_length=1, max_length=4000)
     conversation_id: uuid.UUID | None = None
     top_k: int = Field(default=6, ge=1, le=20)
+    # 仅在新建会话时生效；续聊以会话里已存的模式为准
+    mode: ChatMode = "rag"
 
 
 class Citation(BaseModel):
@@ -32,7 +38,8 @@ class MessageRead(BaseModel):
 
 class ConversationRead(BaseModel):
     id: uuid.UUID
-    kb_id: uuid.UUID
+    kb_id: uuid.UUID | None = None
+    mode: str = "rag"
     title: str
     created_at: datetime
     updated_at: datetime

@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     RETRIEVAL_TOP_K: int = 6
     # 单份文档最多占几条检索结果：长文档的分块彼此相似，不封顶会挤掉其他资料来源
     RETRIEVAL_MAX_PER_DOC: int = 3
+    # 多轮记忆：最多带多少轮历史（user + assistant 各算一条，所以实际条数是 2 倍）
+    HISTORY_MAX_TURNS: int = 10
+    # 历史总字符预算。超出时从最新往回保留，丢掉最早的，防止上下文过长拖慢或撑爆请求
+    HISTORY_MAX_CHARS: int = 8000
     MAX_UPLOAD_MB: int = 50
     UPLOAD_DIR: str = "storage/uploads"
 

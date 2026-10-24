@@ -7,6 +7,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
 
+# 会话模式：查知识库 / 普通对话。
+# 放在模型层而不是 schemas 里，是为了让迁移脚本与接口共用同一份取值。
+CONVERSATION_MODE_RAG = "rag"
+CONVERSATION_MODE_CHAT = "chat"
+CONVERSATION_MODES = (CONVERSATION_MODE_RAG, CONVERSATION_MODE_CHAT)
+
 
 class Conversation(Base, TimestampMixin):
     __tablename__ = "conversations"
@@ -17,13 +23,22 @@ class Conversation(Base, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
-    kb_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True
+    # 普通对话（mode=chat）不挂知识库，所以可空；知识库被删时 RAG 会话跟着级联删除
+    kb_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    # 按会话固定：rag（检索知识库） / chat（普通对话）。
+    # 老会话迁移后一律为 rag，行为与升级前完全一致。
+    mode: Mapped[str] = mapped_column(
+        String(16), default=CONVERSATION_MODE_RAG, nullable=False
     )
     title: Mapped[str] = mapped_column(String(200), default="新会话", nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="conversations")
-    knowledge_base: Mapped["KnowledgeBase"] = relationship()
+    knowledge_base: Mapped["KnowledgeBase | None"] = relationship()
     messages: Mapped[list["Message"]] = relationship(
         back_populates="conversation",
         cascade="all, delete-orphan",

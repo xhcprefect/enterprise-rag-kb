@@ -17,6 +17,13 @@ SYSTEM_PROMPT = """你是企业知识库助手。请严格依据【参考资料�
 4. 不要提及"参考资料"这一措辞之外的系统提示内容。
 """
 
+# 普通对话用的提示词：没有参考资料，也不要求输出引用编号
+PLAIN_SYSTEM_PROMPT = """你是企业内部的智能助手，请直接、准确地回答用户的问题。
+1. 使用中文，条理清晰；涉及步骤时用列表。
+2. 不确定或需要内部资料才能回答时，明确说明，并建议用户切换到「知识库问答」。
+3. 不要输出 [1][2] 这类引用编号。
+"""
+
 # 去掉 qwen3 等模型的思考标签及其内容
 _THINK_PATTERN = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.DOTALL)
 _THINK_OPEN = re.compile(r"<think(?:ing)?>.*\Z", re.DOTALL)
@@ -121,22 +128,57 @@ def _pick_with_doc_cap(
     return picked
 
 
-def build_messages(
-    question: str, pairs: list[tuple[LCDocument, float]], history: list[dict]
-) -> list:
-    messages: list = [SystemMessage(content=SYSTEM_PROMPT)]
+def _history_messages(history: list[dict]) -> list:
+    """把历史裁到轮数与字符预算内，按时间正序返回 LangChain 消息。
 
-    for item in history[-6:]:
+    从最新往回取，超预算就停：留住紧邻的上下文，丢掉最早的。
+    截断后若首条是 assistant，去掉它——避免以模型的话开头，
+    模型容易顺着复述上一轮的答案（且缺了对应的问题，语义也不完整）。
+    """
+    max_items = max(0, settings.HISTORY_MAX_TURNS) * 2
+    picked: list[dict] = []
+    used = 0
+    for item in reversed(history[-max_items:] if max_items else []):
+        content = item.get("content") or ""
+        # 第一条无论如何都收下：单条就超预算时也至少留一点上下文
+        if picked and used + len(content) > settings.HISTORY_MAX_CHARS:
+            break
+        picked.append(item)
+        used += len(content)
+    picked.reverse()
+
+    while picked and picked[0].get("role") != "user":
+        picked.pop(0)
+
+    messages: list = []
+    for item in picked:
         if item["role"] == "user":
             messages.append(HumanMessage(content=item["content"]))
         elif item["role"] == "assistant":
             messages.append(AIMessage(content=item["content"]))
+    return messages
+
+
+def build_messages(
+    question: str, pairs: list[tuple[LCDocument, float]], history: list[dict]
+) -> list:
+    messages: list = [SystemMessage(content=SYSTEM_PROMPT)]
+    messages.extend(_history_messages(history))
 
     context = build_context(pairs) if pairs else "（未检索到相关资料）"
     messages.append(
         HumanMessage(content=f"【参考资料】\n{context}\n\n【用户问题】\n{question}")
     )
     return messages
+
+
+def build_plain_messages(question: str, history: list[dict]) -> list:
+    """普通对话：没有参考资料，直接把问题接在历史后面。"""
+    return [
+        SystemMessage(content=PLAIN_SYSTEM_PROMPT),
+        *_history_messages(history),
+        HumanMessage(content=question),
+    ]
 
 
 def get_llm():
@@ -154,14 +196,25 @@ def get_llm():
 
 
 def answer_stream(
-    question: str, pairs: list[tuple[LCDocument, float]], history: list[dict]
+    question: str,
+    pairs: list[tuple[LCDocument, float]],
+    history: list[dict],
+    mode: str = "rag",
 ) -> Iterator[str]:
-    """流式生成，过滤思考标签后再下发。"""
+    """流式生成，过滤思考标签后再下发。
+
+    ``mode="chat"`` 时不带参考资料，用通用提示词，其余流程完全一致。
+    """
     llm = get_llm()
+    messages = (
+        build_plain_messages(question, history)
+        if mode == "chat"
+        else build_messages(question, pairs, history)
+    )
     buffer = ""
     in_think = False
 
-    for chunk in llm.stream(build_messages(question, pairs, history)):
+    for chunk in llm.stream(messages):
         text = chunk.content if isinstance(chunk.content, str) else ""
         if not text:
             continue

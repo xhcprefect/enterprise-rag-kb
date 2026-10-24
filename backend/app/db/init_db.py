@@ -13,11 +13,18 @@ logger = logging.getLogger(__name__)
 
 # 轻量迁移：``create_all`` 只会建缺失的表，不会给已存在的表补列，
 # 所以这些列要单独 ALTER。表还不存在时跳过（新库交给 create_all）。
-_ADDED_COLUMNS: dict[str, str] = {
-    "progress": "INTEGER NOT NULL DEFAULT 0",
-    "cancel_requested": "BOOLEAN NOT NULL DEFAULT FALSE",
-    "heartbeat_at": "TIMESTAMPTZ",
-    "parse_done": "BOOLEAN NOT NULL DEFAULT FALSE",
+# 按表分组，新增表直接往里加一项即可。
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "documents": {
+        "progress": "INTEGER NOT NULL DEFAULT 0",
+        "cancel_requested": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "heartbeat_at": "TIMESTAMPTZ",
+        "parse_done": "BOOLEAN NOT NULL DEFAULT FALSE",
+    },
+    "conversations": {
+        # 普通对话模式新增；老会话默认按知识库问答解释，行为与升级前一致
+        "mode": "VARCHAR(16) NOT NULL DEFAULT 'rag'",
+    },
 }
 
 
@@ -49,21 +56,29 @@ def init_db(create_admin: bool = True) -> None:
         _create_all(conn)
 
         table_names = set(inspect(conn).get_table_names())
-        if "documents" in table_names:
-            cols = {
+        for table, columns in _ADDED_COLUMNS.items():
+            if table not in table_names:
+                continue
+            existing = {
                 row[0]
                 for row in conn.execute(
                     text(
                         "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_name = 'documents'"
-                    )
+                        "WHERE table_schema = current_schema() AND table_name = :t"
+                    ),
+                    {"t": table},
                 )
             }
-            for name, ddl in _ADDED_COLUMNS.items():
-                if name not in cols:
-                    conn.execute(
-                        text(f"ALTER TABLE documents ADD COLUMN {name} {ddl}")
-                    )
+            for name, ddl in columns.items():
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+        # conversations.kb_id 原来非空（会话必须挂知识库）。普通对话没有知识库，
+        # 需要放开。已是可空时这条是空操作，可重复执行。
+        if "conversations" in table_names:
+            conn.execute(
+                text("ALTER TABLE conversations ALTER COLUMN kb_id DROP NOT NULL")
+            )
 
         # upload_sessions.document_id 是"合并认领标记"，Document 行晚于它创建，不能带外键
         if "upload_sessions" in table_names:
