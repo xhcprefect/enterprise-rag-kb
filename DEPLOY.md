@@ -47,9 +47,12 @@ sudo timedatectl set-timezone Asia/Shanghai
 ### 2. 拉取代码
 
 ```bash
-git clone <仓库地址> enterprise-rag-kb
+git clone https://github.com/xhcprefect/enterprise-rag-kb.git enterprise-rag-kb
 cd enterprise-rag-kb
 ```
+
+仓库里的 `deploy/*.sh` 已带执行位（`100755`）。若从压缩包或其他方式取得代码后
+`./deploy/init.sh` 报 `Permission denied`，补一句 `chmod +x deploy/*.sh`。
 
 ### 3. 写配置
 
@@ -218,12 +221,39 @@ tail -f data/logs/app.log         # 落盘的滚动日志
 ### 更新代码
 
 ```bash
+./deploy/backup.sh                # 本次有数据库结构变更时才需要
 git pull
-docker compose build
-docker compose up -d              # 只重建有变化的容器
+docker compose up -d --build      # 只重建有变化的容器
 ```
 
+`git pull` **不会**碰 `.env`、`backend/.env` 和 `data/`——它们在 `.gitignore` 里，
+既不被跟踪也不会被覆盖。生产配置只存在于服务器上，这是有意的。
+
 数据库结构变更由启动时的 `init_db()` 自动处理，不需要手动迁移。
+
+> `init_db()` 只会**新增**列/表。改字段类型、删列、改默认值它都做不到，而且不会报错，
+> 只会表现为"配置改了但行为没变"。涉及这类变更要手工写 SQL。
+
+#### 服务器首次接入 git
+
+若代码是早先用压缩包传上去的（目录里没有 `.git`），不需要重新克隆，
+在现有目录里接入即可，配置和数据都会原地保留：
+
+```bash
+cd ~/enterprise-rag-kb
+cp .env .env.bak && cp backend/.env backend/.env.bak   # 保险
+git init
+git remote add origin https://github.com/xhcprefect/enterprise-rag-kb.git
+git fetch origin
+git reset --hard origin/main
+
+# 确认配置还在，三行都要有输出
+grep -E '^POSTGRES_PASSWORD=' .env
+grep -E '^(JWT_SECRET|ADMIN_PASSWORD)=' backend/.env
+ls -d data/pgdata
+```
+
+`reset --hard` 只覆盖被跟踪的文件，`.gitignore` 里的 `.env` 与 `data/` 不受影响。
 
 ### 回滚
 
