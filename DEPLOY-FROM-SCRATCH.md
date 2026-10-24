@@ -321,12 +321,15 @@ sed -i 's|^DATA_DIR=.*|DATA_DIR=/data/rag-kb|' .env
 
 ### 5.2 `backend/.env`（应用配置）
 
-需要改四项：
+需要改四项。**在同一个 shell 里连续执行**——`$JWT` 是 shell 变量，
+断开 SSH 或换窗口就没了，此时 `sed` 会把值写成空字符串，效果等同没填：
 
 ```bash
-# ① JWT 密钥（64 字符随机串）
+cd ~/enterprise-rag-kb        # 注意：sed 用的是相对路径，必须在项目根目录
+
+# ① JWT 密钥（64 字符随机串），两处一起写
 JWT=$(python3 -c "import secrets;print(secrets.token_urlsafe(48))")
-sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${JWT}|" backend/.env
+sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${JWT}|" .env backend/.env
 
 # ② 管理员密码
 sed -i "s|^ADMIN_PASSWORD=.*|ADMIN_PASSWORD=你的强密码|" backend/.env
@@ -336,13 +339,24 @@ sed -i "s|^EMBEDDING_API_KEY=.*|EMBEDDING_API_KEY=sk-你的硅基流动Key|" bac
 
 # ④ 对话模型 Key
 sed -i "s|^LLM_API_KEY=.*|LLM_API_KEY=sk-你的对话服务Key|" backend/.env
+
+unset JWT
 ```
 
-同时把根 `.env` 的 `JWT_SECRET` 也设成同一个值（`deploy/init.sh` 会检查两处）：
+写完后**立刻验证**（只输出长度，不打印密钥，避免密钥进 shell 历史和屏幕录制）：
 
 ```bash
-sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${JWT}|" .env
+for f in .env backend/.env; do
+  v=$(grep -E '^JWT_SECRET=' "$f" | tail -1 | cut -d= -f2-)
+  [ ${#v} -ge 32 ] && echo "ok  $f  (${#v} 字符)" || echo "!!  $f  不合格（${#v} 字符）"
+done
 ```
+
+两行都显示 `ok ... (64 字符)` 才算完成。
+
+> 两个 `.env` 里的 `JWT_SECRET` **不必相同**：真正生效的是 `backend/.env`，
+> 应用读它签发 token；根 `.env` 那份 compose 根本不读，只有 `deploy/init.sh`
+> 拿它做占位检查。设成一样只是为了省心。
 
 **其余保持默认**，特别注意这几项**不要手改**：
 
@@ -355,12 +369,30 @@ sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${JWT}|" .env
 
 ### 5.3 验收
 
+一次性体检 `init.sh` 会检查的全部项（**不打印任何值**，只报告哪个还空着/还是占位值）：
+
 ```bash
-# 四项都应显示非占位值
-grep -E '^(POSTGRES_PASSWORD|JWT_SECRET)=' .env
-grep -E '^(JWT_SECRET|ADMIN_PASSWORD)=' backend/.env
-grep -cE '^(EMBEDDING_API_KEY|LLM_API_KEY)=sk-' backend/.env    # 应输出 2
+cd ~/enterprise-rag-kb
+chk() {  # 文件 键 占位值
+  local v; v=$(grep -E "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2-)
+  if   [ -z "$v" ];          then echo "  空      $1  $2"
+  elif [ "$v" = "$3" ];      then echo "  占位值  $1  $2"
+  fi
+}
+chk .env         POSTGRES_PASSWORD "change-me-strong-password"
+chk .env         JWT_SECRET        "change-me-to-a-random-string"
+chk backend/.env JWT_SECRET        "please-change-this-secret-in-production-0123456789"
+chk backend/.env ADMIN_PASSWORD    "Admin@123456"
+chk backend/.env EMBEDDING_API_KEY ""
+chk backend/.env LLM_API_KEY       ""
+echo "（以上无输出 = 全部就绪）"
 ```
+
+> 这份清单与 `deploy/init.sh` 的校验**逐项对应**。根 `.env` 里的
+> `ADMIN_PASSWORD` / `EMBEDDING_API_KEY` / `LLM_API_KEY` 是模板自带的装饰项，
+> compose 不读、`init.sh` 也不检查，**空着没有影响**，不用管。
+
+哪个出现在输出里就补哪个，补法同 §5.2。
 
 > ⚠️ `backend/.env` 与 `.env` 都在 `.gitignore` 里，**永远不会**被 `git pull` 覆盖。
 > 这既是好事（升级不丢配置），也意味着**换机器时必须手动迁移**。
