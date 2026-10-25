@@ -93,7 +93,23 @@
         </div>
       </div>
 
+      <!-- 入库刚创建文档时后端 progress 恒为 0（worker 尚未领取，或还没落第一批分块），
+           这时没有可信百分比，用不确定态表示"在排队"，而不是画一根 0% 的定长条。
+           两个分支是不同元素：切换时旧节点卸载、新节点挂载，不会触发
+           .el-progress-bar__inner 的 width .6s 过渡，因此不会出现进度条从 100% 倒抽回 0 的动画。 -->
       <el-progress
+        v-if="ingestQueued"
+        key="queued"
+        :percentage="30"
+        :duration="1.6"
+        indeterminate
+        :format="queueFormat"
+        :stroke-width="8"
+        class="upload-progress"
+      />
+      <el-progress
+        v-else
+        key="determinate"
         :percentage="uploadTask.percent"
         :status="progressStatus"
         :stroke-width="8"
@@ -150,8 +166,18 @@
         <!-- 状态与进度合并：就绪/失败/取消显示标签，排队与处理中直接显示进度条 -->
         <el-table-column label="状态" width="180">
           <template #default="{ row }">
+            <!-- 排队中的 progress 恒为 0，画 0% 定长条会显得卡死；用不确定态表达"在等 worker" -->
             <el-progress
-              v-if="row.status === 'processing' || row.status === 'pending'"
+              v-if="row.status === 'pending' || (row.status === 'processing' && !row.progress)"
+              :percentage="30"
+              :duration="1.6"
+              indeterminate
+              :format="queueFormat"
+              :stroke-width="6"
+              :text-inside="false"
+            />
+            <el-progress
+              v-else-if="row.status === 'processing'"
               :percentage="row.progress"
               :stroke-width="6"
               :text-inside="false"
@@ -246,7 +272,7 @@ import {
   type UploadSession
 } from '@/api'
 import { useUserStore } from '@/stores/user'
-import { hashFile } from '@/utils/upload'
+import { hashFile, isIngestQueued } from '@/utils/upload'
 
 // 上传任务的两段式进度：先传文件（0-100），再等后台入库（0-100）
 type UploadPhase = 'uploading' | 'paused' | 'ingesting' | 'done' | 'cancelled' | 'failed'
@@ -300,13 +326,27 @@ const uploadTask = ref<UploadTask | null>(null)
 const uploadAbort = ref<AbortController | null>(null)
 const resumeInfo = ref<ResumeInfo | null>(null)
 
+// 入库阶段的 0 表示"worker 还没领取 / 还没落第一批进度"，不是"进度为零"。
+// 这个判断同时供给进度条与文案，避免两处各写一遍条件后走偏。
+const ingestQueued = computed(() => {
+  const t = uploadTask.value
+  return !!t && isIngestQueued(t.phase, t.percent)
+})
+
+const queueFormat = () => '排队中'
+
 const uploadHint = computed(() => {
   const t = uploadTask.value
   if (!t) return ''
   if (hashing.value && t.phase === 'uploading') return '正在计算文件摘要，确保续传的是同一文件…'
   if (t.phase === 'uploading') return `正在上传… ${t.percent}%`
   if (t.phase === 'paused') return `已暂停（${t.percent}%），重新选择同一文件即可继续`
-  if (t.phase === 'ingesting') return `文件已上传，正在解析并向量化入库… ${t.percent}%`
+  if (t.phase === 'ingesting') {
+    // 0 时不要显示 "0%"，否则看起来像卡死了
+    return t.percent === 0
+      ? '文件已上传，正在排队等待解析…'
+      : `文件已上传，正在解析并向量化入库… ${t.percent}%`
+  }
   if (t.phase === 'done') return '入库完成'
   if (t.phase === 'cancelled') return '已取消'
   return '上传或入库失败，可在列表中查看原因'

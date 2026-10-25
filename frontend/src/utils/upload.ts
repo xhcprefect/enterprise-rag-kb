@@ -13,3 +13,12 @@ export async function hashFile(file: Blob, signal?: AbortSignal): Promise<string
   signal?.throwIfAborted()
   return Array.from(hash.digest(), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
+
+/**
+ * 入库进度为 0 的含义是「worker 还没领取任务 / 还没落第一批分块」，
+ * 而不是「进度为零」。这种情况应当显示不确定态（排队中），
+ * 而不是一根 0% 的定长条——后者看起来像卡死了。
+ */
+export function isIngestQueued(phase: string, percent: number): boolean {
+  return phase === 'ingesting' && percent === 0
+}
