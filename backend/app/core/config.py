@@ -11,7 +11,9 @@ class Settings(BaseSettings):
 
     # 应用
     APP_NAME: str = "Enterprise RAG Knowledge Base"
-    DEBUG: bool = True
+    # 控制接口文档（/docs、/redoc、/openapi.json）是否注册。
+    # 默认关闭：/openapi.json 会把全部接口、参数与响应结构公开，等于给扫描器一份说明书。
+    DEBUG: bool = False
     API_V1_PREFIX: str = "/api/v1"
 
     # 数据库

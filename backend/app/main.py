@@ -79,12 +79,19 @@ def _worker_state() -> str:
     return "idle"
 
 
+# 接口文档只在 DEBUG=true 时注册：传 None 让 FastAPI 根本不挂这几条路由，
+# 而不是挂上去再在视图里判断——少一条路由就少一个可被探测的端点。
+_docs_kwargs = (
+    {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
+    if settings.DEBUG
+    else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+)
+
 app = FastAPI(
     title=settings.APP_NAME,
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    **_docs_kwargs,
 )
 
 # 注意顺序：后添加的中间件先执行。请求日志放在最外层，才能把 CORS 预检之外
@@ -158,17 +165,16 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/health", tags=["系统"], summary="健康检查")
 def health():
-    return {
-        "status": "ok",
-        "app": settings.APP_NAME,
-        "llm": settings.LLM_MODEL,
-        "llm_provider": settings.LLM_PROVIDER,
-        "embedding": settings.EMBEDDING_MODEL,
-        "embedding_provider": settings.EMBEDDING_PROVIDER,
-        "worker": _worker_state(),
-    }
+    """探活接口，公网可达，只回最小信息。
+
+    以前还返回 app 名、模型名与服务商，等于把部署拓扑向未登录访客公开；
+    监控只需要知道"活着 + worker 状态"，其余字段一律不外泄。
+    """
+    return {"status": "ok", "worker": _worker_state()}
 
 
 @app.get("/", include_in_schema=False)
 def root():
-    return {"message": settings.APP_NAME, "docs": "/docs"}
+    if settings.DEBUG:
+        return {"message": settings.APP_NAME, "docs": "/docs"}
+    return {"message": settings.APP_NAME}

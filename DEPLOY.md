@@ -65,7 +65,7 @@ cp backend/.env.example backend/.env   # 应用配置
 
 | 文件 | 变量 | 说明 |
 |---|---|---|
-| `.env` | `POSTGRES_PASSWORD` | 数据库密码，只含字母数字，避免连接串转义问题 |
+| `.env` | `POSTGRES_PASSWORD` | 数据库密码，只含字母数字，避免连接串转义问题；`testpw123`、`123456` 这类本地开发口令也会被拦下 |
 | `.env` | `JWT_SECRET` | `python3 -c "import secrets;print(secrets.token_urlsafe(48))"` |
 | `backend/.env` | `JWT_SECRET` | 同上，**两个文件保持一致** |
 | `backend/.env` | `ADMIN_PASSWORD` | 初始管理员密码 |
@@ -144,11 +144,13 @@ docker compose build api
 
 ```bash
 curl http://localhost/health
-# {"status":"ok",...,"worker":"idle"}
+# {"status":"ok","worker":"idle"}    ← 只有这两个字段，公网也不怕
 
 docker compose ps                 # api 应为 (healthy)
 docker compose logs -f api        # 看启动日志
 ```
+
+
 
 浏览器打开 `http://<服务器IP>/`，用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录。
 
@@ -303,6 +305,7 @@ docker compose up -d --scale worker=2
 | 现象 | 排查方向 |
 |---|---|
 | `docker compose ps` 中 api 反复重启 | `docker compose logs api`；多半是 `backend/.env` 里密钥为空或数据库连不上 |
+| 打开 `/docs` 是 404 | **正常**，生产默认关闭。要临时看文档见下方「接口文档」 |
 | `/health` 里 `worker: stale` | worker 没运行或已挂：`docker compose logs worker` |
 | 文档一直 `pending` | 同上；`pending` 意味着没有任何 worker 领取 |
 | 文档 `failed` | 看 `error_message` 字段与 worker 日志；常见是文件格式不支持或云端 API 报错 |
@@ -333,6 +336,28 @@ docker compose exec db psql -U postgres -d ragdb -c \
    order by embedding <=> (select embedding from langchain_pg_embedding limit 1) limit 6;"
 ```
 
+## 接口文档
+
+`/docs`、`/redoc`、`/openapi.json` 只在 `backend/.env` 的 `DEBUG=true` 时注册，
+生产默认 `false` → 三条路由**根本不存在**，由 Nginx 的 SPA fallback 返回首页。
+
+`/openapi.json` 会把全部接口、参数名、响应结构和字段类型公开，等于给扫描器一份
+说明书，所以不要为了"方便看一眼"长期打开。
+
+临时需要看文档时：
+
+```bash
+# 方式一：改配置后重建（记得看完改回去）
+sed -i 's/^DEBUG=.*/DEBUG=true/' backend/.env
+docker compose up -d --force-recreate api
+# 看完：改回 false 再执行同一条命令
+
+# 方式二：不对外暴露，直接在容器里导出
+docker compose exec api python -c \
+  "import json;from app.main import app;print(json.dumps(app.openapi(),ensure_ascii=False,indent=2))" \
+  > /tmp/openapi.json
+```
+
 ## HTTPS
 
 当前按 HTTP 部署，`frontend/nginx.conf` 里已留好注释块。拿到域名后：
@@ -353,6 +378,10 @@ docker compose exec db psql -U postgres -d ragdb -c \
 - [ ] `admin` 密码已改（首次登录后到个人中心修改）
 - [ ] `backend/.env` 没有提交到 git（`.gitignore` 已包含）
 - [ ] 云服务器安全组只放行 80（以及要用的 443），**不要**放行 8000 / 5432
+- [ ] `backend/.env` 的 `DEBUG=false`（默认已是；为 true 时 `/docs`、`/redoc`、
+      `/openapi.json` 会公开整套接口与字段结构）
+- [ ] 公网验证一次：`curl -o /dev/null -w "%{http_code}\n" http://<IP>/openapi.json`
+      应返回 **404**
 - [ ] 定期检查备份是否正常产出（`ls -lh data/backups`）
 
 ## 已知限制

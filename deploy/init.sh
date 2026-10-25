@@ -32,18 +32,29 @@ fi
 # ---------- 2. 占位值检查 ----------
 # 这些值一旦带上生产环境就是安全事故，宁可启动失败也不要静默放行
 problems=0
-check_placeholder() { # 文件 键 占位值
-  local value
-  value=$(grep -E "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true)
-  if [[ -z "$value" || "$value" == "$3" ]]; then
-    fail "$1 的 $2 仍是占位值"
+check_placeholder() { # 文件 键 [弱值...]
+  # 除了模板里的占位值，把仓库里出现过的弱口令也一并拦下——本地开发的
+  # testpw123 之类跟着 .env 一起 cp 上服务器是最容易发生的事故。
+  local file=$1 key=$2 value weak
+  value=$(grep -E "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  if [[ -z "$value" ]]; then
+    fail "$file 的 $key 为空"
     problems=$((problems + 1))
+    return
   fi
+  shift 2
+  for weak in "$@"; do
+    if [[ "$value" == "$weak" ]]; then
+      fail "$file 的 $key 仍是占位/弱值: $weak"
+      problems=$((problems + 1))
+      return
+    fi
+  done
 }
-check_placeholder .env POSTGRES_PASSWORD "change-me-strong-password"
+check_placeholder .env POSTGRES_PASSWORD "change-me-strong-password" "testpw123" "123456"
 check_placeholder .env JWT_SECRET "change-me-to-a-random-string"
 check_placeholder backend/.env JWT_SECRET "please-change-this-secret-in-production-0123456789"
-check_placeholder backend/.env ADMIN_PASSWORD "Admin@123456"
+check_placeholder backend/.env ADMIN_PASSWORD "Admin@123456" "change-me-on-first-login"
 
 if grep -qE '^(EMBEDDING_PROVIDER|LLM_PROVIDER)=cloud' backend/.env; then
   for key in EMBEDDING_API_KEY LLM_API_KEY; do
