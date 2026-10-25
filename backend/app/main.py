@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
+import anyio.to_thread
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -27,6 +28,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 必须在事件循环里改：默认线程池是按循环绑定的，在模块导入期设置改不到它。
+    # 为什么是 200 而不是默认的 40：问答走 "同步生成器 → StreamingResponse"，
+    # 每个 token 都要借线程执行 next()，整段流式期间线程被占着等云端返回。
+    # 40 个并发提问即占满，此后所有同步路由（含 /health）排队，表现为整站变卡。
+    anyio.to_thread.current_default_thread_limiter().total_tokens = settings.THREAD_POOL_SIZE
     init_db()
     with SessionLocal() as db:
         queued = db.scalar(
@@ -39,9 +45,10 @@ async def lifespan(app: FastAPI):
             "有 %d 个文档在等待入库；若 worker 未运行请执行 start-worker.bat", queued
         )
     logger.info(
-        "服务已启动，LLM=%s(%s), Embedding=%s(%s)",
+        "服务已启动，LLM=%s(%s), Embedding=%s(%s), 线程池=%d",
         settings.LLM_MODEL, settings.LLM_PROVIDER,
         settings.EMBEDDING_MODEL, settings.EMBEDDING_PROVIDER,
+        settings.THREAD_POOL_SIZE,
     )
     yield
     logger.info("服务已关闭")

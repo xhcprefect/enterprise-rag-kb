@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     API_V1_PREFIX: str = "/api/v1"
 
+    # 线程池槽位上限（anyio 默认 40）。
+    # 问答接口是 "同步生成器 + StreamingResponse"，Starlette 每吐一个 token 都要
+    # 借一个线程执行 next()，整段流式期间该线程一直被占着等云端返回。
+    # 40 个并发提问就把池占满，之后连 /health、登录都要排队——表现为"整个站点变卡"。
+    # 实测 40→200 后 150 路并发流仍不拖慢普通请求（见 DEPLOY.md「并发能力」）。
+    THREAD_POOL_SIZE: int = 200
+
     # 数据库
     DATABASE_URL: str = "postgresql+psycopg://postgres:123456@localhost:9999/ragdb"
 

@@ -333,6 +333,7 @@ docker compose up -d --scale worker=2
 | 页面 404 | 检查 Nginx 的 SPA fallback；或访问路径不在路由表内 |
 | 上传卡住 | `client_max_body_size`、磁盘空间；`docker compose logs api` |
 | 文档一多，问答明显变慢 | 大概率是缺 HNSW 索引，检索在走全表扫描：见下方检查命令，缺了就跑 `migrate_vector_index` |
+| 多人同时提问后**整站**变卡（`/health` 也慢） | 线程池被流式请求占满，见「并发能力」一节；调大 `backend/.env` 的 `THREAD_POOL_SIZE` |
 
 ### 常用检查命令
 
@@ -355,6 +356,50 @@ docker compose exec db psql -U postgres -d ragdb -c \
    explain (costs off) select id from langchain_pg_embedding
    order by embedding <=> (select embedding from langchain_pg_embedding limit 1) limit 6;"
 ```
+
+## 并发能力
+
+### 瓶颈不是 CPU，是线程池槽位
+
+问答接口是「同步生成器 + `StreamingResponse`」：Starlette 每吐一个 token 都要
+`await anyio.to_thread.run_sync(next, ...)` 借一个线程，而线程要一直等到云端下一个
+token 返回才释放。所以**每路正在生成的流都常年占着一个线程**，CPU 却接近空转。
+
+anyio 默认线程池上限是 **40**。实测（与 `/chat/stream` 同构的同步流式端点，
+每流 10s、不调模型）：
+
+| 并发流 | 普通请求（`/health`、登录、列表） | 全部流耗时 |
+|---|---|---|
+| ≤ 40 | 3–60 ms | 基线 |
+| 45 | 33–548 ms（开始抖动） | 12 s |
+| 80 | **1530 ms** | 20 s（翻倍） |
+
+80 路时线程池状态是 `borrowed=40, tasks_waiting=40`——40 个槽位全在等云端，其余排队。
+**`/health` 也是同步路由，一样要排队**，所以监控会同时报慢或超时。
+
+`backend/.env` 的 `THREAD_POOL_SIZE`（默认 200）就是把这个池放大。调到 200 后实测：
+
+| 并发流 | 普通请求 | 全部流耗时 |
+|---|---|---|
+| 80 | 6 ms | 基线 |
+| 150 | 7 ms | 12 s（基线 10s） |
+
+启动日志里会打印实际生效的值：`服务已启动，... 线程池=200`。
+
+### 已排除的两个「看起来像瓶颈」的地方
+
+- **数据库连接没被流式占住**：检索、历史查询、用户消息落库都在返回生成器**之前**
+  `commit()`，SQLAlchemy 此时已把连接还回池。实测 10 路并发流期间
+  `engine.pool.checkedout() == 0`，所以 `pool_size=10 + max_overflow=20` 不是瓶颈。
+- **CPU / 内存很空**：api 容器约 106 MiB / 3.5 GiB，CPU 0.1%，机器 load 0.12。
+
+### 再往上还有两档（当前不需要）
+
+1. `uvicorn --workers 2`：**必须先改日志输出**——`RotatingFileHandler` 多进程切同一个
+   文件会互相干扰（同「worker 多开」一节的限制）。
+2. 把流式链路改成异步（`cloud_models.stream` → `rag.answer_stream` → `event_stream`
+   三层都改成 `async def` + `httpx.AsyncClient`）：彻底不再需要「每路流一个线程」，
+   并发上限只受内存和上游 API 限制。工作量大，等真的不够用再动。
 
 ## 接口文档
 
@@ -411,7 +456,8 @@ docker compose exec api python -c \
 
 - **日志用文件轮转，不支持多副本共享**；需要多 worker 时先改日志输出方式。
 - **`uvicorn` 单进程**：当前 `CMD` 没带 `--workers`。2 核机器上单进程足够
-  （瓶颈在云端 API 延迟），需要时再调。
+  （瓶颈在云端 API 延迟），需要时再调；但**先读「并发能力」一节**——
+  单进程的并发上限由 `THREAD_POOL_SIZE` 决定，不是 CPU。
 - **向量维度假定为 1024**（`vector_store.py` 的 `EMBEDDING_DIM`）。
   换成其他维度的向量模型时必须重建索引，否则写入会因类型不匹配失败。
 - **HNSW 索引不在 `init_db()` 里**：入库表由 `langchain-postgres` 自建，应用不管它的结构，
