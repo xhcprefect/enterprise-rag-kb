@@ -1,4 +1,5 @@
 import client from './client'
+import { consumeEventStream } from '@/utils/stream'
 
 // ---------- 类型 ----------
 export interface User {
@@ -181,11 +182,12 @@ export interface UploadSession {
 }
 
 export const uploadApi = {
-  /** 建会话；同库同名同大小的未完成会话会被复用，直接带回已收分片。 */
-  createSession: (kbId: string, filename: string, fileSize: number) =>
+  /** 建会话；仅同一用户、同库、同名同大小且完整内容摘要相同才会续传。 */
+  createSession: (kbId: string, filename: string, fileSize: number, contentSha256: string) =>
     client.post<UploadSession>(`/knowledge-bases/${kbId}/upload-sessions`, {
       filename,
-      file_size: fileSize
+      file_size: fileSize,
+      content_sha256: contentSha256
     }),
   getSession: (kbId: string, uploadId: string) =>
     client.get<UploadSession>(`/knowledge-bases/${kbId}/upload-sessions/${uploadId}`),
@@ -221,6 +223,7 @@ export const uploadApi = {
 
 // ---------- 文档 ----------
 export const docApi = {
+  get: (kbId: string, docId: string) => client.get<DocumentItem>(`/knowledge-bases/${kbId}/documents/${docId}`),
   list: (kbId: string, params: { page?: number; page_size?: number; status?: string }) =>
     client.get<PageResult<DocumentItem>>(`/knowledge-bases/${kbId}/documents`, { params }),
   reindex: (kbId: string, docId: string) =>
@@ -293,38 +296,10 @@ export async function streamChat(
     return
   }
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-
-    buffer += decoder.decode(value, { stream: true })
-
-    let index: number
-    while ((index = buffer.indexOf('\n\n')) !== -1) {
-      const raw = buffer.slice(0, index)
-      buffer = buffer.slice(index + 2)
-
-      let event = 'message'
-      const dataLines: string[] = []
-      for (const line of raw.split('\n')) {
-        if (line.startsWith('event:')) event = line.slice(6).trim()
-        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
-      }
-      if (!dataLines.length) continue
-
-      try {
-        const data = JSON.parse(dataLines.join('\n'))
-        if (event === 'meta') handlers.onMeta?.(data)
-        else if (event === 'delta') handlers.onDelta?.(data.content ?? '')
-        else if (event === 'done') handlers.onDone?.(data)
-        else if (event === 'error') handlers.onError?.(data.message ?? '未知错误')
-      } catch {
-        /* 忽略无法解析的帧 */
-      }
-    }
-  }
+  await consumeEventStream(response.body, (event, data) => {
+    if (event === 'meta') handlers.onMeta?.(data)
+    else if (event === 'delta') handlers.onDelta?.(data.content ?? '')
+    else if (event === 'done') handlers.onDone?.(data)
+    else if (event === 'error') handlers.onError?.(data.message ?? '未知错误')
+  }, signal)
 }

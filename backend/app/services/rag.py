@@ -1,6 +1,6 @@
 """检索 + 生成。"""
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 from langchain_core.documents import Document as LCDocument
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -8,7 +8,7 @@ from langchain_ollama import ChatOllama
 
 from app.core.config import settings
 from app.services.cloud_models import get_cloud_chat
-from app.services.vector_store import get_vector_store
+from app.services.vector_store import get_vector_store, search_ready_vectors
 
 SYSTEM_PROMPT = """你是企业知识库助手。请严格依据【参考资料】回答用户问题，遵守以下规则：
 1. 只使用参考资料中的信息作答，不要编造。参考资料不足以回答时，明确说明"根据现有知识库无法回答"。
@@ -85,7 +85,7 @@ def retrieve(collection_name: str, question: str, top_k: int) -> list[tuple[LCDo
 
     while True:
         # 返回 (Document, 余弦距离)，距离越小越相关
-        fetched = store.similarity_search_with_score_by_vector(vector, k=candidates)
+        fetched = search_ready_vectors(store, vector, candidates)
         if not fetched:
             break
         pairs = fetched
@@ -192,63 +192,46 @@ def get_llm():
         # qwen3 系列默认开启思考：0.8B 模型在长上下文下会先想 60~120s 才出正文，
         # 经常超过前端等待时间，表现为"空回答"。知识库问答以引用资料为准，关掉思考更稳更快。
         reasoning=False,
+        num_predict=settings.LLM_MAX_OUTPUT_TOKENS,
     )
+
+
+def filter_reasoning(parts: Iterable[str]) -> Iterator[str]:
+    """保留可能的标签前缀；标签可在任意字符处被上游分片。"""
+    openings = ("<think>", "<thinking>")
+    closings = ("</think>", "</thinking>")
+    buffer = ""
+    hidden = False
+    for part in parts:
+        buffer += part
+        while buffer:
+            tags = closings if hidden else openings
+            matches = [(buffer.find(tag), tag) for tag in tags if tag in buffer]
+            if matches:
+                offset, tag = min(matches)
+                if not hidden and offset:
+                    yield buffer[:offset]
+                buffer = buffer[offset + len(tag):]
+                hidden = not hidden
+                continue
+            keep = max((length for tag in tags for length in range(1, len(tag))
+                        if buffer.endswith(tag[:length])), default=0)
+            content = buffer[:-keep] if keep else buffer
+            if not hidden and content:
+                yield content
+            buffer = buffer[-keep:] if keep else ""
+            break
+    if buffer and not hidden:
+        yield buffer
 
 
 def answer_stream(
-    question: str,
-    pairs: list[tuple[LCDocument, float]],
-    history: list[dict],
-    mode: str = "rag",
+    question: str, pairs: list[tuple[LCDocument, float]], history: list[dict], mode: str = "rag",
 ) -> Iterator[str]:
-    """流式生成，过滤思考标签后再下发。
-
-    ``mode="chat"`` 时不带参考资料，用通用提示词，其余流程完全一致。
-    """
+    if mode != "chat" and not pairs:
+        yield "根据现有知识库无法回答该问题，请补充相关资料或调整问题。"
+        return
     llm = get_llm()
-    messages = (
-        build_plain_messages(question, history)
-        if mode == "chat"
-        else build_messages(question, pairs, history)
-    )
-    buffer = ""
-    in_think = False
-
-    for chunk in llm.stream(messages):
-        text = chunk.content if isinstance(chunk.content, str) else ""
-        if not text:
-            continue
-
-        buffer += text
-        # 处理跨 chunk 的思考标签
-        while True:
-            if not in_think:
-                start = buffer.find("<think")
-                if start == -1:
-                    out, buffer = buffer, ""
-                    if out:
-                        yield out
-                    break
-                if start > 0:
-                    yield buffer[:start]
-                buffer = buffer[start:]
-                end = buffer.find(">")
-                if end == -1:
-                    break
-                buffer = buffer[end + 1:]
-                in_think = True
-            else:
-                end = buffer.find("</think")
-                if end == -1:
-                    # 只保留可能是闭合标签前缀的尾部
-                    keep = min(len(buffer), 12)
-                    buffer = buffer[-keep:]
-                    break
-                close = buffer.find(">", end)
-                if close == -1:
-                    break
-                buffer = buffer[close + 1:]
-                in_think = False
-
-    if buffer and not in_think:
-        yield buffer
+    messages = build_plain_messages(question, history) if mode == "chat" else build_messages(question, pairs, history)
+    parts = (chunk.content for chunk in llm.stream(messages) if isinstance(chunk.content, str))
+    yield from filter_reasoning(parts)

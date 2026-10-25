@@ -87,6 +87,7 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
     last_error = ""
 
     for attempt in range(3):
+        client = None
         try:
             if stream:
                 # 流式响应不能被复用连接池回收，单独开一个客户端随用随关
@@ -120,8 +121,12 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
                 )
             return response
         except httpx.TimeoutException:
+            if stream and client is not None:
+                client.close()
             last_error = f"请求超时（{endpoint.timeout:g}s）"
         except httpx.RequestError as exc:
+            if stream and client is not None:
+                client.close()
             last_error = f"网络错误：{exc}"
 
         if attempt < 2:
@@ -216,6 +221,7 @@ class OpenAICompatibleChat:
             "messages": [_to_openai_message(m) for m in messages],
             "temperature": self.temperature,
             "stream": stream,
+            "max_tokens": settings.LLM_MAX_OUTPUT_TOKENS,
         }
         # 与本地 ChatOllama(reasoning=False) 对齐：Qwen3 系列不进入思考模式。
         # 思考模式会先吐 reasoning_content，长上下文下能拖到几十秒才出正文。
@@ -238,25 +244,35 @@ class OpenAICompatibleChat:
         client, response = _post(
             self.endpoint, "/chat/completions", self._payload(messages, True), stream=True
         )
+        terminal = False
         try:
             for line in response.iter_lines():
                 if not line or not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    terminal = True
                     break
                 try:
                     event = json.loads(data)
-                except ValueError:
-                    continue
+                except ValueError as exc:
+                    raise CloudModelError("模型服务返回了无效的流式数据") from exc
+                if not isinstance(event, dict) or event.get("error"):
+                    raise CloudModelError("模型服务在生成过程中返回错误，请稍后重试")
                 choices = event.get("choices") or []
                 if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                # reasoning_content / reasoning 是思考过程，本项目不展示，直接丢弃
+                    continue  # usage 等独立统计帧可以没有 choices。
+                choice = choices[0]
+                if choice.get("finish_reason") is not None:
+                    terminal = True
+                    if choice["finish_reason"] == "content_filter":
+                        raise CloudModelError("模型服务拒绝生成该回答")
+                delta = choice.get("delta") or {}
                 text = delta.get("content")
                 if text:
                     yield AIMessageChunk(content=text)
+            if not terminal:
+                raise CloudModelError("模型响应提前中断，请重试")
         finally:
             response.close()
             client.close()

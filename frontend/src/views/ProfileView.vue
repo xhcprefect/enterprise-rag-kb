@@ -127,7 +127,9 @@ async function submit() {
   submitting.value = true
   try {
     await userApi.changePassword(form.old_password, form.new_password)
-    ElMessage.success('密码已更新')
+    ElMessage.success('密码已更新，请重新登录')
+    await userStore.logout(false)
+    location.assign('/login')
     formRef.value.resetFields()
   } finally {
     submitting.value = false

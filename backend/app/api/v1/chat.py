@@ -3,13 +3,14 @@ import logging
 import time
 import uuid
 from collections.abc import Iterator
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session as DBSession
 
-from app.api.deps import get_current_user, write_audit
+from app.api.deps import admit_chat, get_current_user, write_audit
 from app.db.session import SessionLocal, get_db
 from app.models import (
     CONVERSATION_MODE_CHAT,
@@ -22,6 +23,8 @@ from app.models import (
 from app.schemas.chat import ChatMode, ChatRequest, ConversationDetail, ConversationRead
 from app.schemas.common import ApiResponse
 from app.services import rag
+from app.core.config import settings
+from app.services.cloud_models import CloudModelError
 
 router = APIRouter(prefix="/chat", tags=["问答"])
 logger = logging.getLogger(__name__)
@@ -94,7 +97,7 @@ def delete_conversation(
     return ApiResponse(data=None, message="已删除")
 
 
-@router.post("/stream", summary="流式问答（SSE，返回 text/event-stream，不套统一结构）")
+@router.post("/stream", dependencies=[Depends(admit_chat)], summary="流式问答（SSE，返回 text/event-stream，不套统一结构）")
 def chat_stream(
     payload: ChatRequest,
     request: Request,
@@ -143,13 +146,15 @@ def chat_stream(
     history_rows = db.scalars(
         select(Message)
         .where(Message.conversation_id == conv.id)
-        .order_by(Message.created_at.asc())
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(max(0, settings.HISTORY_MAX_TURNS) * 2)
     ).all()
-    history = [{"role": m.role, "content": m.content} for m in history_rows]
+    history = [{"role": m.role, "content": m.content} for m in reversed(history_rows)]
 
     # 先落库用户消息
     user_msg = Message(conversation_id=conv.id, role="user", content=payload.question)
     db.add(user_msg)
+    conv.updated_at = datetime.now(timezone.utc)
     db.commit()
 
     conv_id = str(conv.id)
@@ -199,7 +204,9 @@ def chat_stream(
                 yield _sse("delta", {"content": token})
             llm_ms = (time.perf_counter() - t_llm) * 1000
 
-            answer = "".join(answer_parts).strip() or "抱歉，未能生成回答。"
+            answer = "".join(answer_parts).strip()
+            if not answer:
+                raise CloudModelError("模型未返回有效内容，请重试")
             latency = int((time.perf_counter() - started) * 1000)
             logger.info(
                 "问答完成: %s user=%s conv=%s 检索 %.0fms + 生成 %.0fms = %.1fs "
@@ -230,6 +237,7 @@ def chat_stream(
                         latency_ms=latency,
                     )
                 )
+                session.execute(update(Conversation).where(Conversation.id == uuid.UUID(conv_id)).values(updated_at=datetime.now(timezone.utc)))
                 session.commit()
                 write_audit(session, request, db_user, "chat_query", kb_name, detail)
             finally:
@@ -241,7 +249,11 @@ def chat_stream(
                 "问答失败: %s user=%s 问题=%r 已生成 %d 字",
                 scope, user.username, question[:60], sum(len(p) for p in answer_parts),
             )
-            yield _sse("error", {"message": str(exc)[:500]})
+            message = str(exc) if isinstance(exc, CloudModelError) else "问答处理失败，请稍后重试"
+            for key in (settings.LLM_API_KEY, settings.EMBEDDING_API_KEY):
+                if key:
+                    message = message.replace(key, "[已隐藏]")
+            yield _sse("error", {"message": message[:500]})
 
     return StreamingResponse(
         event_stream(),

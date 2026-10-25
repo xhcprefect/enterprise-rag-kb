@@ -4,6 +4,8 @@
 前端使用 **Vue 3 + Pinia + Vite + Element Plus**。模型服务商可在**硅基流动云端**
 与 **Ollama 本地**之间自由切换（向量与对话可分别配置）。
 
+> 最新的安全修复、数据库兼容升级、测试与备份维护说明见 [OPTIMIZATION.md](OPTIMIZATION.md)。
+
 ## 技术栈
 
 | 层 | 技术 |
@@ -81,7 +83,7 @@ enterprise-rag-kb/
      ollama pull bge-m3
      ollama pull qwen3.5:0.8b
      ```
-3. **Python 3.12+**、**Node.js 18+**
+3. **Python 3.12+**、**Node.js 22.18+**
 
 ## 启动
 
@@ -158,7 +160,7 @@ npm run dev
 | `code` | 成功恒为 `0`；失败等于 HTTP 状态码 |
 | `success` | 前端只需判断它即可区分成败 |
 | `message` | 可直接展示给用户的中文提示；参数校验失败时为「参数校验失败 —— 字段: 原因」 |
-| `data` | 业务数据；无返回内容的操作（删除、退出）为 `null`。参数校验失败时为原始校验明细数组 |
+| `data` | 业务数据；无返回内容的操作（删除、退出）为 `null`。参数校验失败时为脱敏后的校验明细数组（不含原始 input） |
 
 分页接口的 `data` 为 `{"total": 100, "items": [...]}`。
 

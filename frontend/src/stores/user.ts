@@ -22,11 +22,9 @@ export const useUserStore = defineStore('user', () => {
     return data
   }
 
-  async function logout() {
+  async function logout(revoke = true) {
     try {
-      // 必须先等请求发出：请求拦截器从 localStorage 读令牌，
-      // 同步清空会让退出接口缺少 Authorization 而返回 401
-      await authApi.logout()
+      if (revoke) await authApi.logout()
     } catch {
       // 令牌已失效时退出接口会失败，不影响本地清理
     }

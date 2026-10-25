@@ -78,6 +78,9 @@ class Document(Base, TimestampMixin):
     )
     # 切分是否已完整落库：为 False 时，残留的 chunk 行不完整，续传必须重新切分
     parse_done: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 索引代次隔离重建前后的向量；lease_id 阻止超时旧任务继续写入。
+    index_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

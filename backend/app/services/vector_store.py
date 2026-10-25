@@ -5,7 +5,12 @@ from functools import lru_cache
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
 from langchain_postgres import PGVector
-from sqlalchemy import delete
+from sqlalchemy import String, cast, delete, func, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
+from langchain_core.documents import Document as LCDocument
+
+from app.models import Document, DocumentStatus, KnowledgeBase
 
 from app.core.config import settings
 from app.db.session import engine as app_engine
@@ -67,29 +72,80 @@ def get_vector_store(collection_name: str) -> PGVector:
     return _store(collection_name)
 
 
-def delete_document_vectors(collection_name: str, document_id: str) -> int:
-    """删除某个文档的所有向量，返回删除条数。
-
-    注意：langchain-postgres 0.0.19 的 ``PGVector.delete()`` 只支持 ``ids``，
-    其余关键字参数会被 ``**kwargs`` 静默吞掉（``delete(filter=...)`` 是空操作），
-    所以这里直接按 ``cmetadata->>'document_id'`` 删。
-    """
+def delete_document_vectors(
+    collection_name: str, document_id: str, *, db: Session | None = None
+) -> int:
+    """清理向量；传入 db 时与文档删除/取消共用事务，不自行提交。"""
     store = get_vector_store(collection_name)
-    embedding_store = store.EmbeddingStore
+    if db is None:
+        with store._make_sync_session() as session:
+            deleted = _delete_vectors(store, session, document_id)
+            session.commit()
+            return deleted
+    return _delete_vectors(store, db, document_id)
 
-    with store._make_sync_session() as session:  # noqa: SLF001 - 官方未暴露按 metadata 删除
-        collection = store.get_collection(session)
+
+def _delete_vectors(store: PGVector, db: Session, document_id: str) -> int:
+    collection = store.get_collection(db)
+    if collection is None:
+        return 0
+    rows = store.EmbeddingStore
+    result = db.execute(delete(rows).where(
+        rows.collection_id == collection.uuid,
+        rows.cmetadata["document_id"].astext == document_id,
+    ))
+    return result.rowcount or 0
+
+
+def persist_vectors(
+    db: Session, store: PGVector, documents: list[LCDocument],
+    vectors: list[list[float]], ids: list[str],
+) -> None:
+    """在调用方已锁住文档并检查租约后，原子写向量与分块进度。"""
+    if len(vectors) != len(documents) or any(len(v) != EMBEDDING_DIM for v in vectors):
+        raise ValueError(f"向量数量或维度不符（要求 {EMBEDDING_DIM} 维）")
+    collection = store.get_collection(db)
+    if collection is None:
+        raise ValueError("知识库向量集合不存在")
+    rows = store.EmbeddingStore
+    statement = insert(rows).values([
+        {"id": identifier, "collection_id": collection.uuid, "embedding": vector,
+         "document": doc.page_content, "cmetadata": doc.metadata}
+        for identifier, vector, doc in zip(ids, vectors, documents)
+    ])
+    db.execute(statement.on_conflict_do_update(
+        index_elements=["id"], set_={
+            "collection_id": statement.excluded.collection_id,
+            "embedding": statement.excluded.embedding,
+            "document": statement.excluded.document,
+            "cmetadata": statement.excluded.cmetadata,
+        },
+    ))
+
+
+def search_ready_vectors(store: PGVector, vector: list[float], k: int) -> list[tuple[LCDocument, float]]:
+    """在 SQL 中过滤无效文档和旧代次；兼容旧向量缺少 index_version 的情况。"""
+    from app.db.session import SessionLocal
+
+    rows = store.EmbeddingStore
+    distance = rows.embedding.cosine_distance(vector).label("distance")
+    with SessionLocal() as db:
+        collection = store.get_collection(db)
         if collection is None:
-            return 0
-        result = session.execute(
-            delete(embedding_store).where(
-                embedding_store.collection_id == collection.uuid,
-                embedding_store.cmetadata["document_id"].astext == str(document_id),
+            return []
+        statement = (
+            select(rows.document, rows.cmetadata, distance)
+            .join(Document, cast(Document.id, String) == rows.cmetadata["document_id"].astext)
+            .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
+            .where(
+                rows.collection_id == collection.uuid,
+                KnowledgeBase.collection_name == store.collection_name,
+                Document.status == DocumentStatus.READY.value,
+                Document.cancel_requested.is_(False),
+                func.coalesce(rows.cmetadata["index_version"].astext, "0") == cast(Document.index_version, String),
             )
         )
-        session.commit()
-        deleted = result.rowcount or 0
-
-    if deleted:
-        logger.info("清理文档向量: %s -> %d 条", document_id, deleted)
-    return deleted
+        if settings.RETRIEVAL_MIN_SIMILARITY > 0:
+            statement = statement.where(distance <= 1.0 - settings.RETRIEVAL_MIN_SIMILARITY)
+        result = db.execute(statement.order_by(distance).limit(k)).all()
+        return [(LCDocument(page_content=text, metadata=meta or {}), float(score)) for text, meta, score in result]

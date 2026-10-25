@@ -435,6 +435,12 @@ def build_receipt(created: list[CreatedUser], failed: list[ImportFailure], sourc
     wb.properties.title = "用户导入回执"
     wb.properties.creator = "Enterprise RAG Knowledge Base"
 
+    # 回执没有业务公式。强制所有文本单元格为字符串，阻止 = 开头的外部数据变成公式。
+    for sheet in wb:
+        for row in sheet.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str):
+                    cell.data_type = "s"
     buffer = io.BytesIO()
     wb.save(buffer)
     filename = f"用户导入回执_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"

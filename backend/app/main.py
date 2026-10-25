@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.v1 import api_router
-from app.core.api_response import error_body, validation_message
+from app.core.api_response import error_body, sanitized_validation_errors, validation_message
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.core.request_log import RequestLoggingMiddleware
@@ -136,7 +136,8 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """参数校验失败：message 给出可直接阅读的字段错误，data 保留原始校验明细。"""
-    errors = jsonable_encoder(exc.errors())
+    # 缺少字段时 input 可能是整个请求体，必须在日志与响应序列化之前剔除。
+    errors = jsonable_encoder(sanitized_validation_errors(exc.errors()))
     request.state.error_detail = f"参数校验失败: {errors}"
     logger.warning(
         "%s %s 参数校验失败: %s", request.method, request.url.path, errors

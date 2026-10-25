@@ -48,7 +48,10 @@ services:
     env_file:
       - ./backend/.env
     environment:
-      # 覆盖 .env 里面向本机开发的连接串与相对路径
+      # 覆盖 .env 里面向本机开发的连接串与相对路径。
+      # API 不发布宿主端口，只接受受控内部网络；Nginx 会覆盖而非追加转发 IP。
+      FORWARDED_ALLOW_IPS: "*"
+      ENVIRONMENT: production
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
       UPLOAD_DIR: /data/uploads
       LOG_DIR: /data/logs
@@ -88,6 +91,7 @@ services:
     env_file:
       - ./backend/.env
     environment:
+      ENVIRONMENT: production
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
       UPLOAD_DIR: /data/uploads
       LOG_DIR: /data/logs

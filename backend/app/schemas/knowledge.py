@@ -50,6 +50,8 @@ class DocumentRead(BaseModel):
 class UploadSessionCreate(BaseModel):
     filename: str = Field(min_length=1, max_length=512)
     file_size: int = Field(gt=0)
+    # 老客户端不提供摘要时只新建、不自动复用；新客户端用完整文件摘要安全续传。
+    content_sha256: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
 
 
 class UploadSessionRead(BaseModel):

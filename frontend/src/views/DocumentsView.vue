@@ -234,7 +234,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type UploadRawFile, type UploadRequestOptions } from 'element-plus'
 import {
@@ -246,6 +246,7 @@ import {
   type UploadSession
 } from '@/api'
 import { useUserStore } from '@/stores/user'
+import { hashFile } from '@/utils/upload'
 
 // 上传任务的两段式进度：先传文件（0-100），再等后台入库（0-100）
 type UploadPhase = 'uploading' | 'paused' | 'ingesting' | 'done' | 'cancelled' | 'failed'
@@ -288,6 +289,7 @@ const kb = ref<KnowledgeBase | null>(null)
 const docs = ref<DocumentItem[]>([])
 const loading = ref(false)
 const uploading = ref(false)
+const hashing = ref(false)
 const page = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
@@ -301,6 +303,7 @@ const resumeInfo = ref<ResumeInfo | null>(null)
 const uploadHint = computed(() => {
   const t = uploadTask.value
   if (!t) return ''
+  if (hashing.value && t.phase === 'uploading') return '正在计算文件摘要，确保续传的是同一文件…'
   if (t.phase === 'uploading') return `正在上传… ${t.percent}%`
   if (t.phase === 'paused') return `已暂停（${t.percent}%），重新选择同一文件即可继续`
   if (t.phase === 'ingesting') return `文件已上传，正在解析并向量化入库… ${t.percent}%`
@@ -325,6 +328,9 @@ const cancelLabel = computed(() => {
 })
 
 let timer: number | undefined
+let disposed = false
+let pollInFlight = false
+let loadSequence = 0
 
 function statusType(status: string) {
   if (status === 'ready') return 'success'
@@ -375,6 +381,8 @@ function formatTime(value: string) {
 }
 
 async function load() {
+  if (disposed) return
+  const sequence = ++loadSequence
   loading.value = true
   try {
     const [kbRes, docRes] = await Promise.all([
@@ -385,11 +393,13 @@ async function load() {
         status: statusFilter.value || undefined
       })
     ])
+    if (disposed || sequence !== loadSequence) return
     kb.value = kbRes.data.find((k) => k.id === kbId) || null
     docs.value = docRes.data.items
     total.value = docRes.data.total
+    if (docs.value.some((d) => d.status === 'pending' || d.status === 'processing') || uploadTask.value?.phase === 'ingesting') startPolling()
   } finally {
-    loading.value = false
+    if (sequence === loadSequence) loading.value = false
   }
 }
 
@@ -428,7 +438,7 @@ async function doUpload(options: UploadRequestOptions) {
   uploadAbort.value = controller
   const file = options.file
 
-  const task: UploadTask = {
+  const task = reactive<UploadTask>({
     docId: '',
     filename: file.name,
     fileSize: file.size,
@@ -439,12 +449,15 @@ async function doUpload(options: UploadRequestOptions) {
     chunkSize: 0,
     totalChunks: 0,
     chunksDone: 0
-  }
+  })
   uploadTask.value = task
 
   try {
-    // 1) 建会话（服务端自动复用同库同名同大小的未完成会话）
-    const { data: session } = await uploadApi.createSession(kbId, file.name, file.size)
+    // 1) 完整内容摘要识别文件，分块读取，不把整个大文件载入内存。
+    hashing.value = true
+    const digest = await hashFile(file, controller.signal)
+    hashing.value = false
+    const { data: session } = await uploadApi.createSession(kbId, file.name, file.size, digest)
     Object.assign(task, {
       uploadId: session.upload_id,
       chunkSize: session.chunk_size,
@@ -467,6 +480,7 @@ async function doUpload(options: UploadRequestOptions) {
     task.percent = 100
     const { data: completed } = await uploadApi.complete(kbId, session.upload_id)
     clearResume()
+    if (disposed) return
 
     Object.assign(task, {
       docId: completed.document.id,
@@ -485,6 +499,7 @@ async function doUpload(options: UploadRequestOptions) {
     if (uploadTask.value) uploadTask.value = { ...task, phase: 'failed' }
     // 会话与已传分片仍在服务端：保留 resume 记录，刷新后可继续传（会话失效时 restoreResume 会自动清理）
   } finally {
+    hashing.value = false
     uploading.value = false
     uploadAbort.value = null
   }
@@ -708,20 +723,29 @@ async function remove(row: DocumentItem) {
 
 function startPolling() {
   stopPolling()
+  if (disposed) return
   timer = window.setInterval(async () => {
+    if (pollInFlight || disposed) return
+    pollInFlight = true
+    const params = { page: page.value, page_size: pageSize.value, status: statusFilter.value || undefined }
     try {
-      const { data } = await docApi.list(kbId, {
-        page: page.value,
-        page_size: pageSize.value,
-        status: statusFilter.value || undefined
-      })
+      const { data } = await docApi.list(kbId, params)
+      if (disposed) return
+      if (params.page !== page.value || params.page_size !== pageSize.value || params.status !== (statusFilter.value || undefined)) return
       docs.value = data.items
       total.value = data.total
-      syncUploadTask(data.items)
+      const task = uploadTask.value
+      if (task?.phase === 'ingesting' && task.docId) {
+        const { data: active } = await docApi.get(kbId, task.docId)
+        if (!disposed && uploadTask.value?.docId === active.id) syncUploadTask([active])
+      }
       const busy = data.items.some((d) => d.status === 'pending' || d.status === 'processing')
-      if (!busy) stopPolling()
-    } catch {
-      /* 网络抖动：不打断轮询，下一拍再试 */
+      if (!busy && uploadTask.value?.phase !== 'ingesting') stopPolling()
+    } catch (err: any) {
+      if (err?.response?.status === 404) uploadTask.value = null
+      // 网络抖动下一拍重试，确保同一时间只有一个轮询请求。
+    } finally {
+      pollInFlight = false
     }
   }, 1500)
 }
@@ -760,7 +784,6 @@ function stopPolling() {
   }
 }
 
-watch([page, pageSize], load)
 onMounted(async () => {
   await load()
   // 恢复"未完成上传"提示：本地只有轻量记录，进度以服务端会话为准
@@ -770,6 +793,7 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
+  disposed = true
   stopPolling()
   // 离开页面：在途上传转为暂停并保留会话，回来后（或刷新后）可续传
   if (uploadTask.value?.phase === 'uploading') pauseUpload(true)

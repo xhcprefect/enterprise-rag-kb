@@ -27,6 +27,7 @@ python-docx>=1.1.2
 # openpyxl 同时用于「批量导入用户」：读上传的 xlsx、生成导入模板与密码回执
 openpyxl>=3.1.5
 pandas>=2.2.3
+tabulate>=0.9.0
 
 # --- Utils ---
 httpx>=0.28.1

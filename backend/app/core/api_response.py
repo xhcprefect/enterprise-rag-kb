@@ -64,6 +64,22 @@ def _describe(err: dict) -> str:
     return msg.removeprefix("Value error, ")
 
 
+def sanitized_validation_errors(errors: list[dict]) -> list[dict]:
+    """只保留定位错误所需的字段；input/msg/任意 ctx 均可能夹带原始凭据。"""
+    safe = []
+    context_keys = {"min_length", "max_length", "gt", "ge", "lt", "le"}
+    for error in errors:
+        item = {"type": error.get("type", "value_error"), "loc": error.get("loc", [])}
+        ctx = error.get("ctx") or {}
+        item["ctx"] = {
+            key: value for key, value in ctx.items()
+            if key in context_keys and isinstance(value, (int, float))
+        }
+        item["msg"] = _describe(item)
+        safe.append(item)
+    return safe
+
+
 def validation_message(errors: list[dict]) -> str:
     """把 pydantic 的字段错误压成一句中文，前端可直接展示。"""
     parts = [f"{_field_name(err.get('loc', []))}: {_describe(err)}" for err in errors]

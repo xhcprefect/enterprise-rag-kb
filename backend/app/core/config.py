@@ -1,16 +1,22 @@
 """应用配置：全部来自环境变量 / .env，便于容器化与多环境部署。"""
 from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, model_validator
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True
     )
 
     # 应用
     APP_NAME: str = "Enterprise RAG Knowledge Base"
+    ENVIRONMENT: Literal["development", "production"] = "development"
+    CHAT_MAX_PER_USER: int = Field(default=2, ge=1)
+    CHAT_MAX_CONCURRENT: int = Field(default=50, ge=1)
     # 控制接口文档（/docs、/redoc、/openapi.json）是否注册。
     # 默认关闭：/openapi.json 会把全部接口、参数与响应结构公开，等于给扫描器一份说明书。
     DEBUG: bool = False
@@ -55,11 +61,14 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "bge-m3:latest"
     LLM_MODEL: str = "qwen3.5:0.8b"
     LLM_TEMPERATURE: float = 0.2
+    LLM_MAX_OUTPUT_TOKENS: int = Field(default=2048, ge=1, le=32768)
 
     # RAG
     CHUNK_SIZE: int = 800
     CHUNK_OVERLAP: int = 120
     RETRIEVAL_TOP_K: int = 6
+    # 默认不改变现有召回阈值；在固定问题集评测后再按需提高。
+    RETRIEVAL_MIN_SIMILARITY: float = Field(default=0.0, ge=0.0, le=1.0)
     # 单份文档最多占几条检索结果：长文档的分块彼此相似，不封顶会挤掉其他资料来源
     RETRIEVAL_MAX_PER_DOC: int = 3
     # 多轮记忆：最多带多少轮历史（user + assistant 各算一条，所以实际条数是 2 倍）
@@ -87,6 +96,20 @@ class Settings(BaseSettings):
     LOG_MAX_BYTES: int = 10 * 1024 * 1024   # 单文件 10MB
     LOG_BACKUP_COUNT: int = 5               # 保留 5 份历史
     LOG_SLOW_REQUEST_MS: int = 3000         # 超过该耗时的请求按 WARNING 记录
+
+    @model_validator(mode="after")
+    def validate_runtime(self):
+        if self.CHUNK_SIZE <= 0 or not 0 <= self.CHUNK_OVERLAP < self.CHUNK_SIZE:
+            raise ValueError("CHUNK_OVERLAP 必须大于等于 0 且小于 CHUNK_SIZE")
+        if self.MAX_UPLOAD_MB <= 0 or not 1 <= self.UPLOAD_CHUNK_SIZE <= 16 * 1024 * 1024:
+            raise ValueError("上传大小配置不合法")
+        if self.INGEST_STALE_SECONDS < 3 or self.THREAD_POOL_SIZE < 1:
+            raise ValueError("入库超时或线程池配置不合法")
+        if self.ENVIRONMENT == "production" and (
+            len(self.JWT_SECRET) < 32 or "please-change" in self.JWT_SECRET or "change-me" in self.JWT_SECRET
+        ):
+            raise ValueError("生产环境必须配置至少 32 位的随机 JWT_SECRET，不能使用模板值")
+        return self
 
     @property
     def cors_origins_list(self) -> list[str]:

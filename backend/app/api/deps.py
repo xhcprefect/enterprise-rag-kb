@@ -1,4 +1,5 @@
 """公共依赖：当前用户、角色校验、审计记录。"""
+from collections.abc import Generator
 import uuid
 
 from fastapi import Depends, HTTPException, Request, status
@@ -34,9 +35,19 @@ def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="账号已被禁用")
+    version = payload.get("ver", 0)
+    if type(version) is not int or version != user.token_version:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录状态已失效，请重新登录")
     # 供请求日志中间件记录"是谁在调接口"
     request.state.user = user
     return user
+
+
+def admit_chat(user: User = Depends(get_current_user)) -> Generator[None, None, None]:
+    # request 生命周期依赖：流结束、异常、客户端断开都会归还名额。
+    from app.core.limits import chat_admission
+    with chat_admission.slot(str(user.id)):
+        yield
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:

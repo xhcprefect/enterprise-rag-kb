@@ -20,7 +20,7 @@
           v-model="kbId"
           placeholder="选择知识库"
           class="kb-select"
-          :disabled="chatMode === 'chat'"
+          :disabled="chatMode === 'chat' || streaming"
           @change="onKbChange"
         >
           <el-option v-for="kb in kbs" :key="kb.id" :label="kb.name" :value="kb.id">
@@ -207,11 +207,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MarkdownIt from 'markdown-it'
-import hljs from 'highlight.js'
+import hljs from 'highlight.js/lib/common'
 import {
   chatApi,
   kbApi,
@@ -304,6 +304,7 @@ const streaming = ref(false)
 const errorMessage = ref('')
 const scrollRef = ref<HTMLElement>()
 let controller: AbortController | null = null
+let disposed = false
 
 const suggestions = ['这个知识库包含哪些内容？', '请总结主要信息', '有哪些关键流程？']
 const plainSuggestions = ['介绍一下你自己', '帮我写一封请假邮件', '解释一下什么是向量数据库']
@@ -365,6 +366,7 @@ async function loadKbs() {
 }
 
 async function onKbChange() {
+  if (streaming.value) return
   currentConversationId.value = null
   messages.value = []
   await loadConversations()
@@ -511,10 +513,12 @@ async function send() {
       },
       {
         onMeta(data) {
+          if (signal.aborted || disposed || controller !== myController) return
           currentConversationId.value = data.conversation_id
           pendingCitations = data.citations
         },
         onDelta(token) {
+          if (signal.aborted || disposed || controller !== myController) return
           pending += token
           if (!rafId) rafId = requestAnimationFrame(flush)
         },
@@ -531,7 +535,7 @@ async function send() {
     )
   } catch (err: any) {
     assistant.streaming = false
-    if (err?.name !== 'AbortError') {
+    if (controller === myController && !disposed && err?.name !== 'AbortError') {
       errorMessage.value = err?.message || '请求失败'
     }
   } finally {
@@ -561,7 +565,7 @@ async function send() {
     }
     // 回答已收口，此时再挂引用来源，视觉上"先答案后出处"
     assistant.citations = pendingCitations
-    await loadConversations()
+    if (!disposed && isCurrent) await loadConversations()
     // 用 followTail 而不是 scrollToBottom：用户中途往回翻时不该在收尾瞬间被拽回去。
     // 但新会话的第一条回答必须让它可见——那时用户本来就在底部，stick 为 true，
     // 直接调用即可。
@@ -571,6 +575,11 @@ async function send() {
 }
 
 onMounted(loadKbs)
+onBeforeUnmount(() => {
+  disposed = true
+  controller?.abort()
+  controller = null
+})
 </script>
 
 <style scoped>

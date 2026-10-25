@@ -33,8 +33,9 @@ class UploadSession(Base, TimestampMixin):
     kb_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), index=True
     )
-    # sha256(kb_id:filename:file_size)，只用于匹配"同一次上传"，不做安全校验
+    # sha256(kb_id:user_id:filename:file_size:content_sha256)，仅相同内容可自动续传
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     file_ext: Mapped[str] = mapped_column(String(16), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)

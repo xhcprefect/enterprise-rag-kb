@@ -176,6 +176,8 @@ docker compose logs -f api        # 看启动日志
 > 数据量小的时候建不建都一样快，等文档多了才发现是全表扫描，排查成本高。
 > 索引用 `CREATE INDEX CONCURRENTLY` 建，不阻塞读写；重复执行是幂等的。
 
+- **备份与升级注意事项**：备份现在会短暂停止 API/worker，以保证数据库和上传文件一致；升级必须同步更新 API、worker 与前端，见 [OPTIMIZATION.md](OPTIMIZATION.md)。
+
 ## 数据与备份
 
 所有数据在 `${DATA_DIR}`（默认 `./data`）：
@@ -363,6 +365,10 @@ docker compose exec db psql -U postgres -d ragdb -c \
 ```
 
 ## 并发能力
+
+当前默认每用户最多 2 路、每个 API 进程最多 50 路问答，超限返回 429，
+通过 `CHAT_MAX_PER_USER` / `CHAT_MAX_CONCURRENT` 配置。以下线程池数据是历史压力测试，
+用于说明机制，不代表当前默认开放的并发配额。
 
 ### 瓶颈不是 CPU，是线程池槽位
 

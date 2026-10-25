@@ -15,11 +15,15 @@ logger = logging.getLogger(__name__)
 # 所以这些列要单独 ALTER。表还不存在时跳过（新库交给 create_all）。
 # 按表分组，新增表直接往里加一项即可。
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "users": {"token_version": "INTEGER NOT NULL DEFAULT 0"},
+    "upload_sessions": {"content_sha256": "VARCHAR(64)"},
     "documents": {
         "progress": "INTEGER NOT NULL DEFAULT 0",
         "cancel_requested": "BOOLEAN NOT NULL DEFAULT FALSE",
         "heartbeat_at": "TIMESTAMPTZ",
         "parse_done": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "index_version": "INTEGER NOT NULL DEFAULT 0",
+        "lease_id": "UUID",
     },
     "conversations": {
         # 普通对话模式新增；老会话默认按知识库问答解释，行为与升级前一致
@@ -108,6 +112,10 @@ def init_db(create_admin: bool = True) -> None:
                     settings.ADMIN_USERNAME,
                 )
             return
+        if settings.ENVIRONMENT == "production" and (
+            len(settings.ADMIN_PASSWORD) < 12 or settings.ADMIN_PASSWORD in {"Admin@123456", "change-me-on-first-login"}
+        ):
+            raise RuntimeError("首次创建生产管理员前必须配置至少 12 位的非默认 ADMIN_PASSWORD")
         admin = User(
             username=settings.ADMIN_USERNAME,
             display_name="系统管理员",

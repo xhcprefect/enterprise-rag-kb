@@ -170,7 +170,7 @@ def update_user(
     db: DBSession = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    user = db.get(User, user_id)
+    user = db.scalar(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
 
@@ -178,6 +178,7 @@ def update_user(
     password = data.pop("password", None)
     if password:
         user.password_hash = hash_password(password)
+    revoke = bool(password) or any(field in data and data[field] != getattr(user, field) for field in ("role", "is_active"))
     for field, value in data.items():
         setattr(user, field, value)
 
@@ -185,6 +186,8 @@ def update_user(
     if user.id == admin.id and (data.get("role") == "user" or data.get("is_active") is False):
         raise HTTPException(status_code=400, detail="不能修改自己的角色或禁用自己")
 
+    if revoke:
+        user.token_version += 1
     db.commit()
     db.refresh(user)
     changed = list(data) + (["password"] if password else [])
@@ -223,10 +226,14 @@ def change_password(
     user: User = Depends(get_current_user),
     db: DBSession = Depends(get_db),
 ):
+    user = db.scalar(select(User).where(User.id == user.id).with_for_update().execution_options(populate_existing=True))
+    if user is None:
+        raise HTTPException(status_code=401, detail="用户不存在")
     if not verify_password(payload.old_password, user.password_hash):
         logger.warning("修改密码失败（原密码错误）: %s", user.username)
         raise HTTPException(status_code=400, detail="原密码错误")
     user.password_hash = hash_password(payload.new_password)
+    user.token_version += 1
     db.commit()
     logger.info("修改密码成功: %s", user.username)
     write_audit(db, request, user, "password_change", user.username)

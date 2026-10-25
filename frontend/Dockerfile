@@ -14,7 +14,7 @@ COPY package.json package-lock.json ./
 RUN npm config set registry "${NPM_REGISTRY}" && npm ci
 
 COPY . .
-# npm run build = vue-tsc -b && vite build，类型错误会直接让构建失败
+# npm run build 先做无产物类型检查，再运行 vite build
 RUN npm run build
 
 FROM nginx:1.27-alpine

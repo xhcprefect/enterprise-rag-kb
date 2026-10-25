@@ -25,7 +25,6 @@ from app.models import Document, DocumentStatus
 from app.services.ingest import ingest_document_task
 from app.services.upload import cleanup_expired
 
-setup_logging("worker")
 logger = logging.getLogger("worker")
 
 IDLE_POLL_SECONDS = 2
@@ -47,9 +46,9 @@ def recover_stale(db: Session) -> int:
         update(Document)
         .where(
             Document.status == DocumentStatus.PROCESSING.value,
-            (Document.heartbeat_at.is_(None)) | (Document.heartbeat_at < deadline),
+            (Document.lease_id.is_(None)) | (Document.heartbeat_at.is_(None)) | (Document.heartbeat_at < deadline),
         )
-        .values(status=DocumentStatus.PENDING.value, heartbeat_at=None)
+        .values(status=DocumentStatus.PENDING.value, heartbeat_at=None, lease_id=None)
     )
     db.commit()
     if result.rowcount:
@@ -57,7 +56,7 @@ def recover_stale(db: Session) -> int:
     return result.rowcount or 0
 
 
-def claim_one(db: Session) -> uuid.UUID | None:
+def claim_one(db: Session) -> tuple[uuid.UUID, uuid.UUID] | None:
     """原子领取一个待处理文档。"""
     doc_id = db.scalar(
         select(Document.id)
@@ -70,19 +69,22 @@ def claim_one(db: Session) -> uuid.UUID | None:
         db.rollback()
         return None
 
+    lease_id = uuid.uuid4()
     result = db.execute(
         update(Document)
         .where(Document.id == doc_id)
         .values(
             status=DocumentStatus.PROCESSING.value,
+            lease_id=lease_id,
             heartbeat_at=datetime.now(timezone.utc),
         )
     )
     db.commit()
-    return doc_id if result.rowcount else None
+    return (doc_id, lease_id) if result.rowcount else None
 
 
 def main() -> int:
+    setup_logging("worker")
     # 不建管理员：那是 API 的职责。worker 只保证表结构就绪，否则两个容器并发启动时
     # worker 可能抢先用默认密码建出 admin，让 .env 里配置的密码永远不生效。
     init_db(create_admin=False)
@@ -110,15 +112,16 @@ def main() -> int:
                 logger.exception("周期清理失败")
 
         with SessionLocal() as db:
-            doc_id = claim_one(db)
+            claimed = claim_one(db)
 
-        if doc_id is None:
+        if claimed is None:
             time.sleep(IDLE_POLL_SECONDS)
             continue
 
+        doc_id, lease_id = claimed
         logger.info("领取任务: %s", doc_id)
         try:
-            ingest_document_task(str(doc_id))
+            ingest_document_task(str(doc_id), lease_id)
         except Exception:  # noqa: BLE001 - ingest 内部已兜底，这里只保 worker 存活
             logger.exception("任务异常退出: %s", doc_id)
 
