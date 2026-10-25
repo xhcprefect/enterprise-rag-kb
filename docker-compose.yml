@@ -55,6 +55,15 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # 文件描述符上限。镜像默认软限只有 1024（硬限 524288），而每路问答流在生成期间
+    # 都占着一个连接 + 一个上游连接 + 若干日志/DB fd。1024 在几百并发时就会开始
+    # accept 失败（表现为客户端 "Server disconnected without sending a response"）。
+    # 软限调到 65536，硬限不动：真正的天花板应交由 THREAD_POOL_SIZE 控制，
+    # 而不是让它隐式地卡在 fd 上。
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 15s
@@ -95,6 +104,12 @@ services:
     restart: unless-stopped
     ports:
       - "${WEB_PORT:-80}:80"
+    # 对外承接所有浏览器连接，同样是镜像默认的 1024 会先于 worker_connections 撞墙。
+    # Nginx 主进程需要更高上限才能把 worker 的 fd 拉到 65536。
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
     depends_on:
       api:
         condition: service_healthy
