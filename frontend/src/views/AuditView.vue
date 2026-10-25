@@ -2,6 +2,7 @@
   <div class="page">
     <div class="page-head">
       <div>
+        <span class="page-eyebrow">AUDIT TRAIL</span>
         <h2>审计日志</h2>
         <p>记录登录、知识库与文档变更、问答等关键操作</p>
       </div>
@@ -11,6 +12,7 @@
           placeholder="全部操作"
           clearable
           class="filter"
+          aria-label="按操作类型筛选"
           @change="onFilter"
         >
           <el-option v-for="(label, key) in ACTION_TEXT" :key="key" :label="label" :value="key" />
@@ -19,8 +21,9 @@
           v-model="usernameFilter"
           placeholder="按用户名筛选"
           clearable
-          class="filter"
+          class="filter user-filter"
           :prefix-icon="Search"
+          aria-label="按用户名筛选"
           @keyup.enter="onFilter"
           @clear="onFilter"
         />
@@ -36,7 +39,7 @@
           操作记录
           <span class="count-badge">{{ total }}</span>
         </div>
-        <span class="muted">共 {{ total }} 条，按时间倒序</span>
+        <span class="muted">按时间倒序排列</span>
       </div>
 
       <el-table v-loading="loading" :data="logs">
@@ -61,7 +64,7 @@
 
         <el-table-column label="对象" min-width="180" show-overflow-tooltip>
           <template #default="{ row }">
-            <span :class="{ muted: !row.target }">{{ row.target || '—' }}</span>
+            <span :class="{ 'is-empty': !row.target }">{{ row.target || '—' }}</span>
           </template>
         </el-table-column>
 
@@ -74,7 +77,16 @@
         <el-table-column label="详情" min-width="220">
           <template #default="{ row }">
             <span v-if="!row.detail" class="muted">—</span>
-            <span v-else class="detail-preview">{{ summarize(row.detail) }}</span>
+            <el-tooltip
+              v-else
+              :content="detailText(row.detail)"
+              placement="top"
+              :trigger="['hover', 'focus']"
+              :show-after="180"
+              popper-class="audit-detail-tip"
+            >
+              <span class="detail-preview" tabindex="0">{{ summarize(row.detail) }}</span>
+            </el-tooltip>
           </template>
         </el-table-column>
 
@@ -154,17 +166,33 @@ function actionType(action: string) {
   return 'success'
 }
 
-/** 详情对象压成一行摘要，完整内容悬浮查看 */
-function summarize(detail: Record<string, unknown>) {
-  if (typeof detail !== 'object' || detail === null) return String(detail)
+/** 未知值转成可读文本，对象用 JSON，避免出现 [object Object]。 */
+function detailValue(value: unknown): string {
+  if (value === null || value === undefined) return '—'
+  if (Array.isArray(value)) {
+    return value.length ? value.map(detailValue).join(', ') : '—'
+  }
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return '—'
+    }
+  }
+  return String(value)
+}
+
+/** 详情对象压成一行摘要，完整内容通过纯文本 tooltip 查看。 */
+function summarize(detail: Record<string, unknown> | null) {
+  if (typeof detail !== 'object' || detail === null) return detailValue(detail)
   const entries = Object.entries(detail)
   if (!entries.length) return '—'
-  return entries
-    .map(([key, value]) => {
-      const text = Array.isArray(value) ? value.join(', ') : String(value)
-      return `${key}: ${text}`
-    })
-    .join(' · ')
+  return entries.map(([key, value]) => `${key}: ${detailValue(value)}`).join(' · ')
+}
+
+/** 与摘要同源，仅供 tooltip 使用，始终按纯文本渲染。 */
+function detailText(detail: Record<string, unknown> | null) {
+  return summarize(detail)
 }
 
 function formatTime(value: string) {
@@ -199,20 +227,11 @@ onMounted(load)
 
 <style scoped>
 .filter {
-  width: 150px;
+  width: 156px;
 }
 
-.count-badge {
-  display: inline-block;
-  margin-left: 6px;
-  padding: 0 7px;
-  border-radius: 999px;
-  background: var(--brand-soft);
-  color: var(--brand);
-  font-size: 11.5px;
-  font-weight: 600;
-  line-height: 18px;
-  vertical-align: 1px;
+.user-filter {
+  width: 184px;
 }
 
 .actor {
@@ -224,48 +243,92 @@ onMounted(load)
 
 .actor-avatar {
   flex-shrink: 0;
+  border: 1px solid #dbe7d9;
+  background: #edf2e8;
+  color: #486246;
   font-size: 11px;
   font-weight: 600;
-  color: #fff;
-  background: linear-gradient(135deg, #9aa6bc, #7b8698);
 }
 
 .actor-name {
   overflow: hidden;
+  color: var(--text);
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 500;
-  color: var(--text);
+}
+
+.is-empty {
+  color: var(--text-3);
 }
 
 .ip {
+  display: inline-block;
   padding: 2px 7px;
+  border: 1px solid var(--line);
   border-radius: 5px;
-  background: #f4f6fb;
-  font-size: 11.5px;
+  background: var(--surface-soft);
   color: var(--text-2);
-  font-family: 'JetBrains Mono', Consolas, Monaco, monospace;
+  font-family: 'Cascadia Code', Consolas, Monaco, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
 }
 
 .detail-preview {
-  font-size: 12px;
-  color: var(--text-3);
-  line-height: 1.5;
   display: block;
+  max-width: 100%;
+  padding: 2px 0;
   overflow: hidden;
+  border-radius: 4px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.55;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: help;
+}
+
+.detail-preview:hover {
+  color: var(--text-2);
+}
+
+.detail-preview:focus-visible {
+  outline: 2px solid rgb(36 122 97 / 35%);
+  outline-offset: 2px;
 }
 
 .time {
-  font-size: 12.5px;
   color: var(--text-3);
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
+}
+
+:global(.audit-detail-tip) {
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 9px 12px;
+  color: #f3f7f4;
+  font-size: 12px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 900px) {
   .filter {
-    width: 120px;
+    width: 132px;
+  }
+
+  .user-filter {
+    width: 160px;
+  }
+}
+
+@media (max-width: 640px) {
+  .filter,
+  .user-filter {
+    flex: 1;
+    width: auto;
+    min-width: 130px;
   }
 }
 </style>

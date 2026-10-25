@@ -2,6 +2,7 @@
   <div class="page">
     <div class="page-head">
       <div>
+        <span class="page-eyebrow">ACCOUNT</span>
         <h2>个人中心</h2>
         <p>查看账号信息并修改登录密码</p>
       </div>
@@ -10,6 +11,11 @@
     <div class="profile-grid">
       <!-- 账号概览 -->
       <section class="panel">
+        <div class="panel-head">
+          <div class="panel-title">账号信息</div>
+          <span class="muted">只读信息</span>
+        </div>
+
         <div class="profile-hero">
           <el-avatar :size="64" class="hero-avatar">
             {{ (profile?.display_name || profile?.username || '?').charAt(0).toUpperCase() }}
@@ -34,7 +40,7 @@
           </div>
           <div class="info-row">
             <span class="info-label">邮箱</span>
-            <span class="info-value" :class="{ muted: !profile?.email }">
+            <span class="info-value" :class="{ 'is-empty': !profile?.email }">
               {{ profile?.email || '未填写' }}
             </span>
           </div>
@@ -52,7 +58,7 @@
       <section class="panel">
         <div class="panel-head">
           <div class="panel-title">修改密码</div>
-          <span class="muted">修改后请使用新密码重新登录</span>
+          <span class="muted">建议定期更换</span>
         </div>
 
         <div class="pwd-body">
@@ -62,6 +68,7 @@
                 v-model="form.old_password"
                 type="password"
                 show-password
+                autocomplete="current-password"
                 placeholder="请输入当前密码"
               />
             </el-form-item>
@@ -70,6 +77,7 @@
                 v-model="form.new_password"
                 type="password"
                 show-password
+                autocomplete="new-password"
                 placeholder="至少 6 位"
               />
             </el-form-item>
@@ -78,14 +86,16 @@
                 v-model="form.confirm"
                 type="password"
                 show-password
+                autocomplete="new-password"
                 placeholder="再次输入新密码"
               />
             </el-form-item>
-
-            <el-button type="primary" :loading="submitting" class="pwd-submit" @click="submit">
-              保存新密码
-            </el-button>
           </el-form>
+        </div>
+
+        <div class="panel-foot pwd-foot">
+          <span class="pwd-hint">保存后当前登录状态会失效，需要使用新密码重新登录</span>
+          <el-button type="primary" :loading="submitting" @click="submit">保存新密码</el-button>
         </div>
       </section>
     </div>
@@ -141,8 +151,8 @@ async function submit() {
 .profile-grid {
   display: grid;
   grid-template-columns: minmax(300px, 0.9fr) minmax(340px, 1.1fr);
-  gap: 16px;
   align-items: start;
+  gap: 18px;
   max-width: 1080px;
 }
 
@@ -150,43 +160,47 @@ async function submit() {
 .profile-hero {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 14px;
-  padding: 22px 22px 20px;
-  background: linear-gradient(135deg, #f7f9ff 0%, #ffffff 70%);
+  padding: 22px;
+  background: var(--brand-tint);
   border-bottom: 1px solid var(--line);
 }
 
 .hero-avatar {
   flex-shrink: 0;
+  overflow: hidden;
+  border: 1px solid #d3e5da;
+  border-radius: 18px;
+  background: var(--brand-soft);
+  color: var(--brand-dark);
   font-size: 24px;
-  font-weight: 600;
-  color: #fff;
-  background: linear-gradient(135deg, #6b8cff, #4c6ef5);
-  box-shadow: 0 6px 16px rgba(76, 110, 245, 0.28);
+  font-weight: 650;
 }
 
 .hero-text {
   flex: 1;
-  min-width: 0;
+  min-width: 140px;
 }
 
 .hero-text h3 {
   margin: 0 0 3px;
+  overflow: hidden;
+  color: var(--text);
   font-size: 17px;
   font-weight: 650;
-  color: var(--text);
-  overflow: hidden;
+  letter-spacing: -0.01em;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .hero-account {
-  font-size: 12.5px;
   color: var(--text-3);
+  font-size: 12.5px;
 }
 
 .info-list {
-  padding: 8px 22px 20px;
+  padding: 6px 22px 16px;
 }
 
 .info-row {
@@ -194,8 +208,8 @@ async function submit() {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 0;
-  border-bottom: 1px dashed var(--line);
+  padding: 13px 0;
+  border-bottom: 1px solid var(--line);
   font-size: 13px;
 }
 
@@ -204,15 +218,15 @@ async function submit() {
 }
 
 .info-label {
-  color: var(--text-3);
   flex-shrink: 0;
+  color: var(--text-3);
 }
 
 .info-value {
+  overflow: hidden;
   color: var(--text);
   font-weight: 500;
   text-align: right;
-  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -221,8 +235,13 @@ async function submit() {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-weight: 400;
   color: var(--text-2);
+  font-weight: 400;
+}
+
+.info-value.is-empty {
+  color: var(--text-3);
+  font-weight: 400;
 }
 
 .status-dot {
@@ -233,7 +252,7 @@ async function submit() {
 
 .status-dot.on {
   background: var(--success);
-  box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.14);
+  box-shadow: 0 0 0 3px rgb(35 129 93 / 13%);
 }
 
 .status-dot.off {
@@ -242,17 +261,55 @@ async function submit() {
 
 /* 修改密码 */
 .pwd-body {
-  padding: 20px 22px 22px;
+  padding: 22px 24px 4px;
 }
 
-.pwd-submit {
-  width: 100%;
-  margin-top: 4px;
+.pwd-body :deep(.el-form-item:last-child) {
+  margin-bottom: 18px;
 }
 
-@media (max-width: 900px) {
+.pwd-foot {
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  padding: 15px 24px 20px;
+  background: var(--surface);
+}
+
+.pwd-hint {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+@media (max-width: 1000px) {
   .profile-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .profile-hero {
+    padding: 18px;
+  }
+
+  .info-list {
+    padding-inline: 18px;
+  }
+
+  .pwd-body {
+    padding: 18px 18px 2px;
+  }
+
+  .pwd-foot {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 14px 18px 18px;
+  }
+
+  .pwd-foot .el-button {
+    width: 100%;
   }
 }
 </style>

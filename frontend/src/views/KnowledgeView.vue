@@ -2,6 +2,7 @@
   <div class="page">
     <div class="page-head">
       <div>
+        <span class="page-eyebrow">KNOWLEDGE BASE</span>
         <h2>知识库管理</h2>
         <p>每个知识库对应一套独立的向量集合，文档互不干扰</p>
       </div>
@@ -12,6 +13,7 @@
           clearable
           class="search"
           :prefix-icon="Search"
+          aria-label="搜索知识库"
         />
         <el-button v-if="userStore.isAdmin" type="primary" @click="openCreate">
           <el-icon><Plus /></el-icon>新建知识库
@@ -19,97 +21,133 @@
       </div>
     </div>
 
-    <!-- 概览 -->
-    <div class="stats">
-      <div class="stat">
-        <div class="stat-icon blue"><el-icon><Files /></el-icon></div>
-        <div class="stat-body">
-          <span class="stat-label">知识库</span>
-          <strong class="stat-value">{{ kbs.length }}</strong>
+    <!-- 概览：只汇总当前列表的真实数据 -->
+    <section class="overview" aria-label="知识库概览">
+      <div class="overview-item">
+        <span class="overview-icon"><el-icon><Files /></el-icon></span>
+        <div class="overview-copy">
+          <span class="overview-label">知识库</span>
+          <strong class="overview-value">{{ kbs.length }}</strong>
         </div>
       </div>
-      <div class="stat">
-        <div class="stat-icon green"><el-icon><Document /></el-icon></div>
-        <div class="stat-body">
-          <span class="stat-label">文档总数</span>
-          <strong class="stat-value">{{ totalDocuments }}</strong>
+      <div class="overview-item">
+        <span class="overview-icon moss"><el-icon><Document /></el-icon></span>
+        <div class="overview-copy">
+          <span class="overview-label">文档总数</span>
+          <strong class="overview-value">{{ totalDocuments }}</strong>
         </div>
       </div>
-      <div class="stat">
-        <div class="stat-icon amber"><el-icon><Unlock /></el-icon></div>
-        <div class="stat-body">
-          <span class="stat-label">公开知识库</span>
-          <strong class="stat-value">{{ publicCount }}</strong>
+      <div class="overview-item">
+        <span class="overview-icon warm"><el-icon><Unlock /></el-icon></span>
+        <div class="overview-copy">
+          <span class="overview-label">公开知识库</span>
+          <strong class="overview-value">{{ publicCount }}</strong>
         </div>
       </div>
-      <div class="stat">
-        <div class="stat-icon slate"><el-icon><Lock /></el-icon></div>
-        <div class="stat-body">
-          <span class="stat-label">私有知识库</span>
-          <strong class="stat-value">{{ kbs.length - publicCount }}</strong>
+      <div class="overview-item">
+        <span class="overview-icon neutral"><el-icon><Lock /></el-icon></span>
+        <div class="overview-copy">
+          <span class="overview-label">私有知识库</span>
+          <strong class="overview-value">{{ kbs.length - publicCount }}</strong>
         </div>
       </div>
-    </div>
+    </section>
 
-    <div v-loading="loading" class="kb-grid">
-      <article
-        v-for="kb in filteredKbs"
-        :key="kb.id"
-        class="kb-card"
-        @click="goDocuments(kb)"
-      >
-        <header class="kb-top">
-          <div class="kb-mark"><el-icon :size="20"><Folder /></el-icon></div>
+    <section class="library" aria-labelledby="library-title">
+      <div class="section-head">
+        <div>
+          <h3 id="library-title">全部知识库</h3>
+          <p v-if="keyword">找到 {{ filteredKbs.length }} 个匹配的知识库</p>
+          <p v-else>打开知识库管理文档，或直接进入问答</p>
+        </div>
+        <span class="count-badge">{{ filteredKbs.length }}</span>
+      </div>
 
-          <el-dropdown
-            v-if="userStore.isAdmin"
-            trigger="click"
-            @command="(cmd: string) => onCommand(cmd, kb)"
+      <div v-loading="loading" class="kb-area">
+        <div v-if="filteredKbs.length" class="kb-grid">
+          <article
+            v-for="kb in filteredKbs"
+            :key="kb.id"
+            class="kb-card"
+            @click="goDocuments(kb)"
           >
-            <button class="kb-more" type="button" @click.stop>
-              <el-icon><MoreFilled /></el-icon>
-            </button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="edit">
-                  <el-icon><EditPen /></el-icon>编辑
-                </el-dropdown-item>
-                <el-dropdown-item command="delete" divided>
-                  <el-icon><Delete /></el-icon>删除
-                </el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
-        </header>
+            <header class="kb-top">
+              <div class="kb-mark"><el-icon :size="19"><Folder /></el-icon></div>
 
-        <h3 class="kb-name">{{ kb.name }}</h3>
-        <p class="kb-desc">{{ kb.description || '暂无描述' }}</p>
+              <el-dropdown
+                v-if="userStore.isAdmin"
+                trigger="click"
+                @command="(cmd: string) => onCommand(cmd, kb)"
+              >
+                <button
+                  class="kb-more"
+                  type="button"
+                  aria-haspopup="menu"
+                  :aria-label="`知识库操作：${kb.name}`"
+                  @click.stop
+                >
+                  <el-icon><MoreFilled /></el-icon>
+                </button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="edit">
+                      <el-icon><EditPen /></el-icon>编辑
+                    </el-dropdown-item>
+                    <el-dropdown-item command="delete" divided>
+                      <el-icon><Delete /></el-icon>删除
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </header>
 
-        <div class="kb-meta">
-          <span class="kb-stat">
-            <el-icon :size="13"><Document /></el-icon>{{ kb.document_count }} 篇文档
-          </span>
-          <el-tag size="small" :type="kb.is_public ? 'success' : 'warning'" effect="light" round>
-            {{ kb.is_public ? '公开' : '私有' }}
-          </el-tag>
+            <h3 class="kb-name">
+              <button
+                type="button"
+                class="kb-name-btn"
+                :title="kb.name"
+                @click.stop="goDocuments(kb)"
+              >
+                {{ kb.name }}
+              </button>
+            </h3>
+            <p class="kb-desc">{{ kb.description || '暂无描述' }}</p>
+
+            <div class="kb-meta">
+              <span class="kb-stat">
+                <el-icon :size="13"><Document /></el-icon>{{ kb.document_count }} 篇文档
+              </span>
+              <el-tag size="small" :type="kb.is_public ? 'success' : 'warning'" effect="light" round>
+                {{ kb.is_public ? '公开' : '私有' }}
+              </el-tag>
+            </div>
+
+            <div class="kb-actions">
+              <el-button size="small" @click.stop="goDocuments(kb)">管理文档</el-button>
+              <el-button size="small" type="primary" plain @click.stop="goChat(kb)">开始问答</el-button>
+            </div>
+          </article>
+
+          <button v-if="userStore.isAdmin" class="kb-card kb-new" type="button" @click="openCreate">
+            <span class="kb-new-icon"><el-icon :size="22"><Plus /></el-icon></span>
+            <span class="kb-new-title">新建知识库</span>
+            <span class="kb-new-hint">为新的资料集合建立独立空间</span>
+          </button>
         </div>
 
-        <div class="kb-actions">
-          <el-button size="small" @click.stop="goDocuments(kb)">管理文档</el-button>
-          <el-button size="small" type="primary" plain @click.stop="goChat(kb)">开始问答</el-button>
+        <div v-else-if="!loading" class="library-empty">
+          <el-empty
+            :description="keyword ? '没有匹配的知识库' : '还没有知识库，先创建一个吧'"
+            :image-size="84"
+          >
+            <el-button v-if="keyword" @click="keyword = ''">清除搜索</el-button>
+            <el-button v-else-if="userStore.isAdmin" type="primary" @click="openCreate">
+              <el-icon><Plus /></el-icon>新建知识库
+            </el-button>
+          </el-empty>
         </div>
-      </article>
-
-      <button v-if="userStore.isAdmin" class="kb-card kb-new" type="button" @click="openCreate">
-        <el-icon :size="26"><Plus /></el-icon>
-        <span>新建知识库</span>
-      </button>
-    </div>
-
-    <el-empty
-      v-if="!loading && !filteredKbs.length"
-      :description="keyword ? '没有匹配的知识库' : '还没有知识库，先创建一个吧'"
-    />
+      </div>
+    </section>
 
     <el-dialog v-model="dialogVisible" :title="editing ? '编辑知识库' : '新建知识库'" width="520px">
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
@@ -259,89 +297,127 @@ onMounted(load)
   width: 220px;
 }
 
-/* ---------- 概览卡片 ---------- */
-.stats {
+/* ---------- 概览 ---------- */
+.overview {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 14px;
-}
-
-.stat {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 16px 18px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  overflow: hidden;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-sm);
 }
 
-.stat-icon {
-  width: 40px;
-  height: 40px;
-  flex-shrink: 0;
-  border-radius: 11px;
+.overview-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  padding: 21px 22px;
+}
+
+.overview-item + .overview-item {
+  border-left: 1px solid var(--line);
+}
+
+.overview-icon {
   display: grid;
+  flex-shrink: 0;
   place-items: center;
-  font-size: 19px;
+  width: 39px;
+  height: 39px;
+  border-radius: 11px;
+  background: var(--brand-soft);
+  color: var(--brand);
+  font-size: 18px;
 }
 
-.stat-icon.blue {
-  background: #eef1ff;
-  color: #4c6ef5;
+.overview-icon.moss {
+  background: #f2f6ef;
+  color: #5c7551;
 }
 
-.stat-icon.green {
-  background: #eaf6f1;
-  color: #067647;
+.overview-icon.warm {
+  background: #fbf5eb;
+  color: var(--warning);
 }
 
-.stat-icon.amber {
-  background: #fdf3ea;
-  color: #b54708;
+.overview-icon.neutral {
+  background: #f3f5f3;
+  color: #6f7d76;
 }
 
-.stat-icon.slate {
-  background: #f1f3f8;
-  color: #7b8598;
-}
-
-.stat-body {
+.overview-copy {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
 }
 
-.stat-label {
-  font-size: 12.5px;
+.overview-label {
   color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
 }
 
-.stat-value {
-  font-size: 22px;
-  font-weight: 650;
-  line-height: 1.15;
+.overview-value {
   color: var(--text);
-  letter-spacing: -0.01em;
+  font-size: 23px;
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
 }
 
-/* ---------- 知识库卡片 ---------- */
+/* ---------- 列表 ---------- */
+.library {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 2px 2px 0;
+}
+
+.section-head h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.5;
+}
+
+.section-head p {
+  margin: 4px 0 0;
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.kb-area {
+  min-height: 220px;
+}
+
 .kb-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
-  align-items: start;
+  grid-template-columns: repeat(auto-fill, minmax(285px, 1fr));
+  align-items: stretch;
   gap: 16px;
-  min-height: 120px;
 }
 
 .kb-card {
   position: relative;
   display: flex;
   flex-direction: column;
-  min-height: 218px;
-  padding: 18px 18px 16px;
+  min-width: 0;
+  min-height: 234px;
+  padding: 18px 19px 16px;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
@@ -352,7 +428,7 @@ onMounted(load)
 
 .kb-card:hover {
   transform: translateY(-2px);
-  border-color: #cfd9f5;
+  border-color: #cddfd5;
   box-shadow: var(--shadow-md);
 }
 
@@ -364,53 +440,73 @@ onMounted(load)
 }
 
 .kb-mark {
-  width: 38px;
-  height: 38px;
-  border-radius: 11px;
   display: grid;
   place-items: center;
-  background: linear-gradient(135deg, #eef1ff 0%, #e4e9ff 100%);
+  width: 38px;
+  height: 38px;
+  border: 1px solid #e0ece5;
+  border-radius: 11px;
+  background: var(--brand-tint);
   color: var(--brand);
 }
 
 .kb-more {
-  width: 28px;
-  height: 28px;
-  border: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
   border-radius: 8px;
   background: transparent;
   color: var(--text-3);
   cursor: pointer;
-  display: grid;
-  place-items: center;
   transition: background 0.15s ease, color 0.15s ease;
 }
 
 .kb-more:hover {
-  background: #f2f4f9;
-  color: var(--text-2);
+  background: var(--brand-soft);
+  color: var(--brand);
 }
 
 .kb-name {
   margin: 0 0 6px;
-  font-size: 15.5px;
+  min-width: 0;
+  font-size: 16px;
   font-weight: 650;
-  color: var(--text);
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+}
+
+.kb-name-btn {
+  display: block;
+  max-width: 100%;
+  padding: 0;
   overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.kb-name-btn:hover {
+  color: var(--brand);
 }
 
 .kb-desc {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.6;
-  color: var(--text-3);
-  height: 42px;
   display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  height: 42px;
+  margin: 0;
   overflow: hidden;
+  color: var(--text-3);
+  font-size: 13px;
+  line-height: 1.62;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .kb-meta {
@@ -425,8 +521,9 @@ onMounted(load)
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 12.5px;
   color: var(--text-3);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .kb-actions {
@@ -442,39 +539,111 @@ onMounted(load)
   margin: 0;
 }
 
-/* 新建卡片：与同一行的知识库卡片等高，底边对齐 */
+/* 新建卡片 */
 .kb-new {
-  align-self: stretch;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  min-height: 218px;
-  border: 1.5px dashed #d3daea;
+  gap: 7px;
+  border: 1.5px dashed var(--line-strong);
   background: transparent;
   box-shadow: none;
   color: var(--text-3);
   font-family: inherit;
-  font-size: 13.5px;
+  font-size: 13px;
 }
 
 .kb-new:hover {
   border-color: var(--brand);
+  background: var(--brand-tint);
   color: var(--brand);
-  background: rgba(76, 110, 245, 0.03);
   box-shadow: none;
+}
+
+.kb-new-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  margin-bottom: 2px;
+  border-radius: 11px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--brand);
+}
+
+.kb-new-title {
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 550;
+}
+
+.kb-new:hover .kb-new-title {
+  color: var(--brand);
+}
+
+.kb-new-hint {
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.library-empty {
+  padding: 22px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
 }
 
 .switch-row {
   display: flex;
   align-items: center;
   gap: 10px;
+  color: var(--text-2);
   font-size: 13px;
-  color: var(--text-3);
+}
+
+@media (max-width: 1020px) {
+  .overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .overview-item:nth-child(3) {
+    border-left: 0;
+  }
+
+  .overview-item:nth-child(n + 3) {
+    border-top: 1px solid var(--line);
+  }
 }
 
 @media (max-width: 640px) {
   .search {
     width: 140px;
+  }
+
+  .overview-item {
+    gap: 10px;
+    padding: 15px 14px;
+  }
+
+  .overview-icon {
+    width: 33px;
+    height: 33px;
+    font-size: 16px;
+  }
+
+  .overview-value {
+    font-size: 21px;
+  }
+
+  .kb-card {
+    min-height: 220px;
+    padding: 16px;
+  }
+
+  .kb-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

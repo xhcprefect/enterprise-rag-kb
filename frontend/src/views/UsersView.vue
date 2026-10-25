@@ -2,6 +2,7 @@
   <div class="page">
     <div class="page-head">
       <div>
+        <span class="page-eyebrow">ACCESS CONTROL</span>
         <h2>用户管理</h2>
         <p>管理员可创建账号、分配角色、重置密码</p>
       </div>
@@ -12,6 +13,7 @@
           clearable
           class="search"
           :prefix-icon="Search"
+          aria-label="搜索用户"
           @keyup.enter="onSearch"
           @clear="onSearch"
         />
@@ -30,6 +32,7 @@
           账号列表
           <span class="count-badge">{{ total }}</span>
         </div>
+        <span class="muted">管理员可调整角色与账号状态</span>
       </div>
 
       <el-table v-loading="loading" :data="users">
@@ -49,7 +52,7 @@
 
         <el-table-column label="邮箱" min-width="190" show-overflow-tooltip>
           <template #default="{ row }">
-            <span :class="{ muted: !row.email }">{{ row.email || '未填写' }}</span>
+            <span :class="{ 'is-empty': !row.email }">{{ row.email || '未填写' }}</span>
           </template>
         </el-table-column>
 
@@ -76,19 +79,21 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="180" fixed="right">
+        <el-table-column label="操作" width="190" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-            <el-button link type="warning" size="small" @click="resetPassword(row)">重置密码</el-button>
-            <el-button
-              link
-              type="danger"
-              size="small"
-              :disabled="row.id === userStore.profile?.id"
-              @click="remove(row)"
-            >
-              删除
-            </el-button>
+            <div class="row-actions">
+              <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
+              <el-button link type="warning" size="small" @click="resetPassword(row)">重置密码</el-button>
+              <el-button
+                link
+                type="danger"
+                size="small"
+                :disabled="row.id === userStore.profile?.id"
+                @click="remove(row)"
+              >
+                删除
+              </el-button>
+            </div>
           </template>
         </el-table-column>
 
@@ -248,7 +253,7 @@
           <el-table-column prop="row" label="行号" width="70" />
           <el-table-column prop="username" label="用户名" min-width="130">
             <template #default="{ row }">
-              <span :class="{ muted: !row.username }">{{ row.username || '（空）' }}</span>
+              <span :class="{ 'is-empty': !row.username }">{{ row.username || '（空）' }}</span>
             </template>
           </el-table-column>
           <el-table-column prop="reason" label="原因" min-width="240" show-overflow-tooltip />
@@ -573,19 +578,6 @@ onMounted(load)
   width: 220px;
 }
 
-.count-badge {
-  display: inline-block;
-  margin-left: 6px;
-  padding: 0 7px;
-  border-radius: 999px;
-  background: var(--brand-soft);
-  color: var(--brand);
-  font-size: 11.5px;
-  font-weight: 600;
-  line-height: 18px;
-  vertical-align: 1px;
-}
-
 .user-cell {
   display: flex;
   align-items: center;
@@ -595,14 +587,17 @@ onMounted(load)
 
 .user-avatar {
   flex-shrink: 0;
+  border: 1px solid #dbe7d9;
+  background: #edf2e8;
+  color: #486246;
   font-size: 13px;
   font-weight: 600;
-  color: #fff;
-  background: linear-gradient(135deg, #9aa6bc, #7b8698);
 }
 
 .user-avatar.admin {
-  background: linear-gradient(135deg, #6b8cff, #4c6ef5);
+  border-color: #cfe1d7;
+  background: var(--brand);
+  color: #fff;
 }
 
 .user-names {
@@ -625,6 +620,10 @@ onMounted(load)
   color: var(--text-3);
 }
 
+.is-empty {
+  color: var(--text-3);
+}
+
 .status-cell {
   display: inline-flex;
   align-items: center;
@@ -641,7 +640,7 @@ onMounted(load)
 
 .status-dot.on {
   background: var(--success);
-  box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.14);
+  box-shadow: 0 0 0 3px rgb(35 129 93 / 13%);
 }
 
 .status-dot.off {
@@ -649,9 +648,20 @@ onMounted(load)
 }
 
 .time {
-  font-size: 12.5px;
   color: var(--text-3);
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
+}
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.row-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 
 .form-grid {
@@ -697,7 +707,7 @@ onMounted(load)
 
 .drop-icon {
   font-size: 34px;
-  color: var(--text-3, #98a2b3);
+  color: var(--text-3);
 }
 
 .drop-hint {
@@ -758,34 +768,39 @@ onMounted(load)
 
 .import-summary {
   display: flex;
-  gap: 12px;
+  gap: 10px;
   margin-bottom: 16px;
 }
 
 .summary-item {
-  flex: 1;
   display: flex;
+  flex: 1;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
-  padding: 14px 8px;
-  border-radius: 10px;
-  background: var(--surface-2, #f5f7fa);
+  gap: 3px;
+  padding: 15px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-soft);
 }
 
 .summary-item.ok {
-  background: rgba(18, 183, 106, 0.08);
+  border-color: #dcebe2;
+  background: #f2f8f4;
 }
 
 .summary-item.bad {
-  background: rgba(240, 68, 56, 0.08);
+  border-color: #f0dbd8;
+  background: #fcf3f2;
 }
 
 .summary-num {
-  font-size: 22px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
   color: var(--text);
+  font-size: 23px;
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
 }
 
 .summary-item.ok .summary-num {
@@ -793,7 +808,7 @@ onMounted(load)
 }
 
 .summary-item.bad .summary-num {
-  color: var(--danger, #f04438);
+  color: var(--danger);
 }
 
 .summary-label {

@@ -1,11 +1,17 @@
 <template>
   <div class="page">
-    <div class="page-head">
+    <div class="page-head docs-head">
       <div class="title-group">
-        <el-button class="back-btn" circle @click="router.push('/knowledge')">
+        <el-button
+          class="back-btn"
+          circle
+          aria-label="返回知识库列表"
+          @click="router.push('/knowledge')"
+        >
           <el-icon><ArrowLeft /></el-icon>
         </el-button>
-        <div>
+        <div class="title-copy">
+          <span class="page-eyebrow">DOCUMENTS</span>
           <h2>{{ kb?.name || '文档管理' }}</h2>
           <p>{{ kb?.description || '上传文档后系统会自动解析、切分并向量化入库' }}</p>
         </div>
@@ -34,7 +40,10 @@
         <span class="format-label">支持格式</span>
         <span v-for="fmt in FORMATS" :key="fmt" class="format-chip">{{ fmt }}</span>
       </div>
-      <span class="format-tip">大文件分片上传，可暂停、可断点续传</span>
+      <span class="format-tip">
+        <el-icon><InfoFilled /></el-icon>
+        大文件分片上传，可暂停、可断点续传
+      </span>
     </div>
 
     <!-- 未完成的上传：刷新/关闭页面后可从这里继续 -->
@@ -57,7 +66,7 @@
     </el-alert>
 
     <!-- 上传进度 -->
-    <el-card v-if="uploadTask" class="upload-card" shadow="never">
+    <section v-if="uploadTask" class="upload-card" aria-label="上传进度">
       <div class="upload-head">
         <div class="upload-file">
           <div class="upload-icon" :class="uploadTask.phase">
@@ -122,7 +131,7 @@
           {{ uploadTask.chunksDone }} / {{ uploadTask.totalChunks }} 片
         </span>
       </div>
-    </el-card>
+    </section>
 
     <!-- 文档表 -->
     <div class="panel">
@@ -135,8 +144,8 @@
           v-model="statusFilter"
           placeholder="全部状态"
           clearable
-          size="small"
           class="status-filter"
+          aria-label="按状态筛选文档"
           @change="onFilterChange"
         >
           <el-option label="已就绪" value="ready" />
@@ -223,19 +232,21 @@
           </template>
         </el-table-column>
 
-        <el-table-column v-if="userStore.isAdmin" label="操作" width="180" fixed="right">
+        <el-table-column v-if="userStore.isAdmin" label="操作" width="210" fixed="right">
           <template #default="{ row }">
-            <el-button
-              v-if="row.status === 'pending' || row.status === 'processing'"
-              link
-              type="warning"
-              size="small"
-              @click="cancelIngest(row)"
-            >
-              取消入库
-            </el-button>
-            <el-button link type="primary" size="small" @click="reindex(row)">重建索引</el-button>
-            <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
+            <div class="row-actions">
+              <el-button
+                v-if="row.status === 'pending' || row.status === 'processing'"
+                link
+                type="warning"
+                size="small"
+                @click="cancelIngest(row)"
+              >
+                取消入库
+              </el-button>
+              <el-button link type="primary" size="small" @click="reindex(row)">重建索引</el-button>
+              <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
+            </div>
           </template>
         </el-table-column>
 
@@ -844,12 +855,25 @@ onBeforeUnmount(() => {
 .title-group {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
+  gap: 14px;
+  min-width: 0;
+}
+
+.title-copy {
+  min-width: 0;
+}
+
+.title-copy h2 {
+  overflow-wrap: anywhere;
 }
 
 .back-btn {
-  margin-top: 2px;
   flex-shrink: 0;
+  margin-top: 23px;
+}
+
+.docs-head {
+  gap: 20px;
 }
 
 /* ---------- 支持格式条 ---------- */
@@ -857,9 +881,9 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
   flex-wrap: wrap;
-  padding: 11px 16px;
+  gap: 12px 20px;
+  padding: 13px 18px;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -869,29 +893,32 @@ onBeforeUnmount(() => {
 .format-tags {
   display: flex;
   align-items: center;
-  gap: 6px;
   flex-wrap: wrap;
+  gap: 6px;
 }
 
 .format-label {
-  font-size: 12.5px;
-  color: var(--text-3);
   margin-right: 4px;
+  color: var(--text-3);
+  font-size: 12px;
 }
 
 .format-chip {
   padding: 2px 9px;
+  border: 1px solid #e2ece5;
   border-radius: 6px;
-  background: #f2f5fb;
-  border: 1px solid #e6ebf5;
+  background: var(--brand-tint);
+  color: var(--brand-dark);
   font-size: 11.5px;
   font-weight: 500;
-  color: var(--text-2);
 }
 
 .format-tip {
-  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: var(--text-3);
+  font-size: 12px;
 }
 
 .resume-alert {
@@ -902,59 +929,59 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   width: 100%;
 }
 
 /* ---------- 上传进度卡 ---------- */
 .upload-card {
-  border-radius: var(--radius);
-  border-color: #d9e2fb;
-  background: linear-gradient(180deg, #fbfcff 0%, #ffffff 100%);
-}
-
-.upload-card :deep(.el-card__body) {
-  padding: 16px 18px;
+  padding: 17px 20px 15px;
+  border: 1px solid #dbe9e1;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
 }
 
 .upload-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 12px;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+  margin-bottom: 14px;
 }
 
 .upload-file {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 11px;
   min-width: 0;
 }
 
 .upload-icon {
-  width: 34px;
-  height: 34px;
-  flex-shrink: 0;
-  border-radius: 10px;
   display: grid;
+  flex-shrink: 0;
   place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
   background: var(--brand-soft);
   color: var(--brand);
 }
 
 .upload-icon.done {
-  background: #e9f9f1;
+  background: #eef7f2;
   color: var(--success);
 }
 
 .upload-icon.failed {
-  background: #fdecea;
+  background: #fcf1f0;
   color: var(--danger);
 }
 
 .upload-icon.paused {
-  background: #fff5e8;
+  background: #fbf5eb;
   color: var(--warning);
 }
 
@@ -976,27 +1003,39 @@ onBeforeUnmount(() => {
 }
 
 .upload-name {
+  overflow: hidden;
+  color: var(--text);
   font-size: 13.5px;
   font-weight: 600;
-  color: var(--text);
-  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .upload-size {
-  font-size: 12px;
   color: var(--text-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .upload-actions {
   display: flex;
-  gap: 8px;
   flex-shrink: 0;
+  gap: 8px;
 }
 
 .upload-progress {
   margin-bottom: 2px;
+}
+
+.upload-progress :deep(.el-progress-bar__outer) {
+  background: #edf2ee;
+}
+
+.upload-progress :deep(.el-progress__text) {
+  min-width: 56px;
+  color: var(--text-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .upload-foot {
@@ -1005,31 +1044,18 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 12px;
   margin-top: 8px;
-  font-size: 12px;
   color: var(--text-3);
+  font-size: 12px;
 }
 
 .upload-chunks {
-  font-variant-numeric: tabular-nums;
   color: var(--text-3);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- 表格 ---------- */
-.count-badge {
-  display: inline-block;
-  margin-left: 6px;
-  padding: 0 7px;
-  border-radius: 999px;
-  background: var(--brand-soft);
-  color: var(--brand);
-  font-size: 11.5px;
-  font-weight: 600;
-  line-height: 18px;
-  vertical-align: 1px;
-}
-
 .status-filter {
-  width: 130px;
+  width: 142px;
 }
 
 .file-cell {
@@ -1040,56 +1066,65 @@ onBeforeUnmount(() => {
 }
 
 .file-ext {
-  flex-shrink: 0;
-  width: 40px;
-  height: 24px;
-  border-radius: 6px;
   display: grid;
+  flex-shrink: 0;
   place-items: center;
-  font-size: 10px;
+  width: 38px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 9.5px;
   font-weight: 700;
-  letter-spacing: 0.02em;
-  color: #fff;
-  background: #8d97a9;
+  letter-spacing: 0.03em;
 }
 
 .file-ext.pdf {
-  background: #ef5350;
+  border-color: #f0dad7;
+  background: #fbf0ee;
+  color: #af5147;
 }
 
 .file-ext.doc {
-  background: #3b82f6;
+  border-color: #dee6ef;
+  background: #f1f4f8;
+  color: #4c647d;
 }
 
 .file-ext.xls,
 .file-ext.csv {
-  background: #12b76a;
+  border-color: #dcebe2;
+  background: #eef7f2;
+  color: #23704f;
 }
 
 .file-ext.md {
-  background: #6366f1;
+  border-color: #e5e9dc;
+  background: #f4f6ee;
+  color: #606e4c;
 }
 
 .file-ext.txt {
-  background: #8d97a9;
+  border-color: #e5eae6;
+  background: #f3f5f3;
+  color: #64746a;
 }
 
 .file-name {
-  font-weight: 500;
-  color: var(--text);
   overflow: hidden;
+  color: var(--text);
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .num {
-  font-variant-numeric: tabular-nums;
   color: var(--text-2);
+  font-variant-numeric: tabular-nums;
 }
 
 .time {
-  font-size: 12.5px;
   color: var(--text-3);
+  font-size: 12.5px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1097,7 +1132,69 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  color: var(--success);
   font-size: 12.5px;
-  color: var(--el-color-success);
+}
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.row-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+
+@media (max-width: 900px) {
+  .back-btn {
+    margin-top: 21px;
+  }
+
+  .format-bar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+}
+
+@media (max-width: 640px) {
+  .docs-head {
+    flex-wrap: wrap;
+  }
+
+  .title-group {
+    gap: 10px;
+  }
+
+  .back-btn {
+    width: 32px;
+    height: 32px;
+    margin-top: 21px;
+  }
+
+  .status-filter {
+    width: 100%;
+  }
+
+  .upload-card {
+    padding: 15px 16px 14px;
+  }
+
+  .upload-head {
+    align-items: flex-start;
+  }
+
+  .upload-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .upload-foot {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
 }
 </style>
