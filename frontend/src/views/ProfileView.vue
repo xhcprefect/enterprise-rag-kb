@@ -2,9 +2,9 @@
   <div class="page">
     <div class="page-head">
       <div>
-        <span class="page-eyebrow">ACCOUNT</span>
-        <h2>个人中心</h2>
-        <p>查看账号信息并修改登录密码</p>
+        <span class="page-eyebrow">{{ t('profile.eyebrow') }}</span>
+        <h2>{{ t('profile.title') }}</h2>
+        <p>{{ t('profile.subtitle') }}</p>
       </div>
     </div>
 
@@ -12,8 +12,8 @@
       <!-- 账号概览 -->
       <section class="panel">
         <div class="panel-head">
-          <div class="panel-title">账号信息</div>
-          <span class="muted">只读信息</span>
+          <div class="panel-title">{{ t('profile.infoTitle') }}</div>
+          <span class="muted">{{ t('profile.infoHint') }}</span>
         </div>
 
         <div class="profile-hero">
@@ -25,30 +25,30 @@
             <span class="hero-account">@{{ profile?.username }}</span>
           </div>
           <el-tag :type="profile?.role === 'admin' ? 'primary' : 'info'" effect="light" round>
-            {{ profile?.role === 'admin' ? '管理员' : '普通用户' }}
+            {{ profile?.role === 'admin' ? t('profile.roleAdmin') : t('profile.roleUser') }}
           </el-tag>
         </div>
 
         <div class="info-list">
           <div class="info-row">
-            <span class="info-label">用户名</span>
+            <span class="info-label">{{ t('common.username') }}</span>
             <span class="info-value">{{ profile?.username || '—' }}</span>
           </div>
           <div class="info-row">
-            <span class="info-label">显示名称</span>
+            <span class="info-label">{{ t('common.displayName') }}</span>
             <span class="info-value">{{ profile?.display_name || '—' }}</span>
           </div>
           <div class="info-row">
-            <span class="info-label">邮箱</span>
+            <span class="info-label">{{ t('common.email') }}</span>
             <span class="info-value" :class="{ 'is-empty': !profile?.email }">
-              {{ profile?.email || '未填写' }}
+              {{ profile?.email || t('common.notProvided') }}
             </span>
           </div>
           <div class="info-row">
-            <span class="info-label">账号状态</span>
+            <span class="info-label">{{ t('profile.accountStatus') }}</span>
             <span class="info-value status">
               <span class="status-dot" :class="profile?.is_active ? 'on' : 'off'"></span>
-              {{ profile?.is_active ? '启用' : '禁用' }}
+              {{ profile?.is_active ? t('common.enabled') : t('common.disabled') }}
             </span>
           </div>
         </div>
@@ -57,45 +57,51 @@
       <!-- 修改密码 -->
       <section class="panel">
         <div class="panel-head">
-          <div class="panel-title">修改密码</div>
-          <span class="muted">建议定期更换</span>
+          <div class="panel-title">{{ t('profile.changePassword') }}</div>
+          <span class="muted">{{ t('profile.changePasswordHint') }}</span>
         </div>
 
         <div class="pwd-body">
-          <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
-            <el-form-item label="原密码" prop="old_password">
+          <el-form
+            ref="formRef"
+            :model="form"
+            :rules="rules"
+            :validate-on-rule-change="false"
+            label-position="top"
+          >
+            <el-form-item :label="t('profile.oldPassword')" prop="old_password">
               <el-input
                 v-model="form.old_password"
                 type="password"
                 show-password
                 autocomplete="current-password"
-                placeholder="请输入当前密码"
+                :placeholder="t('profile.oldPasswordPlaceholder')"
               />
             </el-form-item>
-            <el-form-item label="新密码" prop="new_password">
+            <el-form-item :label="t('profile.newPassword')" prop="new_password">
               <el-input
                 v-model="form.new_password"
                 type="password"
                 show-password
                 autocomplete="new-password"
-                placeholder="至少 6 位"
+                :placeholder="t('profile.newPasswordPlaceholder')"
               />
             </el-form-item>
-            <el-form-item label="确认新密码" prop="confirm">
+            <el-form-item :label="t('profile.confirmPassword')" prop="confirm">
               <el-input
                 v-model="form.confirm"
                 type="password"
                 show-password
                 autocomplete="new-password"
-                placeholder="再次输入新密码"
+                :placeholder="t('profile.confirmPlaceholder')"
               />
             </el-form-item>
           </el-form>
         </div>
 
         <div class="panel-foot pwd-foot">
-          <span class="pwd-hint">保存后当前登录状态会失效，需要使用新密码重新登录</span>
-          <el-button type="primary" :loading="submitting" @click="submit">保存新密码</el-button>
+          <span class="pwd-hint">{{ t('profile.hint') }}</span>
+          <el-button type="primary" :loading="submitting" @click="submit">{{ t('profile.savePassword') }}</el-button>
         </div>
       </section>
     </div>
@@ -103,11 +109,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { userApi } from '@/api'
 import { useUserStore } from '@/stores/user'
 
+const { t, locale } = useI18n()
 const userStore = useUserStore()
 const profile = computed(() => userStore.profile)
 
@@ -115,19 +123,26 @@ const formRef = ref<FormInstance>()
 const submitting = ref(false)
 const form = reactive({ old_password: '', new_password: '', confirm: '' })
 
-const rules: FormRules = {
-  old_password: [{ required: true, message: '请输入原密码', trigger: 'blur' }],
-  new_password: [{ required: true, min: 6, message: '新密码至少 6 位', trigger: 'blur' }],
+const rules = computed<FormRules>(() => ({
+  old_password: [{ required: true, message: t('profile.validation.oldRequired'), trigger: 'blur' }],
+  new_password: [
+    { required: true, min: 6, message: t('profile.validation.newMin'), trigger: 'blur' }
+  ],
   confirm: [
     {
       validator: (_rule, value, callback) => {
-        if (value !== form.new_password) callback(new Error('两次输入的密码不一致'))
+        if (value !== form.new_password) callback(new Error(t('profile.validation.mismatch')))
         else callback()
       },
       trigger: 'blur'
     }
   ]
-}
+}))
+
+// 切换语言只重建校验文案，不清空输入，也不立即触发校验
+watch(locale, () => {
+  formRef.value?.clearValidate()
+})
 
 async function submit() {
   if (!formRef.value) return
@@ -137,7 +152,7 @@ async function submit() {
   submitting.value = true
   try {
     await userApi.changePassword(form.old_password, form.new_password)
-    ElMessage.success('密码已更新，请重新登录')
+    ElMessage.success(t('profile.passwordUpdated'))
     await userStore.logout(false)
     location.assign('/login')
     formRef.value.resetFields()
@@ -170,7 +185,7 @@ async function submit() {
 .hero-avatar {
   flex-shrink: 0;
   overflow: hidden;
-  border: 1px solid #d3e5da;
+  border: 1px solid var(--line);
   border-radius: 18px;
   background: var(--brand-soft);
   color: var(--brand-dark);
@@ -252,11 +267,11 @@ async function submit() {
 
 .status-dot.on {
   background: var(--success);
-  box-shadow: 0 0 0 3px rgb(35 129 93 / 13%);
+  box-shadow: 0 0 0 3px var(--success-soft);
 }
 
 .status-dot.off {
-  background: #c3cad6;
+  background: var(--line-strong);
 }
 
 /* 修改密码 */

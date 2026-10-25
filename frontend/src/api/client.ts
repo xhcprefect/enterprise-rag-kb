@@ -1,5 +1,6 @@
 import axios, { type AxiosInstance, type AxiosResponse } from 'axios'
 import { ElMessage } from 'element-plus'
+import { i18n } from '@/i18n'
 
 /** 后端统一响应结构（见 backend/app/schemas/common.py）。 */
 interface ApiEnvelope<T = unknown> {
@@ -51,11 +52,15 @@ client.interceptors.response.use(
       return Promise.reject(error)
     }
 
+    const fallback = error.code === 'ERR_NETWORK'
+      ? i18n.global.t('errors.network')
+      : error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT'
+        ? i18n.global.t('errors.timeout')
+        : status ? i18n.global.t('errors.http', { status }) : i18n.global.t('errors.request')
     const message =
       (typeof body === 'object' && body?.message) ||
-      (typeof body === 'string' && body) ||
-      error.message ||
-      '请求失败'
+      (typeof body === 'string' && body) || fallback
+    error.message = message
 
     // 令牌过期的 401 会跳转到登录页，不再重复弹提示；
     // 登录失败等其它 401 需要正常提示

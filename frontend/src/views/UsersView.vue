@@ -2,26 +2,26 @@
   <div class="page">
     <div class="page-head">
       <div>
-        <span class="page-eyebrow">ACCESS CONTROL</span>
-        <h2>用户管理</h2>
-        <p>管理员可创建账号、分配角色、重置密码</p>
+        <span class="page-eyebrow">{{ t('users.eyebrow') }}</span>
+        <h2>{{ t('users.title') }}</h2>
+        <p>{{ t('users.subtitle') }}</p>
       </div>
       <div class="page-actions">
         <el-input
           v-model="keyword"
-          placeholder="搜索用户名/姓名"
+          :placeholder="t('users.searchPlaceholder')"
           clearable
           class="search"
           :prefix-icon="Search"
-          aria-label="搜索用户"
+          :aria-label="t('users.searchAria')"
           @keyup.enter="onSearch"
           @clear="onSearch"
         />
         <el-button @click="openImport">
-          <el-icon><Upload /></el-icon>批量导入
+          <el-icon><Upload /></el-icon>{{ t('users.importButton') }}
         </el-button>
         <el-button type="primary" @click="openCreate">
-          <el-icon><Plus /></el-icon>新建用户
+          <el-icon><Plus /></el-icon>{{ t('users.createButton') }}
         </el-button>
       </div>
     </div>
@@ -29,14 +29,14 @@
     <div class="panel">
       <div class="panel-head">
         <div class="panel-title">
-          账号列表
+          {{ t('users.listTitle') }}
           <span class="count-badge">{{ total }}</span>
         </div>
-        <span class="muted">管理员可调整角色与账号状态</span>
+        <span class="muted">{{ t('users.listHint') }}</span>
       </div>
 
       <el-table v-loading="loading" :data="users">
-        <el-table-column label="用户" min-width="200">
+        <el-table-column :label="t('users.colUser')" min-width="200">
           <template #default="{ row }">
             <div class="user-cell">
               <el-avatar :size="32" class="user-avatar" :class="row.role">
@@ -50,40 +50,40 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="邮箱" min-width="190" show-overflow-tooltip>
+        <el-table-column :label="t('users.colEmail')" min-width="190" show-overflow-tooltip>
           <template #default="{ row }">
-            <span :class="{ 'is-empty': !row.email }">{{ row.email || '未填写' }}</span>
+            <span :class="{ 'is-empty': !row.email }">{{ row.email || t('common.notProvided') }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="角色" width="110">
+        <el-table-column :label="t('users.colRole')" width="120">
           <template #default="{ row }">
             <el-tag :type="row.role === 'admin' ? 'primary' : 'info'" size="small" effect="light">
-              {{ row.role === 'admin' ? '管理员' : '普通用户' }}
+              {{ row.role === 'admin' ? t('users.roleAdmin') : t('users.roleUser') }}
             </el-tag>
           </template>
         </el-table-column>
 
-        <el-table-column label="状态" width="100">
+        <el-table-column :label="t('users.colStatus')" width="110">
           <template #default="{ row }">
             <span class="status-cell">
               <span class="status-dot" :class="row.is_active ? 'on' : 'off'"></span>
-              {{ row.is_active ? '启用' : '禁用' }}
+              {{ row.is_active ? t('users.statusActive') : t('users.statusDisabled') }}
             </span>
           </template>
         </el-table-column>
 
-        <el-table-column label="创建时间" width="170">
+        <el-table-column :label="t('users.colCreatedAt')" width="170">
           <template #default="{ row }">
-            <span class="time">{{ formatTime(row.created_at) }}</span>
+            <span class="time">{{ formatDateTime(row.created_at) }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="190" fixed="right">
+        <el-table-column :label="t('users.colActions')" width="210" fixed="right">
           <template #default="{ row }">
             <div class="row-actions">
-              <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-              <el-button link type="warning" size="small" @click="resetPassword(row)">重置密码</el-button>
+              <el-button link type="primary" size="small" @click="openEdit(row)">{{ t('common.edit') }}</el-button>
+              <el-button link type="warning" size="small" @click="resetPassword(row)">{{ t('users.resetPassword') }}</el-button>
               <el-button
                 link
                 type="danger"
@@ -91,14 +91,14 @@
                 :disabled="row.id === userStore.profile?.id"
                 @click="remove(row)"
               >
-                删除
+                {{ t('common.delete') }}
               </el-button>
             </div>
           </template>
         </el-table-column>
 
         <template #empty>
-          <el-empty :description="keyword ? '没有匹配的用户' : '暂无用户'" :image-size="80" />
+          <el-empty :description="keyword ? t('users.emptySearch') : t('users.empty')" :image-size="80" />
         </template>
       </el-table>
 
@@ -115,51 +115,66 @@
       </div>
     </div>
 
-    <el-dialog v-model="dialogVisible" :title="editing ? '编辑用户' : '新建用户'" width="520px">
-      <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
+    <el-dialog
+      v-model="dialogVisible"
+      :title="editing ? t('users.dialogEditTitle') : t('users.dialogCreateTitle')"
+      width="520px"
+    >
+      <el-form
+        ref="formRef"
+        :model="form"
+        :rules="rules"
+        :validate-on-rule-change="false"
+        label-position="top"
+      >
         <div class="form-grid">
-          <el-form-item label="用户名" prop="username">
+          <el-form-item :label="t('common.username')" prop="username">
             <el-input
               v-model="form.username"
               :disabled="!!editing"
-              placeholder="字母、数字、下划线"
+              :placeholder="t('users.usernamePlaceholder')"
             />
           </el-form-item>
-          <el-form-item v-if="!editing" label="初始密码" prop="password">
-            <el-input v-model="form.password" type="password" show-password placeholder="至少 6 位" />
+          <el-form-item v-if="!editing" :label="t('users.initialPassword')" prop="password">
+            <el-input
+              v-model="form.password"
+              type="password"
+              show-password
+              :placeholder="t('users.initialPasswordPlaceholder')"
+            />
           </el-form-item>
-          <el-form-item label="显示名称">
-            <el-input v-model="form.display_name" placeholder="例如：张三" />
+          <el-form-item :label="t('common.displayName')">
+            <el-input v-model="form.display_name" :placeholder="t('users.displayNamePlaceholder')" />
           </el-form-item>
-          <el-form-item label="邮箱">
-            <el-input v-model="form.email" placeholder="可选" />
+          <el-form-item :label="t('common.email')">
+            <el-input v-model="form.email" :placeholder="t('users.emailPlaceholder')" />
           </el-form-item>
         </div>
 
-        <el-form-item label="角色">
+        <el-form-item :label="t('common.role')">
           <el-radio-group v-model="form.role">
-            <el-radio value="user">普通用户</el-radio>
-            <el-radio value="admin">管理员</el-radio>
+            <el-radio value="user">{{ t('users.roleUser') }}</el-radio>
+            <el-radio value="admin">{{ t('users.roleAdmin') }}</el-radio>
           </el-radio-group>
         </el-form-item>
 
-        <el-form-item v-if="editing" label="账号状态">
+        <el-form-item v-if="editing" :label="t('users.accountStatus')">
           <div class="switch-row">
             <el-switch v-model="form.is_active" />
-            <span>{{ form.is_active ? '启用：可以正常登录' : '禁用：无法登录系统' }}</span>
+            <span>{{ form.is_active ? t('users.statusOnHint') : t('users.statusOffHint') }}</span>
           </div>
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submit">保存</el-button>
+        <el-button @click="dialogVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="submitting" @click="submit">{{ t('common.save') }}</el-button>
       </template>
     </el-dialog>
 
     <!-- 批量导入 -->
     <el-dialog
       v-model="importVisible"
-      title="批量导入用户"
+      :title="t('users.import.title')"
       width="680px"
       :close-on-click-modal="false"
       :before-close="handleDialogClose"
@@ -168,16 +183,18 @@
       <template v-if="!importResult">
         <el-alert type="info" :closable="false" show-icon class="import-tip">
           <template #title>
-            从 Excel / CSV 批量建号。每人生成一个<strong>随机初始密码</strong>，导入完成后
-            下载回执查看（密码不存明文，事后无法再导出）。
+            <i18n-t keypath="users.import.securityTip" tag="span">
+              <template #strong>
+                <strong>{{ t('users.import.randomPassword') }}</strong>
+              </template>
+            </i18n-t>
           </template>
         </el-alert>
 
         <div class="import-guide">
-          <span>表格需包含「用户名」列，可选「姓名 / 邮箱 / 角色」。表头支持中英文，
-            角色留空为普通用户。</span>
+          <span>{{ t('users.import.guide') }}</span>
           <el-button link type="primary" size="small" @click="downloadTemplate">
-            下载模板
+            {{ t('users.import.downloadTemplate') }}
           </el-button>
         </div>
 
@@ -196,9 +213,15 @@
               <span class="drop-size">{{ formatSize(importFile.size) }}</span>
             </div>
             <div v-else class="drop-hint">
-              把 .xlsx 或 .csv 拖到这里，或<em>点击选择文件</em>
+              <i18n-t keypath="users.import.dropHint" tag="span">
+                <template #action>
+                  <em>{{ t('users.import.chooseFile') }}</em>
+                </template>
+              </i18n-t>
             </div>
-            <div class="drop-limit">单次最多 {{ IMPORT_MAX_ROWS }} 行，文件不超过 5MB</div>
+            <div class="drop-limit">
+              {{ t('users.import.dropLimit', { rows: formatNumber(IMPORT_MAX_ROWS) }) }}
+            </div>
           </div>
         </el-upload>
 
@@ -207,7 +230,11 @@
         <div v-if="importing" class="import-progress">
           <el-progress :percentage="importPercent" :show-text="false" />
           <span class="progress-text">
-            {{ importPercent < 100 ? `正在上传 ${importPercent}%` : '上传完成，正在创建账号…' }}
+            {{
+              importPercent < 100
+                ? t('users.import.uploading', { percent: importPercent })
+                : t('users.import.processing')
+            }}
           </span>
         </div>
       </template>
@@ -215,16 +242,16 @@
       <template v-else>
         <div class="import-summary">
           <div class="summary-item ok">
-            <span class="summary-num">{{ importResult.created.length }}</span>
-            <span class="summary-label">成功创建</span>
+            <span class="summary-num">{{ formatNumber(importResult.created.length) }}</span>
+            <span class="summary-label">{{ t('users.import.summaryCreated') }}</span>
           </div>
           <div class="summary-item bad">
-            <span class="summary-num">{{ importResult.failed.length }}</span>
-            <span class="summary-label">未导入</span>
+            <span class="summary-num">{{ formatNumber(importResult.failed.length) }}</span>
+            <span class="summary-label">{{ t('users.import.summaryFailed') }}</span>
           </div>
           <div class="summary-item">
-            <span class="summary-num">{{ importResult.total }}</span>
-            <span class="summary-label">数据行</span>
+            <span class="summary-num">{{ formatNumber(importResult.total) }}</span>
+            <span class="summary-label">{{ t('users.import.summaryRows') }}</span>
           </div>
         </div>
 
@@ -236,10 +263,18 @@
           class="receipt-alert"
         >
           <template #title>
-            关闭本窗口后就<strong>再也拿不到</strong>这些初始密码了，请先下载回执。
+            <i18n-t keypath="users.import.receiptWarning" tag="span">
+              <template #strong>
+                <strong>{{ t('users.import.receiptStrong') }}</strong>
+              </template>
+            </i18n-t>
           </template>
           <el-button type="primary" size="small" class="receipt-btn" @click="downloadReceipt">
-            下载回执（{{ importResult.created.length }} 个密码）
+            {{
+              t('users.import.downloadReceiptCount', {
+                total: formatNumber(importResult.created.length)
+              })
+            }}
           </el-button>
         </el-alert>
 
@@ -250,33 +285,38 @@
           max-height="260"
           class="fail-table"
         >
-          <el-table-column prop="row" label="行号" width="70" />
-          <el-table-column prop="username" label="用户名" min-width="130">
+          <el-table-column prop="row" :label="t('users.import.colRow')" width="70" />
+          <el-table-column prop="username" :label="t('users.import.colUsername')" min-width="130">
             <template #default="{ row }">
-              <span :class="{ 'is-empty': !row.username }">{{ row.username || '（空）' }}</span>
+              <span :class="{ 'is-empty': !row.username }">{{ row.username || t('users.import.emptyUsername') }}</span>
             </template>
           </el-table-column>
-          <el-table-column prop="reason" label="原因" min-width="240" show-overflow-tooltip />
+          <el-table-column
+            prop="reason"
+            :label="t('users.import.colReason')"
+            min-width="240"
+            show-overflow-tooltip
+          />
         </el-table>
       </template>
 
       <template #footer>
         <template v-if="!importResult">
-          <el-button :disabled="importing" @click="importVisible = false">取消</el-button>
+          <el-button :disabled="importing" @click="importVisible = false">{{ t('common.cancel') }}</el-button>
           <el-button
             type="primary"
             :disabled="!importFile"
             :loading="importing"
             @click="submitImport"
           >
-            {{ importing ? '导入中…' : '开始导入' }}
+            {{ importing ? t('users.import.importing') : t('users.import.startImport') }}
           </el-button>
         </template>
         <template v-else>
           <el-button type="primary" @click="downloadReceipt" :disabled="!importResult.created.length">
-            下载回执
+            {{ t('users.import.downloadReceipt') }}
           </el-button>
-          <el-button @click="finishImport">完成</el-button>
+          <el-button @click="finishImport">{{ t('users.import.done') }}</el-button>
         </template>
       </template>
     </el-dialog>
@@ -284,7 +324,8 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import {
   ElMessage,
   ElMessageBox,
@@ -300,8 +341,10 @@ import {
   type ImportResult,
   type User
 } from '@/api'
+import { formatDateTime, formatNumber } from '@/i18n/format'
 import { useUserStore } from '@/stores/user'
 
+const { t, locale } = useI18n()
 const userStore = useUserStore()
 
 const users = ref<User[]>([])
@@ -325,20 +368,25 @@ const form = reactive({
   is_active: true
 })
 
-const rules: FormRules = {
+const rules = computed<FormRules>(() => ({
   username: [
-    { required: true, message: '请输入用户名', trigger: 'blur' },
-    { pattern: /^[A-Za-z0-9_.-]+$/, message: '只能包含字母、数字、下划线、点、横线', trigger: 'blur' }
+    { required: true, message: t('users.validation.usernameRequired'), trigger: 'blur' },
+    {
+      pattern: /^[A-Za-z0-9_.-]+$/,
+      message: t('users.validation.usernamePattern'),
+      trigger: 'blur'
+    }
   ],
   password: [
-    { required: true, message: '请输入初始密码', trigger: 'blur' },
-    { min: 6, message: '密码至少 6 位', trigger: 'blur' }
+    { required: true, message: t('users.validation.passwordRequired'), trigger: 'blur' },
+    { min: 6, message: t('users.validation.passwordMin'), trigger: 'blur' }
   ]
-}
+}))
 
-function formatTime(value: string) {
-  return new Date(value).toLocaleString('zh-CN', { hour12: false })
-}
+// 切换语言只重建校验文案，不重新校验、也不清空用户正在编辑的输入
+watch(locale, () => {
+  formRef.value?.clearValidate()
+})
 
 function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
@@ -406,10 +454,10 @@ async function submit() {
         role: form.role,
         is_active: form.is_active
       })
-      ElMessage.success('已更新')
+      ElMessage.success(t('common.updated'))
     } else {
       await userApi.create({ ...form, email: form.email || undefined })
-      ElMessage.success('已创建')
+      ElMessage.success(t('common.created'))
     }
     dialogVisible.value = false
     await load()
@@ -421,28 +469,42 @@ async function submit() {
 async function resetPassword(row: User) {
   let value: string
   try {
-    const res = await ElMessageBox.prompt(`为「${row.username}」设置新密码`, '重置密码', {
-      inputType: 'password',
-      inputPattern: /^.{6,128}$/,
-      inputErrorMessage: '密码至少 6 位',
-      confirmButtonText: '确定'
-    })
+    const res = await ElMessageBox.prompt(
+      t('users.resetPrompt', { username: row.username }),
+      t('users.resetPassword'),
+      {
+        inputType: 'password',
+        inputPattern: /^.{6,128}$/,
+        inputErrorMessage: t('users.validation.passwordMin'),
+        inputPlaceholder: t('users.resetPlaceholder'),
+        confirmButtonText: t('common.confirm'),
+        cancelButtonText: t('common.cancel')
+      }
+    )
     value = res.value
   } catch {
     return
   }
   await userApi.update(row.id, { password: value })
-  ElMessage.success('密码已重置')
+  ElMessage.success(t('users.resetDone'))
 }
 
 async function remove(row: User) {
   try {
-    await ElMessageBox.confirm(`确定删除用户「${row.username}」吗？`, '提示', { type: 'warning' })
+    await ElMessageBox.confirm(
+      t('users.deleteConfirm', { username: row.username }),
+      t('common.tip'),
+      {
+        type: 'warning',
+        confirmButtonText: t('common.confirm'),
+        cancelButtonText: t('common.cancel')
+      }
+    )
   } catch {
     return
   }
   await userApi.remove(row.id)
-  ElMessage.success('已删除')
+  ElMessage.success(t('common.deleted'))
   await load()
 }
 
@@ -477,15 +539,15 @@ function onFileChange(upload: UploadFile) {
   if (!raw) return
   const name = raw.name.toLowerCase()
   if (!name.endsWith('.xlsx') && !name.endsWith('.csv')) {
-    ElMessage.warning('只支持 .xlsx 和 .csv；旧版 .xls 请先另存为 .xlsx')
+    ElMessage.warning(t('users.import.invalidType'))
     return
   }
   if (raw.size > IMPORT_MAX_BYTES) {
-    ElMessage.warning(`文件超过 ${formatSize(IMPORT_MAX_BYTES)}，请精简后重试`)
+    ElMessage.warning(t('users.import.tooLarge', { size: formatSize(IMPORT_MAX_BYTES) }))
     return
   }
   if (!raw.size) {
-    ElMessage.warning('文件是空的')
+    ElMessage.warning(t('users.import.emptyFile'))
     return
   }
   importFile.value = raw
@@ -503,9 +565,11 @@ async function submitImport() {
     })
     importResult.value = data
     if (data.created.length) {
-      ElMessage.success(`成功创建 ${data.created.length} 个账号，请下载回执查看初始密码`)
+      ElMessage.success(
+        t('users.import.createdSuccess', { count: formatNumber(data.created.length) })
+      )
     } else {
-      ElMessage.warning('没有任何账号被创建，请查看下方原因')
+      ElMessage.warning(t('users.import.noneCreated'))
     }
     // 列表可能有新增（也可能只有失败，不刷也无妨，统一刷一次更省心）
     if (data.created.length) {
@@ -528,7 +592,7 @@ async function downloadReceipt() {
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
   )
   receiptSaved.value = true
-  ElMessage.success('回执已下载，请妥善保管')
+  ElMessage.success(t('users.import.receiptDownloaded'))
 }
 
 /**
@@ -537,15 +601,19 @@ async function downloadReceipt() {
  */
 async function handleDialogClose(done: () => void) {
   if (importing.value) {
-    ElMessage.warning('正在导入，请等待完成')
+    ElMessage.warning(t('users.import.inProgress'))
     return
   }
   if (importResult.value?.created.length && !receiptSaved.value) {
     try {
       await ElMessageBox.confirm(
-        '还没有下载回执。关闭后这些初始密码将无法再次获取，确定关闭吗？',
-        '确认关闭',
-        { type: 'warning', confirmButtonText: '仍然关闭', cancelButtonText: '返回下载' }
+        t('users.import.closeConfirm'),
+        t('users.import.closeTitle'),
+        {
+          type: 'warning',
+          confirmButtonText: t('users.import.stillClose'),
+          cancelButtonText: t('users.import.backToDownload')
+        }
       )
     } catch {
       return
@@ -564,7 +632,7 @@ function finishImport() {
 async function downloadTemplate() {
   try {
     const { data } = await userApi.downloadTemplate()
-    saveBlob(data, '用户导入模板.xlsx')
+    saveBlob(data, t('users.import.templateFileName'))
   } catch {
     // 拦截器已提示
   }
@@ -575,7 +643,7 @@ onMounted(load)
 
 <style scoped>
 .search {
-  width: 220px;
+  width: 240px;
 }
 
 .user-cell {
@@ -587,17 +655,17 @@ onMounted(load)
 
 .user-avatar {
   flex-shrink: 0;
-  border: 1px solid #dbe7d9;
-  background: #edf2e8;
-  color: #486246;
+  border: 1px solid var(--line);
+  background: var(--slate-soft);
+  color: var(--slate-text);
   font-size: 13px;
   font-weight: 600;
 }
 
 .user-avatar.admin {
-  border-color: #cfe1d7;
+  border-color: var(--brand);
   background: var(--brand);
-  color: #fff;
+  color: var(--on-brand);
 }
 
 .user-names {
@@ -640,11 +708,11 @@ onMounted(load)
 
 .status-dot.on {
   background: var(--success);
-  box-shadow: 0 0 0 3px rgb(35 129 93 / 13%);
+  box-shadow: 0 0 0 3px var(--success-soft);
 }
 
 .status-dot.off {
-  background: #c3cad6;
+  background: var(--line-strong);
 }
 
 .time {
@@ -687,7 +755,8 @@ onMounted(load)
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   margin-bottom: 12px;
   font-size: 12.5px;
   color: var(--text-3);
@@ -785,13 +854,13 @@ onMounted(load)
 }
 
 .summary-item.ok {
-  border-color: #dcebe2;
-  background: #f2f8f4;
+  border-color: var(--success-border);
+  background: var(--success-soft);
 }
 
 .summary-item.bad {
-  border-color: #f0dbd8;
-  background: #fcf3f2;
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
 }
 
 .summary-num {
@@ -831,10 +900,6 @@ onMounted(load)
 @media (max-width: 700px) {
   .form-grid {
     grid-template-columns: 1fr;
-  }
-
-  .search {
-    width: 150px;
   }
 
   .import-summary {

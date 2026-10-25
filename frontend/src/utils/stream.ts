@@ -1,3 +1,13 @@
+/** 传输层只报告稳定错误码，由调用处按当前界面语言展示。 */
+export class StreamProtocolError extends Error {
+  readonly code: 'invalidStream' | 'streamInterrupted'
+  constructor(code: 'invalidStream' | 'streamInterrupted') {
+    super(code === 'invalidStream' ? '流式响应格式异常，请重试' : '回答连接提前中断，请重试')
+    this.name = 'StreamProtocolError'
+    this.code = code
+  }
+}
+
 /** 与具体页面解耦的流式事件读取；明确区分业务结束和意外断流。 */
 export async function consumeEventStream(
   body: ReadableStream<Uint8Array>,
@@ -21,7 +31,7 @@ export async function consumeEventStream(
     try {
       data = JSON.parse(lines.join('\n'))
     } catch {
-      throw new Error('流式响应格式异常，请重试')
+      throw new StreamProtocolError('invalidStream')
     }
     if (event === 'done' || event === 'error') terminal = true
     onEvent(event, data)
@@ -34,7 +44,7 @@ export async function consumeEventStream(
       if (done) {
         buffer += decoder.decode()
         if (buffer.trim()) dispatch(buffer)
-        if (!terminal) throw new Error('回答连接提前中断，请重试')
+        if (!terminal) throw new StreamProtocolError('streamInterrupted')
         break
       }
       buffer += decoder.decode(value, { stream: true })

@@ -1,5 +1,6 @@
 import client from './client'
-import { consumeEventStream } from '@/utils/stream'
+import { consumeEventStream, StreamProtocolError } from '@/utils/stream'
+import { i18n } from '@/i18n'
 
 // ---------- 类型 ----------
 export interface User {
@@ -267,15 +268,21 @@ export async function streamChat(
   signal?: AbortSignal
 ): Promise<void> {
   const token = localStorage.getItem('rag_token')
-  const response = await fetch('/api/v1/chat/stream', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {})
-    },
-    body: JSON.stringify(payload),
-    signal
-  })
+  let response: Response
+  try {
+    response = await fetch('/api/v1/chat/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      },
+      body: JSON.stringify(payload),
+      signal
+    })
+  } catch (error) {
+    if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error
+    throw new Error(i18n.global.t('errors.network'))
+  }
 
   if (response.status === 401) {
     localStorage.removeItem('rag_token')
@@ -292,14 +299,19 @@ export async function streamChat(
     } catch {
       /* 非 JSON（网关错误页等）时退回原文 */
     }
-    handlers.onError?.(message || text || `请求失败 (${response.status})`)
+    handlers.onError?.(message || text || i18n.global.t('errors.http', { status: response.status }))
     return
   }
 
-  await consumeEventStream(response.body, (event, data) => {
-    if (event === 'meta') handlers.onMeta?.(data)
-    else if (event === 'delta') handlers.onDelta?.(data.content ?? '')
-    else if (event === 'done') handlers.onDone?.(data)
-    else if (event === 'error') handlers.onError?.(data.message ?? '未知错误')
-  }, signal)
+  try {
+    await consumeEventStream(response.body, (event, data) => {
+      if (event === 'meta') handlers.onMeta?.(data)
+      else if (event === 'delta') handlers.onDelta?.(data.content ?? '')
+      else if (event === 'done') handlers.onDone?.(data)
+      else if (event === 'error') handlers.onError?.(data.message ?? i18n.global.t('errors.unknown'))
+    }, signal)
+  } catch (error) {
+    if (error instanceof StreamProtocolError) throw new Error(i18n.global.t(`errors.${error.code}`))
+    throw error
+  }
 }

@@ -5,20 +5,20 @@
         <el-button
           class="back-btn"
           circle
-          aria-label="返回知识库列表"
+          :aria-label="t('documents.backAria')"
           @click="router.push('/knowledge')"
         >
           <el-icon><ArrowLeft /></el-icon>
         </el-button>
         <div class="title-copy">
-          <span class="page-eyebrow">DOCUMENTS</span>
-          <h2>{{ kb?.name || '文档管理' }}</h2>
-          <p>{{ kb?.description || '上传文档后系统会自动解析、切分并向量化入库' }}</p>
+          <span class="page-eyebrow">{{ t('documents.eyebrow') }}</span>
+          <h2>{{ kb?.name || t('documents.title') }}</h2>
+          <p>{{ kb?.description || t('documents.subtitle') }}</p>
         </div>
       </div>
       <div class="page-actions">
         <el-button :loading="loading" @click="load">
-          <el-icon><Refresh /></el-icon>刷新
+          <el-icon><Refresh /></el-icon>{{ t('common.refresh') }}
         </el-button>
         <el-upload
           v-if="userStore.isAdmin"
@@ -28,7 +28,7 @@
           accept=".pdf,.docx,.txt,.md,.xlsx,.csv"
         >
           <el-button type="primary" :loading="uploading">
-            <el-icon><Upload /></el-icon>上传文档
+            <el-icon><Upload /></el-icon>{{ t('documents.upload') }}
           </el-button>
         </el-upload>
       </div>
@@ -37,12 +37,12 @@
     <!-- 支持格式与续传说明 -->
     <div class="format-bar">
       <div class="format-tags">
-        <span class="format-label">支持格式</span>
+        <span class="format-label">{{ t('documents.formatsLabel') }}</span>
         <span v-for="fmt in FORMATS" :key="fmt" class="format-chip">{{ fmt }}</span>
       </div>
       <span class="format-tip">
         <el-icon><InfoFilled /></el-icon>
-        大文件分片上传，可暂停、可断点续传
+        {{ t('documents.formatsTip') }}
       </span>
     </div>
 
@@ -57,16 +57,21 @@
       <template #title>
         <div class="resume-title">
           <span>
-            检测到未完成的上传「<strong>{{ resumeInfo.filename }}</strong>」（已传
-            {{ resumeInfo.percent }}%）。点击右上角「上传文档」重新选择同一文件即可从断点继续。
+            <i18n-t keypath="documents.resumeNotice" tag="span" scope="global">
+              <template #name><strong>{{ resumeInfo.filename }}</strong></template>
+              <template #percent>{{ resumeInfo.percent }}</template>
+              <template #upload>{{ t('documents.upload') }}</template>
+            </i18n-t>
           </span>
-          <el-button link type="danger" size="small" @click="discardResume">放弃该上传</el-button>
+          <el-button link type="danger" size="small" @click="discardResume">
+            {{ t('documents.discardResume') }}
+          </el-button>
         </div>
       </template>
     </el-alert>
 
     <!-- 上传进度 -->
-    <section v-if="uploadTask" class="upload-card" aria-label="上传进度">
+    <section v-if="uploadTask" class="upload-card" :aria-label="t('documents.uploadAria')">
       <div class="upload-head">
         <div class="upload-file">
           <div class="upload-icon" :class="uploadTask.phase">
@@ -89,7 +94,7 @@
             size="small"
             @click="pauseUpload()"
           >
-            暂停
+            {{ t('documents.pause') }}
           </el-button>
           <el-button
             size="small"
@@ -129,7 +134,12 @@
       <div class="upload-foot">
         <span class="upload-hint">{{ uploadHint }}</span>
         <span v-if="uploadTask.totalChunks" class="upload-chunks">
-          {{ uploadTask.chunksDone }} / {{ uploadTask.totalChunks }} 片
+          {{
+            t('documents.chunks', {
+              done: formatNumber(uploadTask.chunksDone),
+              total: formatNumber(uploadTask.totalChunks)
+            })
+          }}
         </span>
       </div>
     </section>
@@ -138,27 +148,27 @@
     <div class="panel">
       <div class="panel-head">
         <div class="panel-title">
-          文档列表
-          <span class="count-badge">{{ total }}</span>
+          {{ t('documents.listTitle') }}
+          <span class="count-badge">{{ formatNumber(total) }}</span>
         </div>
         <el-select
           v-model="statusFilter"
-          placeholder="全部状态"
+          :placeholder="t('documents.filterPlaceholder')"
           clearable
           class="status-filter"
-          aria-label="按状态筛选文档"
+          :aria-label="t('documents.filterAria')"
           @change="onFilterChange"
         >
-          <el-option label="已就绪" value="ready" />
-          <el-option label="排队中" value="pending" />
-          <el-option label="处理中" value="processing" />
-          <el-option label="失败" value="failed" />
-          <el-option label="已取消" value="cancelled" />
+          <el-option :label="t('documents.status.ready')" value="ready" />
+          <el-option :label="t('documents.status.pending')" value="pending" />
+          <el-option :label="t('documents.status.processing')" value="processing" />
+          <el-option :label="t('documents.status.failed')" value="failed" />
+          <el-option :label="t('documents.status.cancelled')" value="cancelled" />
         </el-select>
       </div>
 
       <el-table v-loading="loading" :data="docs" class="table">
-        <el-table-column label="文件名" min-width="280">
+        <el-table-column :label="t('documents.table.filename')" min-width="280">
           <template #default="{ row }">
             <div class="file-cell">
               <span class="file-ext" :class="extClass(row.file_ext)">{{ extLabel(row.file_ext) }}</span>
@@ -167,14 +177,14 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="大小" width="100">
+        <el-table-column :label="t('documents.table.size')" width="100">
           <template #default="{ row }">
             <span class="num">{{ formatSize(row.file_size) }}</span>
           </template>
         </el-table-column>
 
         <!-- 状态与进度合并：就绪/失败/取消显示标签，排队与处理中直接显示进度条 -->
-        <el-table-column label="状态" width="180">
+        <el-table-column :label="t('documents.table.status')" width="180">
           <template #default="{ row }">
             <!-- 排队中的 progress 恒为 0，画 0% 定长条会显得卡死；用流动条纹表达"在等 worker" -->
             <el-progress
@@ -196,20 +206,20 @@
             />
             <el-tooltip
               v-else-if="row.status === 'failed'"
-              :content="row.error_message || '处理失败'"
+              :content="row.error_message || t('documents.failedFallback')"
               placement="top"
             >
-              <el-tag type="danger" size="small" effect="light">失败</el-tag>
+              <el-tag type="danger" size="small" effect="light">{{ t('documents.status.failed') }}</el-tag>
             </el-tooltip>
             <el-tooltip
               v-else-if="row.status === 'cancelled'"
-              content="已取消入库，可重新上传或重建索引"
+              :content="t('documents.cancelledTip')"
               placement="top"
             >
-              <el-tag type="info" size="small" effect="light">已取消</el-tag>
+              <el-tag type="info" size="small" effect="light">{{ t('documents.status.cancelled') }}</el-tag>
             </el-tooltip>
             <span v-else-if="row.status === 'ready'" class="ready-mark">
-              <el-icon><CircleCheckFilled /></el-icon>已就绪
+              <el-icon><CircleCheckFilled /></el-icon>{{ t('documents.status.ready') }}
             </span>
             <el-tag v-else :type="statusType(row.status)" size="small" effect="light">
               {{ statusText(row.status) }}
@@ -217,25 +227,30 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="chunk_count" label="分块" width="80" align="center">
+        <el-table-column prop="chunk_count" :label="t('documents.table.chunks')" width="80" align="center">
           <template #default="{ row }">
-            <span class="num">{{ row.chunk_count }}</span>
+            <span class="num">{{ formatNumber(row.chunk_count) }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="字数" width="100" align="right">
+        <el-table-column :label="t('documents.table.chars')" width="100" align="right">
           <template #default="{ row }">
-            <span class="num">{{ row.char_count.toLocaleString() }}</span>
+            <span class="num">{{ formatNumber(row.char_count) }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="上传时间" width="170">
+        <el-table-column :label="t('documents.table.uploadedAt')" width="190">
           <template #default="{ row }">
-            <span class="time">{{ formatTime(row.created_at) }}</span>
+            <span class="time">{{ formatDateTime(row.created_at) }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column v-if="userStore.isAdmin" label="操作" width="210" fixed="right">
+        <el-table-column
+          v-if="userStore.isAdmin"
+          :label="t('documents.table.actions')"
+          width="210"
+          fixed="right"
+        >
           <template #default="{ row }">
             <div class="row-actions">
               <el-button
@@ -245,16 +260,23 @@
                 size="small"
                 @click="cancelIngest(row)"
               >
-                取消入库
+                {{ t('documents.cancelIngest') }}
               </el-button>
-              <el-button link type="primary" size="small" @click="reindex(row)">重建索引</el-button>
-              <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
+              <el-button link type="primary" size="small" @click="reindex(row)">
+                {{ t('documents.rebuild') }}
+              </el-button>
+              <el-button link type="danger" size="small" @click="remove(row)">
+                {{ t('common.delete') }}
+              </el-button>
             </div>
           </template>
         </el-table-column>
 
         <template #empty>
-          <el-empty description="还没有文档，点击右上角「上传文档」开始" :image-size="80" />
+          <el-empty
+            :description="t('documents.empty', { upload: t('documents.upload') })"
+            :image-size="80"
+          />
         </template>
       </el-table>
 
@@ -276,6 +298,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox, type UploadRawFile, type UploadRequestOptions } from 'element-plus'
 import {
   docApi,
@@ -287,6 +310,7 @@ import {
 } from '@/api'
 import { useUserStore } from '@/stores/user'
 import { hashFile, isIngestQueued } from '@/utils/upload'
+import { formatDateTime, formatNumber } from '@/i18n/format'
 
 // 上传任务的两段式进度：先传文件（0-100），再等后台入库（0-100）
 type UploadPhase = 'uploading' | 'paused' | 'ingesting' | 'done' | 'cancelled' | 'failed'
@@ -323,6 +347,7 @@ const FORMATS = ['PDF', 'Word', 'TXT', 'Markdown', 'Excel', 'CSV']
 const route = useRoute()
 const router = useRouter()
 const userStore = useUserStore()
+const { t } = useI18n()
 
 const kbId = route.params.kbId as string
 const kb = ref<KnowledgeBase | null>(null)
@@ -343,27 +368,27 @@ const resumeInfo = ref<ResumeInfo | null>(null)
 // 入库阶段的 0 表示"worker 还没领取 / 还没落第一批进度"，不是"进度为零"。
 // 这个判断同时供给进度条与文案，避免两处各写一遍条件后走偏。
 const ingestQueued = computed(() => {
-  const t = uploadTask.value
-  return !!t && isIngestQueued(t.phase, t.percent)
+  const task = uploadTask.value
+  return !!task && isIngestQueued(task.phase, task.percent)
 })
 
-const queueFormat = () => '排队中'
+const queueFormat = () => t('documents.queued')
 
 const uploadHint = computed(() => {
-  const t = uploadTask.value
-  if (!t) return ''
-  if (hashing.value && t.phase === 'uploading') return '正在计算文件摘要，确保续传的是同一文件…'
-  if (t.phase === 'uploading') return `正在上传… ${t.percent}%`
-  if (t.phase === 'paused') return `已暂停（${t.percent}%），重新选择同一文件即可继续`
-  if (t.phase === 'ingesting') {
+  const task = uploadTask.value
+  if (!task) return ''
+  if (hashing.value && task.phase === 'uploading') return t('documents.hint.hashing')
+  if (task.phase === 'uploading') return t('documents.hint.uploading', { percent: task.percent })
+  if (task.phase === 'paused') return t('documents.hint.paused', { percent: task.percent })
+  if (task.phase === 'ingesting') {
     // 0 时不要显示 "0%"，否则看起来像卡死了
-    return t.percent === 0
-      ? '文件已上传，正在排队等待解析…'
-      : `文件已上传，正在解析并向量化入库… ${t.percent}%`
+    return task.percent === 0
+      ? t('documents.hint.queued')
+      : t('documents.hint.ingesting', { percent: task.percent })
   }
-  if (t.phase === 'done') return '入库完成'
-  if (t.phase === 'cancelled') return '已取消'
-  return '上传或入库失败，可在列表中查看原因'
+  if (task.phase === 'done') return t('documents.hint.done')
+  if (task.phase === 'cancelled') return t('documents.hint.cancelled')
+  return t('documents.hint.failed')
 })
 
 const progressStatus = computed(() => {
@@ -376,9 +401,9 @@ const progressStatus = computed(() => {
 
 const cancelLabel = computed(() => {
   const phase = uploadTask.value?.phase
-  if (phase === 'done' || phase === 'cancelled' || phase === 'failed') return '关闭'
-  if (phase === 'ingesting') return '取消入库'
-  return '取消上传'
+  if (phase === 'done' || phase === 'cancelled' || phase === 'failed') return t('common.close')
+  if (phase === 'ingesting') return t('documents.cancelIngest')
+  return t('documents.cancelUpload')
 })
 
 let timer: number | undefined
@@ -396,11 +421,11 @@ function statusType(status: string) {
 function statusText(status: string) {
   return (
     {
-      pending: '排队中',
-      processing: '处理中',
-      ready: '已就绪',
-      failed: '失败',
-      cancelled: '已取消'
+      pending: t('documents.status.pending'),
+      processing: t('documents.status.processing'),
+      ready: t('documents.status.ready'),
+      failed: t('documents.status.failed'),
+      cancelled: t('documents.status.cancelled')
     }[status] || status
   )
 }
@@ -428,10 +453,6 @@ function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-}
-
-function formatTime(value: string) {
-  return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
 async function load() {
@@ -468,15 +489,13 @@ function isCancel(err: any) {
 
 function beforeUpload(file: UploadRawFile) {
   if (uploadTask.value?.phase === 'uploading' || uploadTask.value?.phase === 'ingesting') {
-    ElMessage.warning('已有文件正在处理中，请等待完成或先取消')
+    ElMessage.warning(t('documents.busy'))
     return false
   }
   // 若存在未完成会话，必须选同一个文件（服务端按 名称+大小 匹配）
   const pending = resumeInfo.value
   if (pending && (pending.filename !== file.name || pending.fileSize !== file.size)) {
-    ElMessage.warning(
-      `未完成的上传是「${pending.filename}」，请选择同一文件继续，或先放弃该上传`
-    )
+    ElMessage.warning(t('documents.resumeMismatch', { name: pending.filename }))
     return false
   }
   return true
@@ -673,7 +692,7 @@ async function discardResume() {
   if (!pending) return
   try {
     await uploadApi.abort(kbId, pending.uploadId)
-    ElMessage.success('已放弃未完成的上传')
+    ElMessage.success(t('documents.toast.discarded'))
   } catch {
     /* 会话可能已过期，忽略 */
   }
@@ -687,7 +706,7 @@ async function pauseUpload(quiet = false) {
   task.phase = 'paused'
   task.uploading = false
   uploadAbort.value?.abort()
-  if (!quiet) ElMessage.info('已暂停，可稍后重新选择同一文件继续')
+  if (!quiet) ElMessage.info(t('documents.toast.paused'))
 
   // 在途分片被掐断，服务端只保留完整落盘的那些：稍等请求收尾后以会话为准校准进度
   if (!task.uploadId) return
@@ -724,7 +743,7 @@ async function cancelUpload() {
         /* 已过期则无需清理 */
       }
     }
-    ElMessage.info('已取消上传')
+    ElMessage.info(t('documents.toast.cancelled'))
     return
   }
   if (task.phase === 'ingesting' && task.docId) {
@@ -739,15 +758,19 @@ async function cancelIngest(row: DocumentItem) {
 async function cancelIngestById(docId: string, filename: string) {
   try {
     await ElMessageBox.confirm(
-      `确定取消「${filename}」的入库吗？已写入的向量数据会被清理。`,
-      '取消入库',
-      { type: 'warning' }
+      t('documents.confirm.cancelIngest', { name: filename }),
+      t('documents.confirm.cancelIngestTitle'),
+      {
+        type: 'warning',
+        confirmButtonText: t('common.confirm'),
+        cancelButtonText: t('common.cancel')
+      }
     )
   } catch {
     return // 用户点了取消，不是错误
   }
   await docApi.cancel(kbId, docId)
-  ElMessage.success('取消请求已提交，任务将在当前批次结束后停止')
+  ElMessage.success(t('documents.toast.cancelSubmitted'))
   if (uploadTask.value?.docId === docId) {
     uploadTask.value = { ...uploadTask.value, phase: 'cancelled' }
   }
@@ -757,21 +780,27 @@ async function cancelIngestById(docId: string, filename: string) {
 
 async function reindex(row: DocumentItem) {
   await docApi.reindex(kbId, row.id)
-  ElMessage.success('已加入处理队列，请确认 worker 正在运行')
+  ElMessage.success(t('documents.toast.reindexQueued'))
   await load()
   startPolling()
 }
 
 async function remove(row: DocumentItem) {
   try {
-    await ElMessageBox.confirm(`确定删除「${row.filename}」及其向量数据吗？`, '提示', {
-      type: 'warning'
-    })
+    await ElMessageBox.confirm(
+      t('documents.confirm.remove', { name: row.filename }),
+      t('common.tip'),
+      {
+        type: 'warning',
+        confirmButtonText: t('common.confirm'),
+        cancelButtonText: t('common.cancel')
+      }
+    )
   } catch {
     return
   }
   await docApi.remove(kbId, row.id)
-  ElMessage.success('已删除')
+  ElMessage.success(t('common.deleted'))
   await load()
 }
 
@@ -815,7 +844,7 @@ function syncUploadTask(items: DocumentItem[]) {
   }
   if (row.status === 'ready') {
     uploadTask.value = { ...task, percent: 100, phase: 'done' }
-    ElMessage.success('入库完成')
+    ElMessage.success(t('documents.toast.ingestDone'))
     setTimeout(() => {
       if (uploadTask.value?.phase === 'done') uploadTask.value = null
     }, 2000)
@@ -908,7 +937,7 @@ onBeforeUnmount(() => {
 
 .format-chip {
   padding: 2px 9px;
-  border: 1px solid #e2ece5;
+  border: 1px solid var(--accent-border);
   border-radius: 6px;
   background: var(--brand-tint);
   color: var(--brand-dark);
@@ -940,7 +969,7 @@ onBeforeUnmount(() => {
 /* ---------- 上传进度卡 ---------- */
 .upload-card {
   padding: 17px 20px 15px;
-  border: 1px solid #dbe9e1;
+  border: 1px solid var(--success-border);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--shadow-sm);
@@ -974,17 +1003,17 @@ onBeforeUnmount(() => {
 }
 
 .upload-icon.done {
-  background: #eef7f2;
+  background: var(--success-soft);
   color: var(--success);
 }
 
 .upload-icon.failed {
-  background: #fcf1f0;
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
 .upload-icon.paused {
-  background: #fbf5eb;
+  background: var(--warning-soft);
   color: var(--warning);
 }
 
@@ -1039,7 +1068,7 @@ onBeforeUnmount(() => {
 }
 
 .upload-progress :deep(.el-progress-bar__outer) {
-  background: #edf2ee;
+  background: var(--line);
 }
 
 .upload-progress :deep(.el-progress__text) {
@@ -1090,34 +1119,34 @@ onBeforeUnmount(() => {
 }
 
 .file-ext.pdf {
-  border-color: #f0dad7;
-  background: #fbf0ee;
-  color: #af5147;
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .file-ext.doc {
-  border-color: #dee6ef;
-  background: #f1f4f8;
-  color: #4c647d;
+  border-color: var(--line);
+  background: var(--slate-soft);
+  color: var(--slate-text);
 }
 
 .file-ext.xls,
 .file-ext.csv {
-  border-color: #dcebe2;
-  background: #eef7f2;
-  color: #23704f;
+  border-color: var(--success-border);
+  background: var(--success-soft);
+  color: var(--success);
 }
 
 .file-ext.md {
-  border-color: #e5e9dc;
-  background: #f4f6ee;
-  color: #606e4c;
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 .file-ext.txt {
-  border-color: #e5eae6;
-  background: #f3f5f3;
-  color: #64746a;
+  border-color: var(--line);
+  background: var(--surface-soft);
+  color: var(--text-3);
 }
 
 .file-name {
@@ -1137,6 +1166,7 @@ onBeforeUnmount(() => {
   color: var(--text-3);
   font-size: 12.5px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .ready-mark {

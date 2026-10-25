@@ -2,33 +2,33 @@
   <div class="page">
     <div class="page-head">
       <div>
-        <span class="page-eyebrow">AUDIT TRAIL</span>
-        <h2>审计日志</h2>
-        <p>记录登录、知识库与文档变更、问答等关键操作</p>
+        <span class="page-eyebrow">{{ t('audit.eyebrow') }}</span>
+        <h2>{{ t('audit.title') }}</h2>
+        <p>{{ t('audit.subtitle') }}</p>
       </div>
       <div class="page-actions">
         <el-select
           v-model="actionFilter"
-          placeholder="全部操作"
+          :placeholder="t('audit.allActions')"
           clearable
           class="filter"
-          aria-label="按操作类型筛选"
+          :aria-label="t('audit.actionFilterAria')"
           @change="onFilter"
         >
           <el-option v-for="(label, key) in ACTION_TEXT" :key="key" :label="label" :value="key" />
         </el-select>
         <el-input
           v-model="usernameFilter"
-          placeholder="按用户名筛选"
+          :placeholder="t('audit.usernamePlaceholder')"
           clearable
           class="filter user-filter"
           :prefix-icon="Search"
-          aria-label="按用户名筛选"
+          :aria-label="t('audit.usernameAria')"
           @keyup.enter="onFilter"
           @clear="onFilter"
         />
         <el-button :loading="loading" @click="load">
-          <el-icon><Refresh /></el-icon>刷新
+          <el-icon><Refresh /></el-icon>{{ t('common.refresh') }}
         </el-button>
       </div>
     </div>
@@ -36,25 +36,25 @@
     <div class="panel">
       <div class="panel-head">
         <div class="panel-title">
-          操作记录
+          {{ t('audit.listTitle') }}
           <span class="count-badge">{{ total }}</span>
         </div>
-        <span class="muted">按时间倒序排列</span>
+        <span class="muted">{{ t('audit.listHint') }}</span>
       </div>
 
       <el-table v-loading="loading" :data="logs">
-        <el-table-column label="用户" width="180">
+        <el-table-column :label="t('audit.colUser')" width="180">
           <template #default="{ row }">
             <div class="actor">
               <el-avatar :size="26" class="actor-avatar">
                 {{ (row.username || '?').charAt(0).toUpperCase() }}
               </el-avatar>
-              <span class="actor-name">{{ row.username || '匿名' }}</span>
+              <span class="actor-name">{{ row.username || t('audit.anonymous') }}</span>
             </div>
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="130">
+        <el-table-column :label="t('audit.colAction')" width="180">
           <template #default="{ row }">
             <el-tag size="small" :type="actionType(row.action)" effect="light">
               {{ actionText(row.action) }}
@@ -62,19 +62,19 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="对象" min-width="180" show-overflow-tooltip>
+        <el-table-column :label="t('audit.colTarget')" min-width="180" show-overflow-tooltip>
           <template #default="{ row }">
             <span :class="{ 'is-empty': !row.target }">{{ row.target || '—' }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column prop="ip" label="IP" width="140">
+        <el-table-column prop="ip" :label="t('audit.colIp')" width="140">
           <template #default="{ row }">
             <code class="ip">{{ row.ip || '—' }}</code>
           </template>
         </el-table-column>
 
-        <el-table-column label="详情" min-width="220">
+        <el-table-column :label="t('audit.colDetail')" min-width="220">
           <template #default="{ row }">
             <span v-if="!row.detail" class="muted">—</span>
             <el-tooltip
@@ -90,14 +90,14 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="时间" width="170">
+        <el-table-column :label="t('audit.colTime')" width="170">
           <template #default="{ row }">
-            <span class="time">{{ formatTime(row.created_at) }}</span>
+            <span class="time">{{ formatDateTime(row.created_at) }}</span>
           </template>
         </el-table-column>
 
         <template #empty>
-          <el-empty description="暂无审计记录" :image-size="80" />
+          <el-empty :description="t('audit.empty')" :image-size="80" />
         </template>
       </el-table>
 
@@ -117,9 +117,11 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { Search } from '@element-plus/icons-vue'
 import client from '@/api/client'
+import { formatDateTime } from '@/i18n/format'
 
 interface LogItem {
   id: string
@@ -131,6 +133,8 @@ interface LogItem {
   created_at: string
 }
 
+const { t } = useI18n()
+
 const logs = ref<LogItem[]>([])
 const loading = ref(false)
 const total = ref(0)
@@ -139,25 +143,25 @@ const pageSize = ref(20)
 const actionFilter = ref('')
 const usernameFilter = ref('')
 
-const ACTION_TEXT: Record<string, string> = {
-  login_success: '登录成功',
-  login_failed: '登录失败',
-  logout: '退出登录',
-  user_create: '创建用户',
-  user_update: '更新用户',
-  user_delete: '删除用户',
-  user_import: '批量导入用户',
-  password_change: '修改密码',
-  kb_create: '创建知识库',
-  kb_update: '更新知识库',
-  kb_delete: '删除知识库',
-  document_upload: '上传文档',
-  document_delete: '删除文档',
-  chat_query: '知识问答'
-}
+const ACTION_TEXT = computed<Record<string, string>>(() => ({
+  login_success: t('audit.actions.loginSuccess'),
+  login_failed: t('audit.actions.loginFailed'),
+  logout: t('audit.actions.logout'),
+  user_create: t('audit.actions.userCreate'),
+  user_update: t('audit.actions.userUpdate'),
+  user_delete: t('audit.actions.userDelete'),
+  user_import: t('audit.actions.userImport'),
+  password_change: t('audit.actions.passwordChange'),
+  kb_create: t('audit.actions.kbCreate'),
+  kb_update: t('audit.actions.kbUpdate'),
+  kb_delete: t('audit.actions.kbDelete'),
+  document_upload: t('audit.actions.documentUpload'),
+  document_delete: t('audit.actions.documentDelete'),
+  chat_query: t('audit.actions.chatQuery')
+}))
 
 function actionText(action: string) {
-  return ACTION_TEXT[action] || action
+  return ACTION_TEXT.value[action] || action
 }
 
 function actionType(action: string) {
@@ -195,10 +199,6 @@ function detailText(detail: Record<string, unknown> | null) {
   return summarize(detail)
 }
 
-function formatTime(value: string) {
-  return new Date(value).toLocaleString('zh-CN', { hour12: false })
-}
-
 function onFilter() {
   page.value = 1
   load()
@@ -227,11 +227,11 @@ onMounted(load)
 
 <style scoped>
 .filter {
-  width: 156px;
+  width: 180px;
 }
 
 .user-filter {
-  width: 184px;
+  width: 220px;
 }
 
 .actor {
@@ -243,9 +243,9 @@ onMounted(load)
 
 .actor-avatar {
   flex-shrink: 0;
-  border: 1px solid #dbe7d9;
-  background: #edf2e8;
-  color: #486246;
+  border: 1px solid var(--line);
+  background: var(--slate-soft);
+  color: var(--slate-text);
   font-size: 11px;
   font-weight: 600;
 }
@@ -293,7 +293,7 @@ onMounted(load)
 }
 
 .detail-preview:focus-visible {
-  outline: 2px solid rgb(36 122 97 / 35%);
+  outline: 2px solid var(--brand);
   outline-offset: 2px;
 }
 
@@ -303,10 +303,12 @@ onMounted(load)
   font-variant-numeric: tabular-nums;
 }
 
-:global(.audit-detail-tip) {
+:global(.el-popper.is-dark.audit-detail-tip) {
   max-width: min(420px, calc(100vw - 32px));
   padding: 9px 12px;
-  color: #f3f7f4;
+  border: 1px solid var(--line-strong);
+  background: var(--text);
+  color: var(--surface);
   font-size: 12px;
   line-height: 1.75;
   white-space: pre-wrap;
@@ -315,11 +317,11 @@ onMounted(load)
 
 @media (max-width: 900px) {
   .filter {
-    width: 132px;
+    width: 150px;
   }
 
   .user-filter {
-    width: 160px;
+    width: 190px;
   }
 }
 

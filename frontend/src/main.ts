@@ -1,7 +1,7 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import ElementPlus from 'element-plus'
-import zhCn from 'element-plus/es/locale/lang/zh-cn'
+import { i18n } from './i18n'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ChatDotRound, ChatLineRound, CircleCheck,
   CircleCheckFilled, CircleClose, Delete, Document, DocumentCopy, EditPen, Expand,
@@ -10,6 +10,7 @@ import {
   UploadFilled, User, UserFilled, VideoPause
 } from '@element-plus/icons-vue'
 import 'element-plus/dist/index.css'
+import 'element-plus/theme-chalk/dark/css-vars.css'
 import 'highlight.js/styles/github.css'
 
 import App from './App.vue'
@@ -30,6 +31,7 @@ for (const [key, component] of Object.entries(icons)) {
 }
 
 app.use(createPinia())
+app.use(i18n)
+app.use(ElementPlus)
 app.use(router)
-app.use(ElementPlus, { locale: zhCn })
 app.mount('#app')

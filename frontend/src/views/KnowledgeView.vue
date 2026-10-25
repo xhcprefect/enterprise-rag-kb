@@ -2,53 +2,53 @@
   <div class="page">
     <div class="page-head">
       <div>
-        <span class="page-eyebrow">KNOWLEDGE BASE</span>
-        <h2>知识库管理</h2>
-        <p>每个知识库对应一套独立的向量集合，文档互不干扰</p>
+        <span class="page-eyebrow">{{ t('knowledge.eyebrow') }}</span>
+        <h2>{{ t('knowledge.title') }}</h2>
+        <p>{{ t('knowledge.subtitle') }}</p>
       </div>
       <div class="page-actions">
         <el-input
           v-model="keyword"
-          placeholder="搜索知识库"
+          :placeholder="t('knowledge.searchPlaceholder')"
           clearable
           class="search"
           :prefix-icon="Search"
-          aria-label="搜索知识库"
+          :aria-label="t('knowledge.searchAria')"
         />
         <el-button v-if="userStore.isAdmin" type="primary" @click="openCreate">
-          <el-icon><Plus /></el-icon>新建知识库
+          <el-icon><Plus /></el-icon>{{ t('knowledge.create') }}
         </el-button>
       </div>
     </div>
 
     <!-- 概览：只汇总当前列表的真实数据 -->
-    <section class="overview" aria-label="知识库概览">
+    <section class="overview" :aria-label="t('knowledge.overviewAria')">
       <div class="overview-item">
         <span class="overview-icon"><el-icon><Files /></el-icon></span>
         <div class="overview-copy">
-          <span class="overview-label">知识库</span>
-          <strong class="overview-value">{{ kbs.length }}</strong>
+          <span class="overview-label">{{ t('knowledge.overview.bases') }}</span>
+          <strong class="overview-value">{{ formatNumber(kbs.length) }}</strong>
         </div>
       </div>
       <div class="overview-item">
         <span class="overview-icon moss"><el-icon><Document /></el-icon></span>
         <div class="overview-copy">
-          <span class="overview-label">文档总数</span>
-          <strong class="overview-value">{{ totalDocuments }}</strong>
+          <span class="overview-label">{{ t('knowledge.overview.documents') }}</span>
+          <strong class="overview-value">{{ formatNumber(totalDocuments) }}</strong>
         </div>
       </div>
       <div class="overview-item">
         <span class="overview-icon warm"><el-icon><Unlock /></el-icon></span>
         <div class="overview-copy">
-          <span class="overview-label">公开知识库</span>
-          <strong class="overview-value">{{ publicCount }}</strong>
+          <span class="overview-label">{{ t('knowledge.overview.publicBases') }}</span>
+          <strong class="overview-value">{{ formatNumber(publicCount) }}</strong>
         </div>
       </div>
       <div class="overview-item">
         <span class="overview-icon neutral"><el-icon><Lock /></el-icon></span>
         <div class="overview-copy">
-          <span class="overview-label">私有知识库</span>
-          <strong class="overview-value">{{ kbs.length - publicCount }}</strong>
+          <span class="overview-label">{{ t('knowledge.overview.privateBases') }}</span>
+          <strong class="overview-value">{{ formatNumber(kbs.length - publicCount) }}</strong>
         </div>
       </div>
     </section>
@@ -56,11 +56,13 @@
     <section class="library" aria-labelledby="library-title">
       <div class="section-head">
         <div>
-          <h3 id="library-title">全部知识库</h3>
-          <p v-if="keyword">找到 {{ filteredKbs.length }} 个匹配的知识库</p>
-          <p v-else>打开知识库管理文档，或直接进入问答</p>
+          <h3 id="library-title">{{ t('knowledge.listTitle') }}</h3>
+          <p v-if="keyword">
+            {{ t('knowledge.listMatch', { count: formatNumber(filteredKbs.length) }, filteredKbs.length) }}
+          </p>
+          <p v-else>{{ t('knowledge.listHint') }}</p>
         </div>
-        <span class="count-badge">{{ filteredKbs.length }}</span>
+        <span class="count-badge">{{ formatNumber(filteredKbs.length) }}</span>
       </div>
 
       <div v-loading="loading" class="kb-area">
@@ -83,7 +85,7 @@
                   class="kb-more"
                   type="button"
                   aria-haspopup="menu"
-                  :aria-label="`知识库操作：${kb.name}`"
+                  :aria-label="t('knowledge.actionsAria', { name: kb.name })"
                   @click.stop
                 >
                   <el-icon><MoreFilled /></el-icon>
@@ -91,10 +93,10 @@
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item command="edit">
-                      <el-icon><EditPen /></el-icon>编辑
+                      <el-icon><EditPen /></el-icon>{{ t('common.edit') }}
                     </el-dropdown-item>
                     <el-dropdown-item command="delete" divided>
-                      <el-icon><Delete /></el-icon>删除
+                      <el-icon><Delete /></el-icon>{{ t('common.delete') }}
                     </el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
@@ -111,85 +113,110 @@
                 {{ kb.name }}
               </button>
             </h3>
-            <p class="kb-desc">{{ kb.description || '暂无描述' }}</p>
+            <p class="kb-desc">{{ kb.description || t('common.noDescription') }}</p>
 
             <div class="kb-meta">
               <span class="kb-stat">
-                <el-icon :size="13"><Document /></el-icon>{{ kb.document_count }} 篇文档
+                <el-icon :size="13"><Document /></el-icon>
+                <span>
+                  {{ t('knowledge.documentCount', { count: formatNumber(kb.document_count) }, kb.document_count) }}
+                </span>
               </span>
               <el-tag size="small" :type="kb.is_public ? 'success' : 'warning'" effect="light" round>
-                {{ kb.is_public ? '公开' : '私有' }}
+                {{ kb.is_public ? t('common.public') : t('common.private') }}
               </el-tag>
             </div>
 
             <div class="kb-actions">
-              <el-button size="small" @click.stop="goDocuments(kb)">管理文档</el-button>
-              <el-button size="small" type="primary" plain @click.stop="goChat(kb)">开始问答</el-button>
+              <el-button size="small" @click.stop="goDocuments(kb)">{{ t('knowledge.manage') }}</el-button>
+              <el-button size="small" type="primary" plain @click.stop="goChat(kb)">
+                {{ t('knowledge.chat') }}
+              </el-button>
             </div>
           </article>
 
           <button v-if="userStore.isAdmin" class="kb-card kb-new" type="button" @click="openCreate">
             <span class="kb-new-icon"><el-icon :size="22"><Plus /></el-icon></span>
-            <span class="kb-new-title">新建知识库</span>
-            <span class="kb-new-hint">为新的资料集合建立独立空间</span>
+            <span class="kb-new-title">{{ t('knowledge.newTitle') }}</span>
+            <span class="kb-new-hint">{{ t('knowledge.newHint') }}</span>
           </button>
         </div>
 
         <div v-else-if="!loading" class="library-empty">
           <el-empty
-            :description="keyword ? '没有匹配的知识库' : '还没有知识库，先创建一个吧'"
+            :description="keyword ? t('knowledge.emptyMatch') : t('knowledge.empty')"
             :image-size="84"
           >
-            <el-button v-if="keyword" @click="keyword = ''">清除搜索</el-button>
+            <el-button v-if="keyword" @click="keyword = ''">{{ t('knowledge.clearSearch') }}</el-button>
             <el-button v-else-if="userStore.isAdmin" type="primary" @click="openCreate">
-              <el-icon><Plus /></el-icon>新建知识库
+              <el-icon><Plus /></el-icon>{{ t('knowledge.create') }}
             </el-button>
           </el-empty>
         </div>
       </div>
     </section>
 
-    <el-dialog v-model="dialogVisible" :title="editing ? '编辑知识库' : '新建知识库'" width="520px">
-      <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
-        <el-form-item label="名称" prop="name">
-          <el-input v-model="form.name" placeholder="例如：产品手册库" maxlength="128" show-word-limit />
+    <el-dialog
+      v-model="dialogVisible"
+      :title="editing ? t('knowledge.dialogEditTitle') : t('knowledge.dialogCreateTitle')"
+      width="520px"
+    >
+      <el-form
+        ref="formRef"
+        :model="form"
+        :rules="rules"
+        label-position="top"
+        :validate-on-rule-change="false"
+      >
+        <el-form-item :label="t('knowledge.form.name')" prop="name">
+          <el-input
+            v-model="form.name"
+            :placeholder="t('knowledge.form.namePlaceholder')"
+            maxlength="128"
+            show-word-limit
+          />
         </el-form-item>
-        <el-form-item label="描述">
+        <el-form-item :label="t('knowledge.form.description')">
           <el-input
             v-model="form.description"
             type="textarea"
             :rows="3"
             resize="none"
-            placeholder="简要说明知识库用途，便于其他成员识别"
+            :placeholder="t('knowledge.form.descriptionPlaceholder')"
             maxlength="2000"
             show-word-limit
           />
         </el-form-item>
-        <el-form-item label="可见范围">
+        <el-form-item :label="t('knowledge.form.visibility')">
           <div class="switch-row">
             <el-switch v-model="form.is_public" />
-            <span>{{ form.is_public ? '公开：所有登录用户可见' : '私有：仅创建者与管理员可见' }}</span>
+            <span>
+              {{ form.is_public ? t('knowledge.form.publicHint') : t('knowledge.form.privateHint') }}
+            </span>
           </div>
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submit">保存</el-button>
+        <el-button @click="dialogVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="submitting" @click="submit">{{ t('common.save') }}</el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import { kbApi, type KnowledgeBase } from '@/api'
 import { useUserStore } from '@/stores/user'
+import { formatNumber } from '@/i18n/format'
 
 const router = useRouter()
 const userStore = useUserStore()
+const { t, locale } = useI18n()
 
 const loading = ref(false)
 const kbs = ref<KnowledgeBase[]>([])
@@ -201,9 +228,15 @@ const formRef = ref<FormInstance>()
 
 const form = reactive({ name: '', description: '', is_public: true })
 
-const rules: FormRules = {
-  name: [{ required: true, message: '请输入知识库名称', trigger: 'blur' }]
-}
+// 规则随语言重建；关闭规则的自动重校验，切语言不会触发验证或阻断已填内容。
+const rules = computed<FormRules>(() => ({
+  name: [{ required: true, message: t('knowledge.form.nameRequired'), trigger: 'blur' }]
+}))
+
+// 已显示的旧语言错误在切换语言后清除，避免提示与当前语言不一致。
+watch(locale, () => {
+  if (dialogVisible.value) formRef.value?.clearValidate()
+})
 
 const filteredKbs = computed(() => {
   const kw = keyword.value.trim().toLowerCase()
@@ -248,10 +281,10 @@ async function submit() {
   try {
     if (editing.value) {
       await kbApi.update(editing.value.id, form)
-      ElMessage.success('已更新')
+      ElMessage.success(t('common.updated'))
     } else {
       await kbApi.create(form)
-      ElMessage.success('已创建')
+      ElMessage.success(t('common.created'))
     }
     dialogVisible.value = false
     await load()
@@ -269,15 +302,20 @@ async function onCommand(cmd: string, kb: KnowledgeBase) {
 
   try {
     await ElMessageBox.confirm(
-      `删除知识库「${kb.name}」将同时删除其下所有文档和向量数据，且不可恢复。确定继续？`,
-      '危险操作',
-      { type: 'warning', confirmButtonText: '确定删除', confirmButtonClass: 'el-button--danger' }
+      t('knowledge.deleteConfirm', { name: kb.name }),
+      t('common.danger'),
+      {
+        type: 'warning',
+        confirmButtonText: t('knowledge.deleteConfirmButton'),
+        cancelButtonText: t('common.cancel'),
+        confirmButtonClass: 'el-button--danger'
+      }
     )
   } catch {
     return
   }
   await kbApi.remove(kb.id)
-  ElMessage.success('已删除')
+  ElMessage.success(t('common.deleted'))
   await load()
 }
 
@@ -333,18 +371,18 @@ onMounted(load)
 }
 
 .overview-icon.moss {
-  background: #f2f6ef;
-  color: #5c7551;
+  background: var(--success-soft);
+  color: var(--success);
 }
 
 .overview-icon.warm {
-  background: #fbf5eb;
+  background: var(--warning-soft);
   color: var(--warning);
 }
 
 .overview-icon.neutral {
-  background: #f3f5f3;
-  color: #6f7d76;
+  background: var(--slate-soft);
+  color: var(--slate-text);
 }
 
 .overview-copy {
@@ -358,7 +396,6 @@ onMounted(load)
   color: var(--text-3);
   font-size: 12px;
   line-height: 1.5;
-  white-space: nowrap;
 }
 
 .overview-value {
@@ -428,7 +465,7 @@ onMounted(load)
 
 .kb-card:hover {
   transform: translateY(-2px);
-  border-color: #cddfd5;
+  border-color: var(--accent-border);
   box-shadow: var(--shadow-md);
 }
 
@@ -444,7 +481,7 @@ onMounted(load)
   place-items: center;
   width: 38px;
   height: 38px;
-  border: 1px solid #e0ece5;
+  border: 1px solid var(--line);
   border-radius: 11px;
   background: var(--brand-tint);
   color: var(--brand);
@@ -521,6 +558,7 @@ onMounted(load)
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  min-width: 0;
   color: var(--text-3);
   font-size: 12.5px;
   font-variant-numeric: tabular-nums;
@@ -537,6 +575,7 @@ onMounted(load)
 .kb-actions .el-button {
   flex: 1;
   margin: 0;
+  white-space: normal;
 }
 
 /* 新建卡片 */
@@ -582,9 +621,11 @@ onMounted(load)
 }
 
 .kb-new-hint {
+  max-width: 22em;
   color: var(--text-3);
   font-size: 12px;
   font-weight: 400;
+  text-align: center;
 }
 
 .library-empty {
