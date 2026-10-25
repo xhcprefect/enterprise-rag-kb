@@ -103,18 +103,19 @@
       </div>
 
       <!-- 入库刚创建文档时后端 progress 恒为 0（worker 尚未领取，或还没落第一批分块），
-           这时没有可信百分比，用不确定态表示"在排队"，而不是画一根 0% 的定长条。
+           这时没有可信百分比，用流动条纹表示"在排队"，而不是画一根 0% 的定长条。
            两个分支是不同元素：切换时旧节点卸载、新节点挂载，不会触发
            .el-progress-bar__inner 的 width .6s 过渡，因此不会出现进度条从 100% 倒抽回 0 的动画。 -->
       <el-progress
         v-if="ingestQueued"
         key="queued"
-        :percentage="30"
-        :duration="1.6"
-        indeterminate
+        :percentage="100"
+        striped
+        striped-flow
+        :duration="1.2"
         :format="queueFormat"
         :stroke-width="8"
-        class="upload-progress"
+        class="upload-progress pending-progress"
       />
       <el-progress
         v-else
@@ -175,15 +176,17 @@
         <!-- 状态与进度合并：就绪/失败/取消显示标签，排队与处理中直接显示进度条 -->
         <el-table-column label="状态" width="180">
           <template #default="{ row }">
-            <!-- 排队中的 progress 恒为 0，画 0% 定长条会显得卡死；用不确定态表达"在等 worker" -->
+            <!-- 排队中的 progress 恒为 0，画 0% 定长条会显得卡死；用流动条纹表达"在等 worker" -->
             <el-progress
               v-if="row.status === 'pending' || (row.status === 'processing' && !row.progress)"
-              :percentage="30"
-              :duration="1.6"
-              indeterminate
+              :percentage="100"
+              striped
+              striped-flow
+              :duration="1.2"
               :format="queueFormat"
               :stroke-width="6"
               :text-inside="false"
+              class="pending-progress"
             />
             <el-progress
               v-else-if="row.status === 'processing'"

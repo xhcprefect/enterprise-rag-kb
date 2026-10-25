@@ -133,6 +133,7 @@ a { color: var(--brand); }
 .el-form-item__label { font-size: 13px; font-weight: 500; }
 .el-card { border-radius: var(--radius-lg); border-color: var(--line); box-shadow: var(--shadow-sm); }
 .el-dialog { max-width: calc(100vw - 32px); padding: 0; border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow-lg); overflow: hidden; }
+.el-dialog:not(.is-fullscreen) { width: min(var(--el-dialog-width, 50%), calc(100vw - 32px)); }
 .el-dialog__header { padding: 24px 26px 16px; margin-right: 0; border-bottom: 1px solid var(--line); }
 .el-dialog__title { color: var(--text); font-size: 17px; font-weight: 650; }
 .el-dialog__headerbtn { top: 15px; right: 12px; }
@@ -153,8 +154,11 @@ a { color: var(--brand); }
 .el-pagination .el-select__wrapper { min-height: 30px; }
 .el-dropdown-menu { padding: 6px; border-radius: 10px; }
 .el-dropdown-menu__item { min-height: 36px; padding: 0 12px; border-radius: 6px; font-size: 13px; }
-.el-message-box { max-width: calc(100vw - 32px); padding: 18px; border-radius: 16px; }
-.el-message { max-width: calc(100vw - 32px); border-radius: 10px; box-shadow: var(--shadow-md); }
+/* Element 默认 --el-messagebox-width:420px，这里必须用 min() 兜底而不是直接覆盖：
+   写成 calc(100vw - 32px) 会把 420px 上限顶掉，一句「确定删除某某吗」的确认框
+   就撑满整个视口。min() 保证窄屏不溢出、宽屏仍保持 420px 的紧凑尺寸。 */
+.el-message-box { max-width: min(var(--el-messagebox-width, 420px), calc(100vw - 32px)); padding: 18px; border-radius: 16px; }
+.el-message { max-width: min(520px, calc(100vw - 32px)); border-radius: 10px; box-shadow: var(--shadow-md); }
 .el-slider__runway { background: #e4ebe4; }
 .el-empty { padding: 40px 16px; }
 .el-empty__description p { color: var(--text-3); font-size: 13px; }
@@ -222,4 +226,21 @@ a { color: var(--brand); }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+/* 「排队中 / 处理中」这类没有可信百分比的进度：铺满整条，用流动条纹表达"正在进行"。
+   不用 el-progress 的 indeterminate —— 它的关键帧是 left: -100% → 100%，而进度条
+   本身只有 30% 宽，每轮里有大半时间整根移出可视区（被 overflow:hidden 裁掉），
+   看上去就是一闪一闪的。条纹方案只平移背景，色块始终填满整个轨道。 */
+.pending-progress .el-progress-bar__inner {
+  width: 100% !important;
+  /* 条形细，条纹要收一点、淡一点，否则在 6px 高的轨道上糊成一片 */
+  background-size: .8em .8em;
+  opacity: .85;
+}
+.pending-progress .el-progress__text {
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: .02em;
 }
