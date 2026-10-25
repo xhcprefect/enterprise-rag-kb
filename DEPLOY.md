@@ -207,11 +207,31 @@ data/
 
 ### 定时备份
 
+**必须配**，尤其在这类竞价实例上——机器被回收时手动备份等于没有备份。
+
 ```bash
-crontab -e
-# 每天凌晨 3:20
-20 3 * * * /opt/enterprise-rag-kb/deploy/backup.sh >> /var/log/rag-backup.log 2>&1
+# 一条命令装好（幂等，重复执行不会叠加）
+(crontab -l 2>/dev/null | grep -v "deploy/backup.sh"; \
+ echo '20 3 * * * cd $HOME/enterprise-rag-kb && ./deploy/backup.sh >> $HOME/enterprise-rag-kb/data/logs/backup.log 2>&1') | crontab -
+
+crontab -l                                    # 确认已装
 ```
+
+两个容易踩的坑，上面的写法已经避开：
+
+- **日志不要写 `/var/log`**：普通用户 `ubuntu` 对它没有写权限，重定向会直接失败，
+  而 cron 的报错只会进系统邮件（基本看不到）。写 `data/logs/` 下。
+- **不要写死绝对路径**：用 `$HOME` 或 `cd` 进项目目录，换机器、换用户名都不用改。
+
+装完**务必模拟 cron 的精简环境实测一次**，`cron` 能跑不代表 `crontab` 里那条能跑：
+
+```bash
+env -i HOME=$HOME PATH=/usr/bin:/bin SHELL=/bin/sh \
+  /bin/sh -c 'cd $HOME/enterprise-rag-kb && ./deploy/backup.sh'
+# 应输出「备份完成: ...」，exit 0
+```
+
+`cron` 不继承登录 shell 的 PATH / 环境变量，是这类任务最常见的静默失败原因。
 
 ### 恢复
 
@@ -376,6 +396,9 @@ docker compose exec api python -c \
 - [ ] `JWT_SECRET` 已换成随机值（`.env` 与 `backend/.env` 两处）
 - [ ] `POSTGRES_PASSWORD` 已改，且数据库端口**没有**暴露到公网（当前配置只在内网）
 - [ ] `admin` 密码已改（首次登录后到个人中心修改）
+- [ ] 改完后把 `backend/.env` 的 `ADMIN_PASSWORD` **整行删掉**——它只在建号那一次
+      生效，留着只会让后来人误以为改它就能改密码（密码对不上时启动日志会告警提示）
+- [ ] 定时备份已配置且在跑：`crontab -l` 有输出、`data/logs/backup.log` 有记录
 - [ ] `backend/.env` 没有提交到 git（`.gitignore` 已包含）
 - [ ] 云服务器安全组只放行 80（以及要用的 443），**不要**放行 8000 / 5432
 - [ ] `backend/.env` 的 `DEBUG=false`（默认已是；为 true 时 `/docs`、`/redoc`、

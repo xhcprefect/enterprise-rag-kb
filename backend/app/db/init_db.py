@@ -4,7 +4,7 @@ import logging
 from sqlalchemy import inspect, select, text
 
 from app.core.config import settings
-from app.core.security import hash_password
+from app.core.security import hash_password, verify_password
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
 from app.models import User, UserRole
@@ -94,17 +94,30 @@ def init_db(create_admin: bool = True) -> None:
 
     with SessionLocal() as db:
         admin = db.scalar(select(User).where(User.username == settings.ADMIN_USERNAME))
-        if admin is None:
-            admin = User(
-                username=settings.ADMIN_USERNAME,
-                display_name="系统管理员",
-                password_hash=hash_password(settings.ADMIN_PASSWORD),
-                role=UserRole.ADMIN.value,
-            )
-            db.add(admin)
-            try:
-                db.commit()
-                logger.info("已创建初始管理员: %s", settings.ADMIN_USERNAME)
-            except Exception:  # noqa: BLE001 - API 与 worker 可能同时启动
-                db.rollback()
-                logger.info("初始管理员已由其他进程创建: %s", settings.ADMIN_USERNAME)
+        if admin is not None:
+            # 管理员已存在，ADMIN_PASSWORD 不再有任何作用——它只在建号那一次被读取。
+            # 但如果配置文件里的值已经和库里的密码对不上，它就成了一条会误导人的
+            # 过期记录：有人会以为"改这里就能改密码"，或者拿它当找回凭据。
+            # 只在这种真的对不上时才告警，否则每次重启都刷一行没意义的日志。
+            if settings.ADMIN_PASSWORD and not verify_password(
+                settings.ADMIN_PASSWORD, admin.password_hash
+            ):
+                logger.warning(
+                    "backend/.env 的 ADMIN_PASSWORD 与管理员 %s 的实际密码不一致，"
+                    "该配置项已失效：改密码请走「个人中心」，或删除这一行避免误导",
+                    settings.ADMIN_USERNAME,
+                )
+            return
+        admin = User(
+            username=settings.ADMIN_USERNAME,
+            display_name="系统管理员",
+            password_hash=hash_password(settings.ADMIN_PASSWORD),
+            role=UserRole.ADMIN.value,
+        )
+        db.add(admin)
+        try:
+            db.commit()
+            logger.info("已创建初始管理员: %s", settings.ADMIN_USERNAME)
+        except Exception:  # noqa: BLE001 - API 与 worker 可能同时启动
+            db.rollback()
+            logger.info("初始管理员已由其他进程创建: %s", settings.ADMIN_USERNAME)
