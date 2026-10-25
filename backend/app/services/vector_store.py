@@ -68,7 +68,12 @@ def get_embeddings() -> Embeddings:
 
 
 def get_vector_store(collection_name: str) -> PGVector:
-    """按知识库返回独立的向量集合（进程内缓存，避免每次检索重建引擎与表）。"""
+    """按知识库返回独立的向量集合（进程内缓存，避免每次检索重建引擎与表）。
+
+    参数必须是 ``KnowledgeBase.collection_name``（形如 ``kb_99ae064d594a4b2f``），
+    不是知识库的 UUID。``search_ready_vectors`` 会拿它和库里的 collection_name
+    做等值匹配，传错了不报错、只是静默返回空结果——排查起来很像"检索坏了"。
+    """
     return _store(collection_name)
 
 
