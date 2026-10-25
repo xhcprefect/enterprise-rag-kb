@@ -137,12 +137,20 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
 
 def _format_error(label: str, status: int, body: str) -> str:
     """把 OpenAI 风格的错误体压成一行中文提示，避免把整段 HTML 抛给调用方。"""
-    message = body
+    message = ""
     try:
         data = json.loads(body)
-        message = data.get("message") or (data.get("error") or {}).get("message") or body
+        message = data.get("message") or (data.get("error") or {}).get("message") or ""
     except (ValueError, AttributeError):
-        message = body[:300]
+        pass
+    if not message:
+        # 5xx 常由 Cloudflare / 网关吐出整页 HTML（例如 sheapi.top 的 520），
+        # 截前 300 字仍是 <!DOCTYPE html><html>… 的噪声，对用户毫无意义。
+        # 这类响应体只说明"对方站点挂了"，换成一句可读的说明。
+        if _looks_like_markup(body):
+            message = _status_hint(status)
+        else:
+            message = body.strip()[:300] or _status_hint(status)
     if status == 401:
         return f"{label} 鉴权失败（401）：API Key 无效或已过期"
     if status == 402:
@@ -150,6 +158,23 @@ def _format_error(label: str, status: int, body: str) -> str:
     if status == 429:
         return f"{label} 触发限流（429）：{message}"
     return f"{label} 返回 {status}：{message}"
+
+
+def _looks_like_markup(body: str) -> bool:
+    """判断响应体是不是 HTML/XML 页面而非接口错误信息。"""
+    head = body.lstrip()[:200].lower()
+    return head.startswith(("<!doctype", "<html", "<?xml", "<head", "<body"))
+
+
+def _status_hint(status: int) -> str:
+    """给没有可读错误体的状态码配一句中文说明。"""
+    if status >= 500:
+        return "模型服务商站点异常，请稍后重试"
+    if status == 404:
+        return "接口地址不存在，请检查 LLM_BASE_URL 配置"
+    if status == 403:
+        return "无权访问该模型，请检查账号权限"
+    return "服务端未返回可读的错误信息"
 
 
 def _embedding_endpoint() -> _Endpoint:

@@ -998,6 +998,14 @@ onBeforeUnmount(() => {
   }
 }
 
+/* 减少动态效果时停转：旋转的圈会定格成一个歪斜的图标，看不出在转反而更奇怪。
+   改为不转的静态图标，进行中的状态由下方的「排队中」/「处理中」文案承担。 */
+@media (prefers-reduced-motion: reduce) {
+  .upload-icon.ingesting :deep(.el-icon) {
+    animation: none !important;
+  }
+}
+
 .upload-meta {
   display: flex;
   flex-direction: column;

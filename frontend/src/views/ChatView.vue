@@ -474,6 +474,10 @@ async function send() {
       streaming.value = false
       controller = null
     }
+    // 先记下是否真的产出了回答：下面的兜底文案不是回答，不能给它配引用来源。
+    // 否则模型报错时会同时出现「引用来源 6」和一句"抱歉，模型未返回内容"，
+    // 看起来像"明明检索到了却不回答"，自相矛盾。
+    const answered = !!assistant.content
     // 一个 token 都没收到时也要有明确交代，不能留空气泡
     if (!assistant.content) {
       assistant.content = aborted
@@ -482,8 +486,9 @@ async function send() {
           ? '抱歉，模型未返回内容，请重试或调小「检索条数」。'
           : '抱歉，模型未返回内容，请重试。'
     }
-    // 回答已收口，此时再挂引用来源，视觉上"先答案后出处"
-    assistant.citations = pendingCitations
+    // 回答已收口，此时再挂引用来源，视觉上"先答案后出处"。
+    // 只有真正产出了回答才挂：报错/空回答时引用块只会让人困惑。
+    assistant.citations = answered ? pendingCitations : undefined
     if (!disposed && isCurrent) await loadConversations()
     // 用 followTail 而不是 scrollToBottom：用户中途往回翻时不该在收尾瞬间被拽回去。
     // 但新会话的第一条回答必须让它可见——那时用户本来就在底部，stick 为 true，
@@ -590,6 +595,12 @@ onBeforeUnmount(() => {
 .dot:nth-child(2) { animation-delay: .15s; }
 .dot:nth-child(3) { animation-delay: .3s; }
 @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: .5; } 30% { transform: translateY(-3px); opacity: 1; } }
+/* 减少动态效果时动画会停住，三点会定格成三个半透明灰点、看不出"还在处理"。
+   改成静态实心点，配合旁边的「生成中」文字，状态依然明确。 */
+@media (prefers-reduced-motion: reduce) {
+  .dot { animation: none !important; opacity: 1; }
+  .cursor { animation: none !important; opacity: 1; }
+}
 .citations { margin-top: 14px; padding: 2px 13px; border: 1px solid #e4eadc; border-radius: 10px; background: #fafcf7; }
 .citations :deep(.el-collapse) { border: 0; background: transparent; --el-collapse-header-height: 37px; --el-collapse-border-color: transparent; }
 .citations :deep(.el-collapse-item__header) { padding: 0; border: 0; background: transparent; color: var(--text-2); font-size: 12px; }

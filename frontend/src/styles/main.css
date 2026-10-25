@@ -224,8 +224,18 @@ a { color: var(--brand); }
   .el-dialog__body { padding-inline: 20px; }
   .el-dialog__header, .el-dialog__footer { padding-inline: 20px; }
 }
+/* 系统开启「减少动态效果」时，动画应当彻底停住，而不是"变快"。
+   把 animation-duration 压到 .01ms 配合 infinite 会让循环每秒重播约 10 万次，
+   采样到的每帧都是随机相位——转圈和三点加载看起来像抽风，反而比原来更晃眼。
+   正确做法：动画只播一次且时长归零（停在起始帧），过渡直接取消。 */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    animation-delay: 0s !important;
+    transition-duration: 0s !important;
+  }
 }
 
 /* 「排队中 / 处理中」这类没有可信百分比的进度：铺满整条，用流动条纹表达"正在进行"。
