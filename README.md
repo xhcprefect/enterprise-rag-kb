@@ -307,5 +307,6 @@ docker compose up -d --build
 ```
 
 编排包含 4 个服务：`db`（pgvector）、`api`（uvicorn）、`worker`（入库）、
-`web`（Nginx 静态托管 + 反代）。数据统一落在 `${DATA_DIR}`，附备份/恢复脚本，
-适配可能被回收的竞价实例。
+`web`（Nginx 静态托管 + 反代）。`api` 与 `worker` 是**同一个镜像**
+（`rag-kb-backend`，只差启动命令），构建一次、两个容器共用，不会出现版本漂移。
+数据统一落在 `${DATA_DIR}`，附备份/恢复脚本，适配可能被回收的竞价实例。

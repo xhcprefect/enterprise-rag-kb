@@ -39,6 +39,11 @@ services:
   api:
     build:
       context: ./backend
+    # api 与 worker 跑的是同一份代码（Dockerfile 用 CMD 区分），显式指定同一个镜像名，
+    # 让它们共享同一个镜像 tag 而不是各自打一个。否则 compose 会按服务名分别 tag
+    # （rag-kb-api / rag-kb-worker），构建时间不同就会留下两份指向不同代码的镜像，
+    # worker 悄悄跑旧代码而 api 已是新的——之前就踩过这个坑。
+    image: rag-kb-backend:latest
     restart: unless-stopped
     env_file:
       - ./backend/.env
@@ -75,6 +80,9 @@ services:
   worker:
     build:
       context: ./backend
+    # 与 api 同一个镜像 tag：compose 会复用同一次构建产物，
+    # `docker compose build` 也只构建一次，不会再出现 api/worker 代码版本不一致。
+    image: rag-kb-backend:latest
     restart: unless-stopped
     command: ["python", "worker.py"]
     env_file:
