@@ -72,9 +72,8 @@
               <div class="message-author">{{ msg.role === 'user' ? '你' : 'AI 助手' }}<span v-if="msg.streaming" class="generating-label">生成中</span></div>
               <div class="bubble">
                 <div v-if="msg.role === 'assistant' && msg.streaming && !msg.content" class="thinking" role="status"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="thinking-text">{{ chatMode === 'rag' ? '正在检索并生成回答…' : '正在生成回答…' }}</span></div>
-                <div v-else-if="msg.role === 'assistant'" class="markdown-body" v-html="renderMarkdown(msg.content, !!msg.streaming)"></div>
+                <div v-else-if="msg.role === 'assistant'" class="markdown-body" :class="{ streaming: msg.streaming }" v-html="renderMarkdown(msg.content, !!msg.streaming)"></div>
                 <div v-else class="plain-text">{{ msg.content }}</div>
-                <span v-if="msg.streaming && msg.content" class="cursor">▊</span>
               </div>
               <div v-if="msg.citations?.length" class="citations">
                 <el-collapse><el-collapse-item>
@@ -587,8 +586,26 @@ onBeforeUnmount(() => {
 .bubble { padding: 3px 0; color: var(--text); font-size: 14px; line-height: 1.85; }
 .message.user .bubble { padding: 12px 17px; border: 1px solid #e0e9d7; border-radius: 12px 3px 12px 12px; background: #eef4e7; color: #3c5838; }
 .plain-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-.cursor { animation: blink 1s step-end infinite; color: var(--brand); font-size: 12px; }
-@keyframes blink { 50% { opacity: 0; } }
+/* 光标画在正文最后一个块元素的末尾，而不是作为兄弟节点跟在 .markdown-body 后面：
+   后者是块级元素，紧跟其后的行内 span 只能另起一行，光标会孤零零掉到下一行（看起来像渲染出错）。
+   用伪元素内联在文字流里，收尾时紧贴最后一个字符，符合"正在打字"的直觉。
+   闪烁用 opacity 而非 step-end 的硬切，减少突兀感；1.06s 慢一档，长时间生成时不晃眼。
+
+   只在段落/标题/引用/列表项这类文字块上画：流式若正好停在代码块里，
+   伪元素会被 flex/表格布局挤出怪异位置，那种情况下宁可不显示光标。 */
+.markdown-body.streaming :deep(> :last-child) {
+  &:is(p, h1, h2, h3, h4, h5, h6, blockquote, li)::after {
+    content: '';
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    margin-left: 2px;
+    background: var(--brand);
+    vertical-align: text-bottom;
+    animation: caret 1.06s steps(2, start) infinite;
+  }
+}
+@keyframes caret { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .thinking { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-height: 25px; color: var(--text-3); font-size: 12px; }
 .thinking-text { margin-left: 6px; }
 .dot { width: 5px; height: 5px; border-radius: 50%; background: #9bb28c; animation: bounce 1.2s infinite ease-in-out; }
@@ -599,7 +616,7 @@ onBeforeUnmount(() => {
    改成静态实心点，配合旁边的「生成中」文字，状态依然明确。 */
 @media (prefers-reduced-motion: reduce) {
   .dot { animation: none !important; opacity: 1; }
-  .cursor { animation: none !important; opacity: 1; }
+  .markdown-body.streaming :deep(> :last-child):is(p, h1, h2, h3, h4, h5, h6, blockquote, li)::after { animation: none !important; opacity: 1; }
 }
 .citations { margin-top: 14px; padding: 2px 13px; border: 1px solid #e4eadc; border-radius: 10px; background: #fafcf7; }
 .citations :deep(.el-collapse) { border: 0; background: transparent; --el-collapse-header-height: 37px; --el-collapse-border-color: transparent; }
