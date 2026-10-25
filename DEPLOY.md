@@ -162,6 +162,8 @@ docker compose logs -f api        # 看启动日志
 4. 针对该文档提问，能返回答案并带 `[1]` 引用
 5. `curl http://localhost/health` 里 `worker` 不是 `stale`
 6. 重启后数据还在（见下节）
+7. 「用户管理 → 批量导入」下载模板、导入一个两行的 xlsx、能下载回执
+   （若这一步 404，说明 web 容器还是旧前端产物，重新 `docker compose up -d --build web`）
 
 > **第 3 步不能省**：入库表由 `langchain-postgres` 自己建，`init_db()` 不管它，
 > 所以新库、老库都要手工跑一次。**第一个文档入库之后**执行：
@@ -334,6 +336,9 @@ docker compose up -d --scale worker=2
 | 上传卡住 | `client_max_body_size`、磁盘空间；`docker compose logs api` |
 | 文档一多，问答明显变慢 | 大概率是缺 HNSW 索引，检索在走全表扫描：见下方检查命令，缺了就跑 `migrate_vector_index` |
 | 多人同时提问后**整站**变卡（`/health` 也慢） | 线程池被流式请求占满，见「并发能力」一节；调大 `backend/.env` 的 `THREAD_POOL_SIZE` |
+| 批量导入提示「表头里找不到用户名列」 | 首行必须是表头且含「用户名/账号/登录名/username」之一；如果文件前面有标题行或空行，先删掉 |
+| 批量导入提示「Excel 文件无法解析」 | 文件其实是 `.xls` 或损坏。用 Excel 打开后「另存为 → Excel 工作簿(.xlsx)」 |
+| 批量导入很慢 | 每行一次 bcrypt（约 55ms，已并发）。500 行约 30 秒属正常；再大请拆分 |
 
 ### 常用检查命令
 
@@ -480,6 +485,8 @@ docker compose exec api python -c \
 - [ ] 公网验证一次：`curl -o /dev/null -w "%{http_code}\n" http://<IP>/openapi.json`
       应返回 **404**
 - [ ] 定期检查备份是否正常产出（`ls -lh data/backups`）
+- [ ] 批量导入后的回执（含明文初始密码）不要放在共享目录，分发完即删；
+      系统不会保留，也不会写进审计日志
 
 ## 已知限制
 
@@ -492,3 +499,9 @@ docker compose exec api python -c \
 - **HNSW 索引不在 `init_db()` 里**：入库表由 `langchain-postgres` 自建，应用不管它的结构，
   索引要手工跑 `scripts/migrate_vector_index`（新库上线验收清单第 3 条）。
 - **备份不含 Docker 镜像**，回滚依赖重新 `build`。
+- **批量导入的密码只在响应里出现一次**：库里只存 bcrypt 哈希，回执（xlsx）随导入响应
+  返回 base64，**不再落盘、不再提供二次下载**。管理员关掉对话框前必须下载，
+  否则只能走「重置密码」逐个处理。回执本身是明文密码文件，请勿留在共享目录。
+- **批量导入是同步请求**：每行一次 bcrypt（约 200ms，4 线程并发后约 55ms/行），
+  500 行约 30 秒。跑满时需要占用一个线程池槽位（`THREAD_POOL_SIZE` 默认 200，
+  影响可忽略）。超过 500 行请拆分。

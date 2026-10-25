@@ -134,6 +134,7 @@ const ACTION_TEXT: Record<string, string> = {
   user_create: '创建用户',
   user_update: '更新用户',
   user_delete: '删除用户',
+  user_import: '批量导入用户',
   password_change: '修改密码',
   kb_create: '创建知识库',
   kb_update: '更新知识库',

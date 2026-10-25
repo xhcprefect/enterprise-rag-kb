@@ -1,7 +1,9 @@
 import logging
 import uuid
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DBSession
 
@@ -10,7 +12,16 @@ from app.core.security import hash_password, verify_password
 from app.db.session import get_db
 from app.models import User
 from app.schemas.common import ApiResponse, PageResult
-from app.schemas.user import ChangePassword, UserCreate, UserRead, UserUpdate
+from app.schemas.user import (
+    ChangePassword,
+    ImportFailureItem,
+    ImportedUser,
+    ImportResult,
+    UserCreate,
+    UserRead,
+    UserUpdate,
+)
+from app.services import user_import
 
 router = APIRouter(prefix="/users", tags=["用户管理"])
 logger = logging.getLogger(__name__)
@@ -71,6 +82,84 @@ def create_user(
     )
     write_audit(db, request, admin, "user_create", user.username, {"role": user.role})
     return ApiResponse(data=user, message="用户已创建")
+
+
+@router.post(
+    "/import",
+    response_model=ApiResponse[ImportResult],
+    summary="批量导入用户（管理员）",
+)
+def import_users(
+    request: Request,
+    file: UploadFile = File(...),
+    db: DBSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """从 Excel(.xlsx) / CSV 批量建号，每人一个随机初始密码。
+
+    尽力而为：单行不合法不影响其它行，响应里逐行给出结果，并附带一份
+    含明文初始密码的回执（base64 xlsx）供下载——密码不落库，只有这一次机会拿到。
+    """
+    # 边读边数，不信任 file.size：Starlette 的 UploadFile 会先把大文件落到临时文件，
+    # 直接 read() 等于把上传的东西整个拉进内存。这里超限立刻停，和上传接口的做法一致。
+    limit = user_import.MAX_IMPORT_BYTES
+    buffer = bytearray()
+    while chunk := file.file.read(256 * 1024):
+        buffer.extend(chunk)
+        if len(buffer) > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"文件超过 {limit // 1024 // 1024}MB 限制，请精简后重试",
+            )
+    data = bytes(buffer)
+    try:
+        outcome = user_import.import_users(db, data, file.filename or "")
+    except user_import.ImportFormatError as exc:
+        # 文件本身的问题（格式/表头/行数）是一次 400，而不是逐行失败
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    logger.info(
+        "批量导入用户: 文件=%s 共%d行 成功%d 失败%d 操作人=%s",
+        file.filename or "-", outcome.total, len(outcome.created),
+        len(outcome.failed), admin.username,
+    )
+    write_audit(
+        db, request, admin, "user_import", file.filename or "",
+        {
+            "total": outcome.total,
+            "created": len(outcome.created),
+            "failed": len(outcome.failed),
+            "roles": {r: sum(1 for u in outcome.created if u.role == r) for r in ("admin", "user")},
+        },
+    )
+
+    return ApiResponse(
+        data=ImportResult(
+            total=outcome.total,
+            created=[ImportedUser(**vars(u)) for u in outcome.created],
+            failed=[ImportFailureItem(**vars(f)) for f in outcome.failed],
+            receipt_filename=outcome.receipt_filename,
+            receipt_base64=user_import.receipt_b64(outcome),
+        ),
+        message=f"导入完成：成功 {len(outcome.created)} 个，失败 {len(outcome.failed)} 个",
+    )
+
+
+@router.get("/import/template", summary="下载用户导入模板（管理员）")
+def download_import_template(_: User = Depends(require_admin)):
+    """表头 + 角色下拉 + 填写说明。不含示例数据，避免被当成真实账号导入。"""
+    filename, payload = user_import.build_template()
+    # 中文文件名要按 RFC 5987 编码，否则部分浏览器会存成乱码
+    return Response(
+        content=payload,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=user-import-template.xlsx; "
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        },
+    )
 
 
 @router.patch("/{user_id}", response_model=ApiResponse[UserRead], summary="更新用户（管理员）")

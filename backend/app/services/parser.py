@@ -66,19 +66,27 @@ def _iter_docx(path: Path) -> Iterator[tuple[str, float]]:
             yield "\n".join(rows) + "\n\n", done / total
 
 
-def _sniff_encoding(path: Path) -> str:
-    """按采样字节判断编码，返回第一个能解码的候选。"""
-    with path.open("rb") as fh:
-        head = fh.read(SNIFF_BYTES)
+def detect_encoding(head: bytes) -> str:
+    """按采样字节判断编码，返回第一个能解码的候选。
+
+    传进来的是文件开头的一小段（不是整个文件）。采样末尾可能截断多字节字符，
+    所以用增量解码器 ``final=False``，让不完整的尾部序列不参与判定。
+    """
     for encoding in ENCODINGS:
         try:
-            # 采样末尾可能截断多字节字符，去掉末尾不完整序列再判定
             decoder = codecs.getincrementaldecoder(encoding)()
             decoder.decode(head, final=False)
             return encoding
         except UnicodeDecodeError:
             continue
     return "utf-8"
+
+
+def _sniff_encoding(path: Path) -> str:
+    """按采样字节判断编码，返回第一个能解码的候选。"""
+    with path.open("rb") as fh:
+        head = fh.read(SNIFF_BYTES)
+    return detect_encoding(head)
 
 
 def _parse_text(path: Path) -> str:

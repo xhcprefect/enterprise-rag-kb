@@ -84,6 +84,31 @@ export const authApi = {
 }
 
 // ---------- 用户 ----------
+/** 导入成功的一行：password 是明文初始密码，只在这个响应里出现一次。 */
+export interface ImportedUser {
+  row: number
+  username: string
+  display_name: string
+  email: string | null
+  role: 'admin' | 'user'
+  password: string
+}
+
+export interface ImportFailureItem {
+  row: number
+  username: string
+  reason: string
+}
+
+export interface ImportResult {
+  total: number
+  created: ImportedUser[]
+  failed: ImportFailureItem[]
+  receipt_filename: string
+  /** 回执 xlsx 的 base64（明文密码不落库，只有这一次能拿到） */
+  receipt_base64: string
+}
+
 export const userApi = {
   list: (params: { page?: number; page_size?: number; keyword?: string }) =>
     client.get<PageResult<User>>('/users', { params }),
@@ -93,7 +118,43 @@ export const userApi = {
     client.patch<User>(`/users/${id}`, data),
   remove: (id: string) => client.delete(`/users/${id}`),
   changePassword: (old_password: string, new_password: string) =>
-    client.post('/users/change-password', { old_password, new_password })
+    client.post('/users/change-password', { old_password, new_password }),
+  /** 批量导入：逐行尽力而为，回执 xlsx 随响应一起带回。 */
+  importUsers: (file: File, onProgress?: (percent: number) => void) => {
+    const form = new FormData()
+    form.append('file', file)
+    return client.post<ImportResult>('/users/import', form, {
+      // 不手写 Content-Type：要让浏览器自己补 multipart 的 boundary
+      timeout: 0,
+      onUploadProgress: (e) => {
+        if (e.total) onProgress?.(Math.round((e.loaded / e.total) * 100))
+      }
+    })
+  },
+  /** 导入模板（表头 + 角色下拉 + 填写说明）。 */
+  downloadTemplate: () =>
+    client.get<Blob>('/users/import/template', { responseType: 'blob' })
+}
+
+/** 触发浏览器下载一个 Blob（用完即释放 objectURL）。 */
+export function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  // 立刻 revoke 会让部分浏览器（Safari）取消下载，放到下一轮事件循环
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+/** 把 base64 存成本地文件（导入回执用）。 */
+export function saveBase64File(base64: string, filename: string, mime = 'application/octet-stream') {
+  const bytes = atob(base64)
+  const buffer = new Uint8Array(bytes.length)
+  for (let i = 0; i < bytes.length; i += 1) buffer[i] = bytes.charCodeAt(i)
+  saveBlob(new Blob([buffer], { type: mime }), filename)
 }
 
 // ---------- 知识库 ----------
