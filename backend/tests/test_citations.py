@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from tests.fake_turns import mock_turns
+
 from fastapi import Request
 from langchain_core.documents import Document as LCDocument
 
@@ -96,6 +98,7 @@ class CitationApiTests(unittest.TestCase):
         async def consume(response):
             return [frame async for frame in response.body_iterator]
         with ExitStack() as stack:
+            mock_turns(stack, conv.id, writer)
             stack.enter_context(patch.object(chat, "_get_conversation", return_value=conv))
             stack.enter_context(patch.object(chat, "_get_kb", return_value=self.kb))
             retrieval = stack.enter_context(patch.object(rag, "retrieve", return_value=documents()))

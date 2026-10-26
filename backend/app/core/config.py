@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: Literal["development", "production"] = "development"
     CHAT_MAX_PER_USER: int = Field(default=2, ge=1)
     CHAT_MAX_CONCURRENT: int = Field(default=50, ge=1)
+    CHAT_LEASE_SECONDS: int = Field(default=300, ge=30, le=3600)
     # 控制接口文档（/docs、/redoc、/openapi.json）是否注册。
     # 默认关闭：/openapi.json 会把全部接口、参数与响应结构公开，等于给扫描器一份说明书。
     DEBUG: bool = False
@@ -56,12 +57,16 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://www.sheapi.top/v1"
     LLM_API_KEY: str = ""
     LLM_TIMEOUT: int = 180              # 长回答 + 思考模型可能较慢，留足余量
+    LLM_STREAM_INCLUDE_USAGE: bool = False  # 仅在服务支持 stream_options 时打开
 
     # 模型名（当前生效的那个；切换服务商时同步改这里）
     EMBEDDING_MODEL: str = "bge-m3:latest"
     LLM_MODEL: str = "qwen3.5:0.8b"
     LLM_TEMPERATURE: float = 0.2
     LLM_MAX_OUTPUT_TOKENS: int = Field(default=2048, ge=1, le=32768)
+    # 按所接模型的真实窗口配置；输入预算会预留最大输出和安全余量。
+    LLM_CONTEXT_WINDOW_TOKENS: int = Field(default=32768, ge=1024, le=2097152)
+    CONTEXT_TOKEN_SAFETY_MARGIN: int = Field(default=512, ge=0)
 
     # RAG
     CHUNK_SIZE: int = 800
@@ -71,10 +76,24 @@ class Settings(BaseSettings):
     RETRIEVAL_MIN_SIMILARITY: float = Field(default=0.0, ge=0.0, le=1.0)
     # 单份文档最多占几条检索结果：长文档的分块彼此相似，不封顶会挤掉其他资料来源
     RETRIEVAL_MAX_PER_DOC: int = 3
-    # 多轮记忆：最多带多少轮历史（user + assistant 各算一条，所以实际条数是 2 倍）
-    HISTORY_MAX_TURNS: int = 10
-    # 历史总字符预算。超出时从最新往回保留，丢掉最早的，防止上下文过长拖慢或撑爆请求
-    HISTORY_MAX_CHARS: int = 8000
+    HYBRID_RETRIEVAL_ENABLED: bool = True
+    KEYWORD_CANDIDATES: int = Field(default=60, ge=1, le=200)
+    RETRIEVAL_NEIGHBOR_CHUNKS: int = Field(default=1, ge=0, le=2)
+    RERANK_ENABLED: bool = False
+    RERANK_BASE_URL: str = ""
+    RERANK_API_KEY: str = ""
+    RERANK_MODEL: str = ""
+    RERANK_TIMEOUT: float = Field(default=3.0, gt=0, le=30)
+    RERANK_MAX_CHARS: int = Field(default=2000, ge=128, le=8000)
+    # 仅对依赖历史的追问补全检索问题；独立问题和普通对话不额外调用模型。
+    RETRIEVAL_REWRITE_ENABLED: bool = True
+    RETRIEVAL_REWRITE_TIMEOUT: float = Field(default=5.0, gt=0, le=60)
+    RETRIEVAL_REWRITE_MAX_TOKENS: int = Field(default=256, ge=32, le=2048)
+    RETRIEVAL_REWRITE_HISTORY_TURNS: int = Field(default=3, ge=1, le=10)
+    RETRIEVAL_REWRITE_HISTORY_CHARS: int = Field(default=3000, ge=128, le=12000)
+    # 多轮记忆：只保留完整的 user + assistant 轮次。
+    HISTORY_MAX_TURNS: int = Field(default=10, ge=0, le=100)
+    HISTORY_MAX_CHARS: int = Field(default=8000, ge=0)
     MAX_UPLOAD_MB: int = 50
     UPLOAD_DIR: str = "storage/uploads"
 
@@ -99,6 +118,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime(self):
+        if self.LLM_CONTEXT_WINDOW_TOKENS - self.LLM_MAX_OUTPUT_TOKENS - self.CONTEXT_TOKEN_SAFETY_MARGIN < 512:
+            raise ValueError("模型上下文窗口必须为输入保留至少 512 token，请调大窗口或调小最大输出和安全余量")
         if self.CHUNK_SIZE <= 0 or not 0 <= self.CHUNK_OVERLAP < self.CHUNK_SIZE:
             raise ValueError("CHUNK_OVERLAP 必须大于等于 0 且小于 CHUNK_SIZE")
         if self.MAX_UPLOAD_MB <= 0 or not 1 <= self.UPLOAD_CHUNK_SIZE <= 16 * 1024 * 1024:

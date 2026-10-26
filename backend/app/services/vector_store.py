@@ -1,11 +1,12 @@
 """pgvector 向量存储封装（LangChain PGVector）。"""
 import logging
+import uuid
 from functools import lru_cache
 
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
 from langchain_postgres import PGVector
-from sqlalchemy import String, cast, delete, func, select
+from sqlalchemy import String, and_, cast, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 from langchain_core.documents import Document as LCDocument
@@ -126,6 +127,84 @@ def persist_vectors(
             "cmetadata": statement.excluded.cmetadata,
         },
     ))
+
+
+def load_ready_citations(collection_name: str, citations: list[dict]) -> list[tuple[LCDocument, float]]:
+    """按历史来源身份读取当前仍有效的原文，不把旧 snippet 当作新证据。
+
+    受当前知识库、ready 状态、取消标志、索引代次共同约束。缺少代次的旧引用
+    仅接受仍在第 0 代、且片段前缀完全匹配的原文；重建后不能靠相同编号复活。
+    """
+    from app.db.session import SessionLocal
+
+    requests = []
+    for citation in citations[:20]:
+        try:
+            document_id = str(uuid.UUID(str(citation.get("document_id"))))
+            chunk_index = citation.get("chunk_index")
+            version = citation.get("index_version")
+            if not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0:
+                continue
+            if version is not None and (not isinstance(version, int) or isinstance(version, bool) or version < 0):
+                continue
+            start = citation.get("chunk_start") if citation.get("chunk_start") is not None else chunk_index
+            end = citation.get("chunk_end") if citation.get("chunk_end") is not None else chunk_index
+            if any(not isinstance(value, int) or isinstance(value, bool) for value in (start, end)) or not 0 <= start <= chunk_index <= end or end - start > 4:
+                continue
+            requests.append((document_id, chunk_index, version or 0, citation, start, end))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    if not requests:
+        return []
+    store = get_vector_store(collection_name)
+    rows = store.EmbeddingStore
+    with SessionLocal() as db:
+        collection = store.get_collection(db)
+        if collection is None:
+            return []
+        statement = (
+            select(rows.document, rows.cmetadata)
+            .join(Document, cast(Document.id, String) == rows.cmetadata["document_id"].astext)
+            .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
+            .where(
+                rows.collection_id == collection.uuid,
+                KnowledgeBase.collection_name == collection_name,
+                Document.status == DocumentStatus.READY.value,
+                Document.cancel_requested.is_(False),
+                func.coalesce(rows.cmetadata["index_version"].astext, "0") == cast(Document.index_version, String),
+                or_(*(and_(rows.cmetadata["document_id"].astext == document_id,
+                           rows.cmetadata["chunk_index"].astext.in_([str(index) for index in range(start, end + 1)]),
+                           Document.index_version == version)
+                      for document_id, chunk_index, version, _, start, end in requests)),
+            )
+        )
+        fetched = db.execute(statement).all()
+    found = {}
+    for text, metadata in fetched:
+        meta = metadata or {}
+        key = (meta.get("document_id"), meta.get("chunk_index"), meta.get("index_version") or 0)
+        found[key] = (text, meta)
+    result = []
+    from app.services.source_documents import merge_locations, public_location
+
+    for document_id, chunk_index, version, citation, start, end in requests:
+        chunks = [found.get((document_id, index, version)) for index in range(start, end + 1)]
+        current = found.get((document_id, chunk_index, version))
+        if current is None or any(chunk is None or not isinstance(chunk[0], str) or not chunk[0].strip() for chunk in chunks):
+            continue
+        anchor_text, meta = current
+        text = "\n\n".join(chunk[0] for chunk in chunks)
+        snippet = citation.get("snippet")
+        if citation.get("index_version") is None and (not isinstance(snippet, str) or not snippet or not text.startswith(snippet)):
+            continue
+        result.append((LCDocument(page_content=text, metadata={
+            **meta, **merge_locations([chunk[1] for chunk in chunks]), "index_version": version, "citation_score": None,
+            "chunk_start": start, "chunk_end": end,
+            "_anchor_content": anchor_text, "_anchor_location": public_location(meta),
+            "historical_source_index": citation.get("source_index"),
+            "historical_message_id": citation.get("source_message_id"),
+        }), 0.0))
+    return result
 
 
 def search_ready_vectors(store: PGVector, vector: list[float], k: int) -> list[tuple[LCDocument, float]]:

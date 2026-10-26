@@ -45,6 +45,25 @@ class DocumentRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class SourceChunkRead(BaseModel):
+    chunk_index: int
+    content: str
+    location: dict
+
+
+class SourceRead(BaseModel):
+    document_id: uuid.UUID
+    filename: str
+    file_ext: str
+    index_version: int
+    chunk_index: int
+    chunk_start: int
+    chunk_end: int
+    location: dict
+    chunks: list[SourceChunkRead]
+    truncated: bool
+
+
 # ---------------- 分片上传 ----------------
 
 class UploadSessionCreate(BaseModel):

@@ -17,7 +17,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import Document, DocumentChunk, DocumentStatus, KnowledgeBase
-from app.services.parser import iter_document_blocks
+from app.services.structured_documents import iter_structured_chunks
+from app.services.hybrid_search import build_search_text
 from app.services.vector_store import delete_document_vectors, get_vector_store, persist_vectors
 
 logger = logging.getLogger(__name__)
@@ -138,12 +139,6 @@ def _persist_chunks(db: Session, job: IngestJob) -> int:
     next_index = 0
     progress = 0.0
 
-    def blocks():
-        nonlocal progress
-        for text, fraction in iter_document_blocks(Path(job.stored_path)):
-            progress = fraction
-            yield text, fraction
-
     def flush():
         if not pending:
             return
@@ -154,10 +149,11 @@ def _persist_chunks(db: Session, job: IngestJob) -> int:
         db.commit()
         pending.clear()
 
-    for content in iter_chunks(blocks()):
-        if not content.strip():
-            continue
-        pending.append(DocumentChunk(document_id=job.document_id, chunk_index=next_index, content=content))
+    for chunk in iter_structured_chunks(Path(job.stored_path), settings.CHUNK_SIZE, settings.CHUNK_OVERLAP):
+        content, progress = chunk.content, chunk.progress
+        pending.append(DocumentChunk(document_id=job.document_id, chunk_index=next_index, content=content,
+                                     source_metadata=chunk.metadata,
+                                     search_text=build_search_text(content, {**chunk.metadata, "filename": job.filename})))
         next_index += 1
         if len(pending) >= max(1, settings.CHUNK_PERSIST_BATCH):
             flush()
@@ -177,13 +173,18 @@ def _embed_pending(db: Session, job: IngestJob, store, total: int, done: int) ->
         contents = [row.content for row in rows]
         row_ids = [row.id for row in rows]
         indexes = [row.chunk_index for row in rows]
+        locations = [dict(row.source_metadata or {}) for row in rows]
+        for row in rows:
+            if not row.search_text:
+                row.search_text = build_search_text(row.content, {**(row.source_metadata or {}), "filename": job.filename})
         db.commit()  # 网络期间不持有文档行锁，也不占用数据库连接。
 
         vectors = store.embeddings.embed_documents(contents)
         payload = [LCDocument(page_content=content, metadata={
+            **location,
             "document_id": str(job.document_id), "kb_id": str(job.kb_id),
             "filename": job.filename, "chunk_index": index, "index_version": job.version,
-        }) for index, content in zip(indexes, contents)]
+        }) for index, content, location in zip(indexes, contents, locations)]
         identifiers = [f"{job.document_id}:{index}" if job.version == 0 else
                        f"{job.document_id}:{job.version}:{index}" for index in indexes]
 

@@ -5,7 +5,9 @@ import os
 import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -50,11 +52,11 @@ def _bind_test_engine() -> None:
 
 _bind_test_engine()
 SessionLocal, engine = db_session.SessionLocal, db_session.engine
-from app.models import Conversation, Document, DocumentChunk, KnowledgeBase, UploadSession, User
+from app.models import ChatTurn, Conversation, Document, DocumentChunk, KnowledgeBase, Message, UploadSession, User
 from app.schemas.auth import LoginRequest
 from app.schemas.chat import ChatRequest
 from app.schemas.user import ChangePassword, UserUpdate
-from app.services import ingest, rag, upload, vector_store
+from app.services import chat_turns, ingest, rag, upload, vector_store
 
 
 class FakeEmbeddings(Embeddings):
@@ -101,6 +103,8 @@ class DatabaseTests(unittest.TestCase):
             patch.object(settings, "INGEST_BATCH_SIZE", 1),
             patch.object(settings, "UPLOAD_CHUNK_SIZE", 4),
             patch.object(vector_store, "get_embeddings", return_value=self.embeddings),
+            # discover 不带 -t 时，向量模块可能早于测试库重绑导入；显式隔离其引擎。
+            patch.object(vector_store, "_vector_engine", return_value=engine),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -170,6 +174,76 @@ class DatabaseTests(unittest.TestCase):
             db.execute(update(Document).where(Document.id == did).values(status="ready"))
             db.commit()
         self.assertNotIn(str(did), self.retrieve_ids())
+
+    def test_historical_citation_reads_ready_original_and_checks_legacy_prefix(self):
+        did = self.add_doc()
+        ingest.ingest_document_task(str(did))
+        citation = {**rag.to_citations(rag.retrieve(self.kb.collection_name, "q", 1))[0], "source_index": 3}
+        loaded = vector_store.load_ready_citations(self.kb.collection_name, [citation])
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0][0].page_content, "content 0")
+        self.assertEqual(loaded[0][0].metadata["historical_source_index"], 3)
+        self.assertIsNone(rag.to_citations(loaded)[0]["score"])
+        legacy = {key: value for key, value in citation.items() if key != "index_version"}
+        self.assertEqual(len(vector_store.load_ready_citations(self.kb.collection_name, [legacy])), 1)
+        self.assertEqual(vector_store.load_ready_citations(self.kb.collection_name, [{**legacy, "snippet": "different"}]), [])
+        with SessionLocal() as db:
+            rows = self.store.EmbeddingStore
+            db.execute(update(rows).values(cmetadata=rows.cmetadata.op("-")("index_version")))
+            db.commit()
+        self.assertEqual(len(vector_store.load_ready_citations(self.kb.collection_name, [legacy])), 1)
+
+    def test_historical_citation_excludes_failed_cancelled_and_deleted_documents(self):
+        did = self.add_doc()
+        ingest.ingest_document_task(str(did))
+        citation = rag.to_citations(rag.retrieve(self.kb.collection_name, "q", 1))[0]
+        for status, cancelled in [("failed", False), ("processing", False), ("cancelled", True), ("ready", True)]:
+            with self.subTest(status=status, cancelled=cancelled):
+                with SessionLocal() as db:
+                    db.execute(update(Document).where(Document.id == did).values(status=status, cancel_requested=cancelled))
+                    db.commit()
+                self.assertEqual(vector_store.load_ready_citations(self.kb.collection_name, [citation]), [])
+        with SessionLocal() as db:
+            # 故意留下向量孤儿，验证读取必须关联仍存在的业务文档。
+            db.execute(delete(Document).where(Document.id == did))
+            db.commit()
+        self.assertEqual(vector_store.load_ready_citations(self.kb.collection_name, [citation]), [])
+
+    def test_historical_citation_cannot_resolve_to_a_new_index_generation(self):
+        did = self.add_doc()
+        ingest.ingest_document_task(str(did))
+        citation = rag.to_citations(rag.retrieve(self.kb.collection_name, "q", 1))[0]
+        with SessionLocal() as db:
+            doc = db.get(Document, did)
+            ingest.reset_document_for_reindex(db, doc)
+            # 模拟新一代解析完成，避免依赖 add_doc 的占位文件路径。
+            db.add(DocumentChunk(document_id=did, chunk_index=0, content="new content 0"))
+            doc.parse_done, doc.chunk_count = True, 1
+            db.commit()
+        ingest.ingest_document_task(str(did))
+        self.assertEqual(vector_store.load_ready_citations(self.kb.collection_name, [citation]), [])
+        current = rag.to_citations(rag.retrieve(self.kb.collection_name, "q", 1))[0]
+        self.assertEqual(current["index_version"], 1)
+        self.assertEqual(len(vector_store.load_ready_citations(self.kb.collection_name, [current])), 1)
+
+    def test_historical_citation_is_scoped_to_both_collection_and_document_knowledge_base(self):
+        from langchain_core.documents import Document as LCDocument
+        did = self.add_doc()
+        ingest.ingest_document_task(str(did))
+        citation = rag.to_citations(rag.retrieve(self.kb.collection_name, "q", 1))[0]
+        with SessionLocal() as db:
+            other = KnowledgeBase(name="other", collection_name="other_" + uuid.uuid4().hex, owner_id=self.admin.id)
+            db.add(other)
+            db.commit()
+        self.assertEqual(vector_store.load_ready_citations(other.collection_name, [citation]), [])
+        other_store = vector_store.get_vector_store(other.collection_name)
+        with SessionLocal() as db:
+            # 即便向量被错误写入另一集合，也必须校验业务文档所属知识库。
+            vector_store.persist_vectors(db, other_store, [LCDocument(page_content="misplaced", metadata={
+                "document_id": str(did), "chunk_index": 0, "index_version": 0,
+            })], [[1.0] + [0.0] * 1023], ["misplaced-" + str(did)])
+            db.commit()
+        self.assertEqual(vector_store.load_ready_citations(other.collection_name, [citation]), [])
 
     def test_cancel_last_batch_prevents_publication(self):
         did = self.add_doc()
@@ -271,7 +345,8 @@ class DatabaseTests(unittest.TestCase):
             db.add(conv)
             db.flush()
             for index in range(6):
-                db.add(Message(conversation_id=conv.id, role="user" if index % 2 == 0 else "assistant", content=str(index)))
+                db.add(Message(conversation_id=conv.id, role="user" if index % 2 == 0 else "assistant",
+                               content=str(index), created_at=fixed + timedelta(seconds=index)))
             db.commit()
             async def consume(response):
                 return "".join([frame async for frame in response.body_iterator])
@@ -400,12 +475,280 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(client.get(f"/api/v1/knowledge-bases/{self.kb.id}/documents", headers=headers).status_code, 404)
             self.assertEqual(client.get("/api/v1/users", headers=headers).status_code, 403)
 
-    def test_schema_migration_is_idempotent(self):
+    def _claim_chat(self, db, *, conversation_id=None, request_id=None, question="question"):
+        return chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=conversation_id,
+                                     kb_id=None, mode="chat", question=question, top_k=6,
+                                     request_id=request_id or uuid.uuid4())
+
+    def test_parallel_duplicate_request_creates_one_conversation_and_one_question(self):
+        key, barrier = uuid.uuid4(), Barrier(2)
+        def submit(_):
+            with SessionLocal() as db:
+                barrier.wait(timeout=10)
+                try:
+                    return self._claim_chat(db, request_id=key)
+                except HTTPException as exc:
+                    return exc.status_code
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(submit, range(2)))
+        self.assertEqual(sum(isinstance(result, chat_turns.Reservation) for result in results), 1)
+        self.assertIn(409, results)
+        with SessionLocal() as db:
+            self.assertEqual(db.scalar(select(func.count()).select_from(Conversation)), 1)
+            self.assertEqual(db.scalar(select(func.count()).select_from(ChatTurn)), 1)
+            self.assertEqual(db.scalar(select(func.count()).select_from(Message)), 1)
+
+    def test_same_conversation_is_serialized_across_database_connections(self):
+        with SessionLocal() as db:
+            conv = Conversation(user_id=self.admin.id, mode="chat")
+            db.add(conv)
+            db.commit()
+        barrier = Barrier(2)
+        def submit(_):
+            with SessionLocal() as db:
+                barrier.wait(timeout=10)
+                try:
+                    return self._claim_chat(db, conversation_id=conv.id)
+                except HTTPException as exc:
+                    return exc.status_code
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(submit, range(2)))
+        active = next(result for result in results if isinstance(result, chat_turns.Reservation))
+        self.assertIn(409, results)
+        with SessionLocal() as db:
+            self.assertTrue(chat_turns.cancel_request(db, active.request_id, self.admin.id))
+            replacement = self._claim_chat(db, conversation_id=conv.id)
+        with SessionLocal() as db, self.assertRaises(chat_turns.ChatLeaseLost):
+            chat_turns.complete_turn(db, active, "stale answer", [], 1, {})
+        with SessionLocal() as db:
+            chat_turns.complete_turn(db, replacement, "new answer", [], 1, {})
+            answers = db.scalars(select(Message).where(Message.role == "assistant")).all()
+            self.assertEqual(len(answers), 1)
+            self.assertEqual(answers[0].reply_to_id, replacement.user_message_id)
+
+    def test_completed_request_replay_does_not_create_a_second_turn(self):
+        key = uuid.uuid4()
+        with SessionLocal() as db:
+            first = self._claim_chat(db, request_id=key)
+            chat_turns.complete_turn(db, first, "saved answer", [], 12, {"status": "original"})
+        with SessionLocal() as db:
+            replay = self._claim_chat(db, request_id=key)
+            self.assertEqual(replay.replay_answer, "saved answer")
+            self.assertEqual(replay.conversation_id, first.conversation_id)
+            self.assertEqual(db.scalar(select(func.count()).select_from(ChatTurn)), 1)
+            self.assertEqual(db.scalar(select(func.count()).select_from(Message)), 2)
+        with SessionLocal() as db, self.assertRaises(HTTPException) as error:
+            self._claim_chat(db, request_id=key, question="changed question")
+        self.assertEqual(error.exception.status_code, 409)
+
+    def test_api_replay_invokes_model_once_and_deleted_conversation_cannot_reappear(self):
+        from fastapi.testclient import TestClient
+        with patch("app.core.logging.setup_logging"):
+            from app import main
+        client = TestClient(main.app)
+        headers = {"Authorization": "Bearer " + create_access_token(str(self.admin.id), "admin")}
+        key = uuid.uuid4()
+        payload = {"request_id": str(key), "question": "hello once", "mode": "chat"}
+        with patch.object(rag, "answer_stream", side_effect=lambda *args, **kwargs: iter(["saved", " answer"])) as model:
+            original = client.post("/api/v1/chat/stream", headers=headers, json=payload)
+            replay = client.post("/api/v1/chat/stream", headers=headers, json=payload)
+            self.assertEqual(original.status_code, 200, original.text)
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertEqual(model.call_count, 1)
+            def events(response):
+                return {frame.splitlines()[0][7:]: json.loads(frame.split("data: ", 1)[1])
+                        for frame in response.text.strip().split("\n\n")}
+            first_events, replay_events = events(original), events(replay)
+            conv_id = first_events["meta"]["conversation_id"]
+            self.assertEqual(replay_events["meta"]["conversation_id"], conv_id)
+            self.assertTrue(replay_events["done"]["replayed"])
+            self.assertEqual(first_events["done"]["message_id"], replay_events["done"]["message_id"])
+            with SessionLocal() as db:
+                self.assertEqual(db.scalar(select(func.count()).select_from(Message)), 2)
+            self.assertEqual(client.delete(f"/api/v1/chat/conversations/{conv_id}", headers=headers).status_code, 200)
+            with patch.object(main.logger, "warning"), patch("app.core.request_log.logger.warning"):
+                deleted = client.post("/api/v1/chat/stream", headers=headers, json=payload)
+            self.assertEqual(deleted.status_code, 410, deleted.text)
+            self.assertEqual(model.call_count, 1)
+        with SessionLocal() as db:
+            self.assertEqual(db.scalar(select(func.count()).select_from(Conversation)), 0)
+            tombstone = db.scalar(select(ChatTurn).where(ChatTurn.request_id == key))
+            self.assertIsNotNone(tombstone)
+            self.assertIsNone(tombstone.conversation_id)
+            self.assertIsNone(tombstone.trace)
+
+    def test_deleted_active_conversation_fences_worker_and_retains_deduplication(self):
+        with SessionLocal() as db:
+            active = self._claim_chat(db)
+            chat.delete_conversation(active.conversation_id, db, self.admin)
+        with SessionLocal() as db:
+            self.assertEqual(db.get(ChatTurn, active.turn_id).status, "cancelled")
+        with SessionLocal() as db, self.assertRaises(chat_turns.ChatLeaseLost):
+            chat_turns.complete_turn(db, active, "late answer", [], 1, {})
+        with SessionLocal() as db, self.assertRaises(HTTPException) as error:
+            self._claim_chat(db, request_id=active.request_id)
+        self.assertEqual(error.exception.status_code, 410)
+
+    def test_knowledge_base_deletion_clears_request_diagnostics_and_fences_active_answers(self):
+        with SessionLocal() as db:
+            kwargs = dict(user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
+                          mode="rag", question="private question", top_k=6)
+            finished = chat_turns.claim_turn(db, request_id=uuid.uuid4(), **kwargs)
+            chat_turns.complete_turn(db, finished, "private answer", [], 1, {"retrieval_query": "private query"})
+            active = chat_turns.claim_turn(db, request_id=uuid.uuid4(), **kwargs)
+            knowledge.delete_kb(self.kb.id, self.request, db, self.admin)
+        with SessionLocal() as db:
+            for turn_id in [finished.turn_id, active.turn_id]:
+                turn = db.get(ChatTurn, turn_id)
+                self.assertIsNone(turn.conversation_id)
+                self.assertIsNone(turn.trace)
+            self.assertEqual(db.get(ChatTurn, active.turn_id).status, "cancelled")
+            self.assertEqual(db.scalar(select(func.count()).select_from(Message)), 0)
+            with self.assertRaises(chat_turns.ChatLeaseLost):
+                chat_turns.complete_turn(db, active, "late private answer", [], 1, {})
+
+    def test_model_failure_releases_lease_and_is_excluded_from_next_history(self):
+        import asyncio
+        async def consume(response):
+            return "".join([frame async for frame in response.body_iterator])
+        def broken(*_args, **_kwargs):
+            yield "partial answer"
+            raise RuntimeError("simulated provider failure")
+        with SessionLocal() as db:
+            with patch.object(rag, "answer_stream", side_effect=broken), patch.object(chat.logger, "exception"):
+                output = asyncio.run(consume(chat.chat_stream(ChatRequest(mode="chat", question="failed question"),
+                                                              self.request, db, self.admin)))
+            self.assertIn("event: error", output)
+            self.assertNotIn("event: done", output)
+            conv = db.scalar(select(Conversation))
+            self.assertIsNone(conv.active_turn_id)
+            failed = db.scalar(select(Message))
+            self.assertEqual(failed.status, "failed")
+            with patch.object(rag, "answer_stream", return_value=iter(["successful answer"])) as model:
+                result = asyncio.run(consume(chat.chat_stream(ChatRequest(mode="chat", question="next question",
+                                                                          conversation_id=conv.id),
+                                                              self.request, db, self.admin)))
+            self.assertIn("event: done", result)
+            self.assertEqual(model.call_args.args[2], [])
+            self.assertEqual(db.scalar(select(func.count()).select_from(Message).where(Message.role == "assistant")), 1)
+
+    def test_diagnostics_are_admin_only_before_a_turn_is_claimed(self):
+        from fastapi.testclient import TestClient
+        with SessionLocal() as db:
+            viewer = User(username="trace_viewer", role="user", password_hash=hash_password("Original123"))
+            db.add(viewer)
+            db.commit()
+        with patch("app.core.logging.setup_logging"):
+            from app import main
+        client = TestClient(main.app)
+        headers = {"Authorization": "Bearer " + create_access_token(str(viewer.id), "user")}
+        with patch.object(main.logger, "warning"), patch("app.core.request_log.logger.warning"), \
+             patch.object(rag, "answer_stream") as model:
+            result = client.post("/api/v1/chat/stream", headers=headers,
+                                 json={"mode": "chat", "question": "hello", "include_trace": True})
+        self.assertEqual(result.status_code, 403, result.text)
+        model.assert_not_called()
+        with SessionLocal() as db:
+            self.assertEqual(db.scalar(select(func.count()).select_from(ChatTurn)), 0)
+
+    def test_request_identifiers_and_cancellation_are_scoped_to_each_user(self):
+        key = uuid.uuid4()
+        with SessionLocal() as db:
+            other = User(username="second_chat_user", role="user", password_hash=hash_password("Original123"))
+            db.add(other)
+            db.commit()
+            first = self._claim_chat(db, request_id=key)
+            with self.assertRaises(HTTPException) as error:
+                chat_turns.cancel_request(db, key, other.id)
+            self.assertEqual(error.exception.status_code, 404)
+            second = chat_turns.claim_turn(db, user_id=other.id, conversation_id=None, kb_id=None,
+                                          mode="chat", question="other question", top_k=6, request_id=key)
+            self.assertNotEqual(first.conversation_id, second.conversation_id)
+            self.assertTrue(chat_turns.cancel_request(db, key, other.id))
+            chat_turns.complete_turn(db, first, "first answer", [], 1, {})
+            self.assertEqual(db.get(ChatTurn, second.turn_id).status, "cancelled")
+            self.assertEqual(db.get(ChatTurn, first.turn_id).status, "completed")
+
+    def test_expired_worker_is_fenced_and_failed_question_is_not_a_history_turn(self):
+        with SessionLocal() as db:
+            first = self._claim_chat(db)
+            db.execute(update(Conversation).where(Conversation.id == first.conversation_id).values(
+                lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)))
+            db.commit()
+            second = self._claim_chat(db, conversation_id=first.conversation_id)
+        with SessionLocal() as db, self.assertRaises(chat_turns.ChatLeaseLost):
+            chat_turns.complete_turn(db, first, "wrong", [], 1, {})
+        with SessionLocal() as db:
+            chat_turns.complete_turn(db, second, "right", [], 1, {})
+            self.assertEqual(db.get(ChatTurn, first.turn_id).status, "failed")
+            self.assertEqual(db.get(Message, first.user_message_id).status, "failed")
+            answer = db.scalar(select(Message).where(Message.role == "assistant"))
+            self.assertEqual(answer.reply_to_id, second.user_message_id)
+
+    def test_keyword_search_is_scoped_ready_and_handles_exact_codes_and_chinese_articles(self):
+        from app.services.hybrid_search import build_search_text
+        from app.services.retrieval_candidates import keyword_candidates
+        did = self.add_doc()
+        ingest.ingest_document_task(str(did))
+        with SessionLocal() as db:
+            chunk = db.scalar(select(DocumentChunk).where(DocumentChunk.document_id == did))
+            chunk.content = "第一百四十三条 ERR_AUTH_401 登录凭据失效"
+            chunk.search_text = build_search_text(chunk.content, {"filename": "policy.txt"})
+            db.commit()
+        for query in ["ERR_AUTH_401", "第143条"]:
+            with self.subTest(query=query):
+                found = keyword_candidates(self.kb.collection_name, query)
+                self.assertEqual([doc.metadata["document_id"] for doc, _ in found], [str(did)])
+                self.assertIsNone(rag.to_citations(found)[0]["score"])
+        self.assertEqual(keyword_candidates("other_collection", "ERR_AUTH_401"), [])
+        with SessionLocal() as db:
+            db.execute(update(Document).where(Document.id == did).values(cancel_requested=True))
+            db.commit()
+        self.assertEqual(keyword_candidates(self.kb.collection_name, "ERR_AUTH_401"), [])
+
+    def test_source_preview_generation_and_metadata_survive_real_ingest(self):
+        from app.services.source_documents import read_source
+        path = Path(self.temp.name) / "structured.md"
+        path.write_text("# 第一章\\n第一条 请按流程审批。\\n第二条 保留凭据。".replace("\\n", "\n"), encoding="utf-8")
+        with SessionLocal() as db:
+            doc = Document(kb_id=self.kb.id, filename="structured.md", file_ext=".md", stored_path=str(path), file_size=path.stat().st_size)
+            db.add(doc)
+            db.commit()
+        ingest.ingest_document_task(str(doc.id))
+        with SessionLocal() as db:
+            doc = db.get(Document, doc.id)
+            self.assertEqual(doc.status, "ready")
+            preview = read_source(db, self.kb.id, doc.id, 0, 0)
+            self.assertTrue(preview["chunks"][0]["content"])
+            self.assertTrue(preview["location"])
+            ingest.reset_document_for_reindex(db, doc)
+            with self.assertRaises(HTTPException) as error:
+                read_source(db, self.kb.id, doc.id, 0, 0)
+            self.assertEqual(error.exception.status_code, 409)
+
+    def test_schema_migration_is_idempotent_and_preserves_legacy_history(self):
+        with SessionLocal() as db:
+            legacy = Conversation(user_id=self.admin.id, kb_id=self.kb.id, title="legacy history")
+            db.add(legacy)
+            db.flush()
+            db.add_all([Message(conversation_id=legacy.id, role="user", content="old question"),
+                        Message(conversation_id=legacy.id, role="assistant", content="old answer")])
+            db.commit()
+            legacy_id = legacy.id
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE users DROP COLUMN token_version"))
             conn.execute(text("ALTER TABLE documents DROP COLUMN index_version, DROP COLUMN lease_id"))
             conn.execute(text("ALTER TABLE upload_sessions DROP COLUMN content_sha256"))
+            conn.execute(text("ALTER TABLE conversations DROP COLUMN mode, DROP COLUMN active_turn_id, DROP COLUMN lease_expires_at"))
+            conn.execute(text("ALTER TABLE messages DROP COLUMN turn_id, DROP COLUMN reply_to_id, DROP COLUMN status"))
+            conn.execute(text("ALTER TABLE document_chunks DROP COLUMN source_metadata, DROP COLUMN search_text"))
+            conn.execute(text("DROP TABLE chat_turns"))
         init_db(create_admin=False)
         init_db(create_admin=False)
         with SessionLocal() as db:
             self.assertEqual(db.get(User, self.admin.id).token_version, 0)
+            migrated = db.get(Conversation, legacy_id)
+            self.assertEqual(migrated.mode, "rag")
+            self.assertEqual({row.content for row in migrated.messages}, {"old question", "old answer"})
+            self.assertTrue(all(row.status == "completed" and row.turn_id is None for row in migrated.messages))
+            self.assertEqual(db.scalar(select(func.count()).select_from(ChatTurn)), 0)

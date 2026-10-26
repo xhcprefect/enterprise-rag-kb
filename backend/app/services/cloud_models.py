@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -252,6 +253,8 @@ class OpenAICompatibleChat:
         # 思考模式会先吐 reasoning_content，长上下文下能拖到几十秒才出正文。
         # 只对 Qwen3 发送：其他模型（DeepSeek、Qwen2.5 等）不认识这个参数，
         # 部分网关会直接 400，所以按模型名判断而不是无条件带上。
+        if stream and settings.LLM_STREAM_INCLUDE_USAGE:
+            payload["stream_options"] = {"include_usage": True}
         if "qwen3" in self.model.lower():
             payload["enable_thinking"] = False
         return payload
@@ -284,6 +287,13 @@ class OpenAICompatibleChat:
                     raise CloudModelError("模型服务返回了无效的流式数据") from exc
                 if not isinstance(event, dict) or event.get("error"):
                     raise CloudModelError("模型服务在生成过程中返回错误，请稍后重试")
+                usage = event.get("usage")
+                if isinstance(usage, dict):
+                    incoming, outgoing = usage.get("prompt_tokens"), usage.get("completion_tokens")
+                    if (isinstance(incoming, int) and not isinstance(incoming, bool) and incoming >= 0
+                            and isinstance(outgoing, int) and not isinstance(outgoing, bool) and outgoing >= 0):
+                        yield AIMessageChunk(content="", usage_metadata={"input_tokens": incoming, "output_tokens": outgoing,
+                                                                      "total_tokens": incoming + outgoing})
                 choices = event.get("choices") or []
                 if not choices:
                     continue  # usage 等独立统计帧可以没有 choices。
@@ -292,7 +302,7 @@ class OpenAICompatibleChat:
                     terminal = True
                     if choice["finish_reason"] == "content_filter":
                         raise CloudModelError("模型服务拒绝生成该回答")
-                delta = choice.get("delta") or {}
+                delta = choice.get("delta") or choice.get("message") or {}
                 text = delta.get("content")
                 if text:
                     yield AIMessageChunk(content=text)
@@ -313,6 +323,78 @@ def _to_openai_message(message: BaseMessage) -> dict[str, str]:
             part.get("text", "") if isinstance(part, dict) else str(part) for part in content
         )
     return {"role": role, "content": content}
+
+
+async def _complete_short_chat(messages: list[BaseMessage], timeout: float, max_tokens: int) -> str:
+    """单次、可取消的补全请求；总截止时间覆盖连接、响应读取和 JSON 解析。"""
+    if settings.LLM_PROVIDER == "cloud":
+        endpoint = _llm_endpoint()
+        url = endpoint.url("/chat/completions")
+        headers = endpoint.headers()
+        # 主问答本就要求服务支持 SSE；部分网关的非流式接口只返回 usage，
+        # 因此轻量调用也请求 SSE，在总截止时间内收集正文并主动关闭连接。
+        payload = get_cloud_chat()._payload(messages, True)
+        payload.update(temperature=0, max_tokens=max_tokens)
+    else:
+        url = settings.OLLAMA_BASE_URL.rstrip("/") + "/api/chat"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "model": settings.LLM_MODEL,
+            "messages": [_to_openai_message(message) for message in messages],
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0, "num_predict": max_tokens,
+                        "num_ctx": settings.LLM_CONTEXT_WINDOW_TOKENS},
+        }
+    async with asyncio.timeout(timeout):
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(2.0, timeout))) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                if settings.LLM_PROVIDER == "cloud" and "text/event-stream" in response.headers.get("content-type", ""):
+                    # 同一请求/总截止时间内消费到终止帧；兼容网关包裹的 message 帧。
+                    parts, size, terminal = [], 0, False
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        value = line[5:].strip()
+                        if value == "[DONE]":
+                            terminal = True
+                            break
+                        event = json.loads(value)
+                        if not isinstance(event, dict) or event.get("error"):
+                            raise CloudModelError("追问补全服务返回错误")
+                        choices = event.get("choices") or []
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        text = (choice.get("delta") or choice.get("message") or {}).get("content")
+                        if text is not None:
+                            if not isinstance(text, str):
+                                raise CloudModelError("追问补全返回结构异常")
+                            parts.append(text)
+                            size += len(text)
+                            if size > min(32768, max(2000, max_tokens * 16)):
+                                raise CloudModelError("追问补全响应超过长度限制")
+                        if choice.get("finish_reason"):
+                            if choice["finish_reason"] == "content_filter":
+                                raise CloudModelError("追问补全服务拒绝生成")
+                            terminal = True
+                            break
+                    if not terminal:
+                        raise CloudModelError("追问补全流提前中断")
+                    content = "".join(parts)
+                else:
+                    await response.aread()
+                    data = response.json()
+                    content = data["choices"][0]["message"]["content"] if settings.LLM_PROVIDER == "cloud" else data["message"]["content"]
+                if not isinstance(content, str):
+                    raise CloudModelError("追问补全返回结构异常")
+                return content
+
+
+def complete_short_chat(messages: list[BaseMessage], *, timeout: float, max_tokens: int) -> str:
+    """由同步问答工作线程调用；失败不重试，由上层回退原始检索问题。"""
+    return asyncio.run(_complete_short_chat(messages, timeout, max_tokens))
 
 
 def get_cloud_embeddings() -> OpenAICompatibleEmbeddings:

@@ -17,6 +17,18 @@ class RuntimeTests(unittest.TestCase):
         config = Settings(_env_file=None, ENVIRONMENT="production", JWT_SECRET="test-random-value-with-at-least-32-characters")
         self.assertEqual(config.ENVIRONMENT, "production")
 
+    def test_context_window_reserves_output_and_safety_before_input(self):
+        config = Settings(_env_file=None, LLM_CONTEXT_WINDOW_TOKENS=4096,
+                          LLM_MAX_OUTPUT_TOKENS=2048, CONTEXT_TOKEN_SAFETY_MARGIN=512)
+        self.assertEqual(config.LLM_CONTEXT_WINDOW_TOKENS - config.LLM_MAX_OUTPUT_TOKENS - config.CONTEXT_TOKEN_SAFETY_MARGIN, 1536)
+        for overrides in [dict(LLM_CONTEXT_WINDOW_TOKENS=2048), dict(CONTEXT_TOKEN_SAFETY_MARGIN=40000),
+                          dict(LLM_MAX_OUTPUT_TOKENS=32768), dict(HISTORY_MAX_TURNS=-1),
+                          dict(HISTORY_MAX_CHARS=-1), dict(RETRIEVAL_REWRITE_TIMEOUT=0)]:
+            with self.subTest(overrides=overrides), self.assertRaises(ValidationError):
+                Settings(_env_file=None, **overrides)
+        no_history = Settings(_env_file=None, HISTORY_MAX_TURNS=0, HISTORY_MAX_CHARS=0)
+        self.assertEqual(no_history.HISTORY_MAX_TURNS, 0)
+
     def test_admission_rejects_overload_and_releases_after_error(self):
         limiter = ChatAdmission()
         with patch.object(settings, "CHAT_MAX_PER_USER", 1), patch.object(settings, "CHAT_MAX_CONCURRENT", 1):

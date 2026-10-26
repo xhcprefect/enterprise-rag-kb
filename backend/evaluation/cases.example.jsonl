@@ -1,0 +1,6 @@
+{"id":"fact","question":"合成制度中，请假需要提前几天申请？","expected_outcome":"answer","expected_sources":[{"filename":"合成员工制度.md"}],"required_phrases":["提前3天"]}
+{"id":"followup","turns":["合成制度中，请假需要提前几天申请？","那紧急情况呢？"],"expected_outcome":"answer","expected_sources":[{"filename":"合成员工制度.md"}],"required_phrases":["当天报备"]}
+{"id":"topic-switch","turns":["合成制度中，请假需要提前几天申请？","换个话题，合成手册中 ERR_AUTH_401 怎么处理？"],"expected_outcome":"answer","expected_sources":[{"filename":"合成错误手册.md"}],"required_phrases":["重新登录"],"forbidden_phrases":["提前3天"]}
+{"id":"no-answer","question":"这个合成知识库能预测明年股价吗？","expected_outcome":"refuse","expect_no_citations":true}
+{"id":"clarify","question":"那种情况呢？","expected_outcome":"clarify","expect_no_citations":true}
+{"id":"missing-citation","turns":["合成制度中，请假需要提前几天申请？","解释刚才第99条来源"],"expected_outcome":"clarify","expect_no_citations":true}

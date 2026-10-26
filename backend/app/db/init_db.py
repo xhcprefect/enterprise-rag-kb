@@ -28,6 +28,17 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "conversations": {
         # 普通对话模式新增；老会话默认按知识库问答解释，行为与升级前一致
         "mode": "VARCHAR(16) NOT NULL DEFAULT 'rag'",
+        "active_turn_id": "UUID",
+        "lease_expires_at": "TIMESTAMPTZ",
+    },
+    "messages": {
+        "turn_id": "UUID REFERENCES chat_turns(id) ON DELETE CASCADE",
+        "reply_to_id": "UUID REFERENCES messages(id) ON DELETE SET NULL",
+        "status": "VARCHAR(16) NOT NULL DEFAULT 'completed'",
+    },
+    "document_chunks": {
+        "source_metadata": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "search_text": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -76,6 +87,9 @@ def init_db(create_admin: bool = True) -> None:
             for name, ddl in columns.items():
                 if name not in existing:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+        if "messages" in table_names:
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_turn_role ON messages (turn_id, role)"))
 
         # conversations.kb_id 原来非空（会话必须挂知识库）。普通对话没有知识库，
         # 需要放开。已是可空时这条是空操作，可重复执行。

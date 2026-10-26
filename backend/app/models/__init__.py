@@ -4,6 +4,7 @@ from app.models.conversation import (
     CONVERSATION_MODE_RAG,
     CONVERSATION_MODES,
     Conversation,
+    ChatTurn,
     Message,
 )
 from app.models.document import Document, DocumentChunk, DocumentStatus, KnowledgeBase
@@ -16,6 +17,7 @@ __all__ = [
     "CONVERSATION_MODE_RAG",
     "CONVERSATION_MODES",
     "Conversation",
+    "ChatTurn",
     "Message",
     "Document",
     "DocumentChunk",

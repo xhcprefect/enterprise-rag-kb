@@ -1,0 +1,6 @@
+{"id":"fact","answer":"应提前3天申请[1]。","citations":[{"filename":"合成员工制度.md","chunk_index":0}],"trace":{"status":"original","candidate_sources":[{"filename":"合成员工制度.md","chunk_index":0}],"supplied_sources":[{"filename":"合成员工制度.md","chunk_index":0}]},"first_token_ms":20,"total_ms":100}
+{"id":"followup","answer":"紧急情况允许当天报备[1]。","citations":[{"filename":"合成员工制度.md","chunk_index":0}],"trace":{"status":"rewritten","candidate_sources":[{"filename":"合成员工制度.md","chunk_index":0}],"supplied_sources":[{"filename":"合成员工制度.md","chunk_index":0}]},"first_token_ms":30,"total_ms":150}
+{"id":"topic-switch","answer":"ERR_AUTH_401 应重新登录[1]。","citations":[{"filename":"合成错误手册.md","chunk_index":0}],"trace":{"status":"original","candidate_sources":[{"filename":"合成错误手册.md","chunk_index":0}],"supplied_sources":[{"filename":"合成错误手册.md","chunk_index":0}]},"first_token_ms":25,"total_ms":130}
+{"id":"no-answer","answer":"根据现有知识库无法回答股价预测问题。","citations":[],"trace":{"status":"original","candidate_sources":[],"supplied_sources":[]},"total_ms":80}
+{"id":"clarify","answer":"请补充您指的是哪种情况。","citations":[],"trace":{"status":"clarify","candidate_sources":[],"supplied_sources":[]},"total_ms":10}
+{"id":"missing-citation","answer":"上一轮回答没有您指定的引用来源，请确认来源编号。","citations":[],"trace":{"status":"clarify","candidate_sources":[],"supplied_sources":[]},"total_ms":10}

@@ -1,0 +1,2 @@
+{"id":"stale-source","question":"解释上一轮来源1","conversation_id":"00000000-0000-0000-0000-000000000001","expected_outcome":"clarify","expect_no_citations":true,"required_phrases":["不可用"]}
+{"id":"private-kb-denied","actor":"member","question":"请说明这个私有知识库中的请假规则。","expected_http_status":403,"expect_no_citations":true}

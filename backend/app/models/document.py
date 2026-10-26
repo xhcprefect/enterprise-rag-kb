@@ -14,7 +14,7 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -112,6 +112,8 @@ class DocumentChunk(Base, TimestampMixin):
     )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_metadata: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    search_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     embedded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     document: Mapped["Document"] = relationship(back_populates="chunks")

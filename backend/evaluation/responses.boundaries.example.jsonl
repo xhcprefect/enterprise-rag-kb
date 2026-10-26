@@ -1,0 +1,2 @@
+{"id":"stale-source","answer":"您指定的历史来源已不可用、被更新或无法核验，请重新选择文档或确认来源。","citations":[],"trace":{"status":"clarify","candidate_sources":[],"supplied_sources":[]},"total_ms":12}
+{"id":"private-kb-denied","http_status":403,"error":"http_error","total_ms":5}

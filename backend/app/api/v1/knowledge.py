@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session as DBSession
 from starlette.concurrency import run_in_threadpool
@@ -12,12 +13,13 @@ from starlette.concurrency import run_in_threadpool
 from app.api.deps import get_current_user, require_admin, write_audit
 from app.core.config import settings
 from app.db.session import SessionLocal, get_db
-from app.models import Document, DocumentChunk, DocumentStatus, KnowledgeBase, UploadSession, UploadStatus, User
+from app.models import Conversation, Document, DocumentChunk, DocumentStatus, KnowledgeBase, UploadSession, UploadStatus, User
 from app.schemas.common import ApiResponse, PageResult
 from app.schemas.knowledge import (
-    DocumentRead, KnowledgeBaseCreate, KnowledgeBaseRead, KnowledgeBaseUpdate,
+    DocumentRead, KnowledgeBaseCreate, KnowledgeBaseRead, KnowledgeBaseUpdate, SourceRead,
     UploadChunkRead, UploadCompleteRead, UploadSessionCreate, UploadSessionRead,
 )
+from app.services import chat_turns, source_documents
 from app.services import upload as upload_service
 from app.services.ingest import reset_document_for_reindex
 from app.services.parser import SUPPORTED_EXTENSIONS
@@ -119,6 +121,9 @@ def delete_kb(kb_id: uuid.UUID, request: Request, db: DBSession = Depends(get_db
     name, collection = kb.name, kb.collection_name
     docs = db.scalars(select(Document).where(Document.kb_id == kb.id).with_for_update()).all()
     paths = [Path(doc.stored_path) for doc in docs]
+    conversations = db.scalars(select(Conversation.id).where(Conversation.kb_id == kb_id)
+                              .order_by(Conversation.id).with_for_update()).all()
+    chat_turns.clear_conversation_requests(db, conversations)
     store = get_vector_store(collection)
     db.execute(delete(store.EmbeddingStore).where(store.EmbeddingStore.collection_id.in_(
         select(store.CollectionStore.uuid).where(store.CollectionStore.name == collection))))
@@ -147,6 +152,28 @@ def list_documents(kb_id: uuid.UUID, page: int = Query(1, ge=1), page_size: int 
 def get_document(kb_id: uuid.UUID, doc_id: uuid.UUID, db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     _get_kb_for_user(db, kb_id, user)
     return ApiResponse(data=_get_doc(db, kb_id, doc_id))
+
+
+@router.get("/{kb_id}/documents/{doc_id}/source", response_model=ApiResponse[SourceRead], summary="读取当前有效的引用原文")
+def get_source(kb_id: uuid.UUID, doc_id: uuid.UUID, chunk_index: int = Query(ge=0),
+               index_version: int = Query(0, ge=0), chunk_start: int | None = Query(None, ge=0),
+               chunk_end: int | None = Query(None, ge=0), db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
+    _get_kb_for_user(db, kb_id, user)
+    return ApiResponse(data=source_documents.read_source(db, kb_id, doc_id, chunk_index, index_version, chunk_start, chunk_end))
+
+
+@router.get("/{kb_id}/documents/{doc_id}/pdf", summary="带鉴权的当前 PDF 原文件预览")
+def get_source_pdf(kb_id: uuid.UUID, doc_id: uuid.UUID, index_version: int = Query(ge=0),
+                   db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
+    _get_kb_for_user(db, kb_id, user)
+    doc = source_documents.ready_document(db, kb_id, doc_id, index_version)
+    if doc.file_ext.lower() != ".pdf":
+        raise HTTPException(400, "该文档不是 PDF，请使用文本原文预览")
+    path = Path(doc.stored_path).resolve()
+    if not path.is_relative_to(upload_service.upload_root().resolve()) or not path.is_file():
+        raise HTTPException(404, "原文件不存在")
+    return FileResponse(path, media_type="application/pdf", filename=doc.filename, content_disposition_type="inline",
+                        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @router.post("/{kb_id}/documents", response_model=ApiResponse[DocumentRead], summary="上传文档（小文件单请求，后台入库）")
