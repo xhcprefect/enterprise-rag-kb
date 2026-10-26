@@ -21,6 +21,7 @@ from app.core.request_log import RequestLoggingMiddleware
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.models import Document, DocumentStatus
+from app.services import chat_turns
 
 setup_logging("app")
 logger = logging.getLogger(__name__)
@@ -35,6 +36,13 @@ async def lifespan(app: FastAPI):
     anyio.to_thread.current_default_thread_limiter().total_tokens = settings.THREAD_POOL_SIZE
     init_db()
     with SessionLocal() as db:
+        # 上次进程在生成中途退出时，那轮问答没有机会写回状态；租约全局兜底一次。
+        # 放在启动阶段而不是定时任务里：只要会卡住的进程都必然重走过这里。
+        try:
+            chat_turns.reclaim_expired(db)
+        except Exception as exc:
+            db.rollback()
+            logger.warning("回收过期问答失败，将由租约续期逻辑处理: %s", type(exc).__name__)
         queued = db.scalar(
             select(func.count()).select_from(Document).where(
                 Document.status == DocumentStatus.PENDING.value

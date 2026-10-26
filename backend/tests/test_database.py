@@ -675,6 +675,31 @@ class DatabaseTests(unittest.TestCase):
             with self.assertRaises(chat_turns.ChatLeaseLost):
                 chat_turns.complete_turn(db, active, "late private answer", [], 1, {})
 
+    def test_startup_reclaims_turns_whose_lease_expired_unattended(self):
+        """进程在生成中途退出时，没有后续请求触发 _expire_active，只能靠启动回收。"""
+        with SessionLocal() as db:
+            expired = self._claim_chat(db)
+            conversation_id = expired.conversation_id
+            live = self._claim_chat(db)
+        # 会话 A 的租约早已过期，且不会再有人访问它；会话 B 仍在租约内。
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE conversations SET lease_expires_at = :past WHERE id = :id"),
+                         {"past": datetime.now(timezone.utc) - timedelta(hours=1), "id": conversation_id})
+        with SessionLocal() as db:
+            self.assertEqual(chat_turns.reclaim_expired(db), 1)
+        with SessionLocal() as db:
+            turn, message, conv = db.get(ChatTurn, expired.turn_id), db.get(Message, expired.user_message_id), db.get(Conversation, conversation_id)
+            self.assertEqual(turn.status, "failed")
+            self.assertEqual(message.status, "failed")
+            self.assertIsNone(conv.active_turn_id)
+            self.assertIsNone(conv.lease_expires_at)
+            # 未过期的会话必须原样保留，否则会打断正在生成的回答。
+            self.assertEqual(db.get(ChatTurn, live.turn_id).status, "processing")
+            self.assertEqual(db.get(Conversation, live.conversation_id).active_turn_id, live.turn_id)
+        with SessionLocal() as db:
+            # 幂等：再跑一次不应重复处理，也不该把已完成/失败的失败轮次算进去。
+            self.assertEqual(chat_turns.reclaim_expired(db), 0)
+
     def test_model_failure_releases_lease_and_is_excluded_from_next_history(self):
         import asyncio
         async def consume(response):

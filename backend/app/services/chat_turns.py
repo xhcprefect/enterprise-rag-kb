@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import select, text, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -55,6 +55,40 @@ def _expire_active(db: Session, conv: Conversation) -> None:
         db.execute(update(ChatTurn).where(ChatTurn.id == conv.active_turn_id, ChatTurn.status == "processing").values(status="failed"))
         db.execute(update(Message).where(Message.turn_id == conv.active_turn_id, Message.status == "processing").values(status="failed"))
     conv.active_turn_id, conv.lease_expires_at = None, None
+
+
+def reclaim_expired(db: Session) -> int:
+    """回收租约已过期的在途问答；返回处理的会话数。
+
+    正常路径由 ``_expire_active`` 在**同一会话**再次认领时清理。但若进程在生成中途
+    被杀（部署、OOM、竞价实例回收），那轮会永远停在 processing：没有并发续期线程，
+    也就不会有人再碰这个会话，``/chat/conversations`` 会一直显示「回答中」。
+    这里在启动时按租约全局兜底一次，与 ``_expire_active`` 的判定口径保持一致。
+    """
+    now = _now()
+    conv_ids = db.scalars(select(Conversation.id).where(
+        Conversation.active_turn_id.is_not(None),
+        or_(Conversation.lease_expires_at.is_(None), Conversation.lease_expires_at <= now),
+    )).all()
+    if not conv_ids:
+        return 0
+    # 先记下要回收的轮次，后面只动这些行：不能顺带改到该会话里更早失败的历史记录。
+    turn_ids = db.scalars(select(ChatTurn.id).where(
+        ChatTurn.conversation_id.in_(conv_ids), ChatTurn.status == "processing",
+    )).all()
+    messages = db.execute(update(Message).where(
+        Message.turn_id.in_(turn_ids), Message.status == "processing",
+    ).values(status="failed")).rowcount if turn_ids else 0
+    turns = db.execute(update(ChatTurn).where(
+        ChatTurn.id.in_(turn_ids), ChatTurn.status == "processing",
+    ).values(status="failed")).rowcount if turn_ids else 0
+    # 整行批量更新，避免身份映射里留着旧的 active_turn_id。
+    db.execute(update(Conversation).where(Conversation.id.in_(conv_ids))
+               .values(active_turn_id=None, lease_expires_at=None))
+    db.commit()
+    logger.warning("回收了 %d 个租约过期的在途会话（问答 %d 条、消息 %d 条标记为失败）",
+                   len(conv_ids), turns, messages)
+    return len(conv_ids)
 
 
 def claim_turn(db: Session, *, user_id: uuid.UUID, conversation_id: uuid.UUID | None,
