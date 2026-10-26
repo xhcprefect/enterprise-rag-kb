@@ -80,7 +80,10 @@ export default {
       source: {
         title: '引用原文', loading: '正在核验并读取原文…', unavailable: '原文已更新、不可用或无法读取，请重新检索。',
         noPosition: '旧索引未记录页码或章节，可查看下方原文；重新索引后补充位置。',
-        version: '索引版本 {version}', previewPdf: '预览 PDF 并定位页码', truncated: '预览内容过长，已截短显示。',
+        version: '索引版本 {version}', previewPdf: '预览 PDF 原文件', previewPdfAtPage: '预览 PDF 并定位到第 {page} 页',
+        pdfTarget: '定位目标：原文件第 {page} 页（按文件物理页序计算，可能与页内印刷页码不同）。',
+        pdfPageUnknown: '尚未确认该引用的页码，预览将从第一页打开；重新索引后可补充页码定位。',
+        truncated: '预览内容过长，已截短显示。',
         page: '第 {index} 页', pages: '第 {start}–{end} 页', sheet: '工作表：{name}',
         row: '表格第 {index} 行', rows: '表格第 {start}–{end} 行', line: '文本第 {index} 行', lines: '文本第 {start}–{end} 行'
       },
@@ -188,7 +191,10 @@ export default {
       source: {
         title: 'Source text', loading: 'Verifying and loading source…', unavailable: 'The source has changed or is unavailable. Please search again.',
         noPosition: 'This older index has no page or section metadata. Source text is shown below; reindex to add locations.',
-        version: 'Index version {version}', previewPdf: 'Preview PDF at the source page', truncated: 'The preview was shortened because it is too long.',
+        version: 'Index version {version}', previewPdf: 'Preview original PDF', previewPdfAtPage: 'Preview PDF at page {page}',
+        pdfTarget: 'Target: physical page {page} of the original PDF. Printed page labels may differ.',
+        pdfPageUnknown: 'The source page could not be verified. Preview starts at the first page; reindex to add page locations.',
+        truncated: 'The preview was shortened because it is too long.',
         page: 'Page {index}', pages: 'Pages {start}–{end}', sheet: 'Sheet: {name}',
         row: 'Table row {index}', rows: 'Table rows {start}–{end}', line: 'Text line {index}', lines: 'Text lines {start}–{end}'
       },

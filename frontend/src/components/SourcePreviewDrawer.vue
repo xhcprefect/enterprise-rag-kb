@@ -6,9 +6,10 @@
       <h2 class="source-filename">{{ source.filename }}</h2>
       <p class="source-position">{{ position.join(' · ') || t('chat.source.noPosition') }}</p>
       <p class="source-version">{{ t('chat.source.version', { version: source.index_version }) }}</p>
-      <el-button v-if="source.file_ext === '.pdf'" :loading="pdfLoading" @click="loadPdf">{{ t('chat.source.previewPdf') }}</el-button>
+      <el-button v-if="isPdf" :loading="pdfLoading" @click="loadPdf">{{ targetPage ? t('chat.source.previewPdfAtPage', { page: targetPage }) : t('chat.source.previewPdf') }}</el-button>
+      <p v-if="isPdf" class="source-position">{{ targetPage ? t('chat.source.pdfTarget', { page: targetPage }) : t('chat.source.pdfPageUnknown') }}</p>
       <el-alert v-if="pdfError" class="source-pdf-error" :title="pdfError" type="warning" :closable="false" />
-      <iframe v-if="pdfUrl" class="source-pdf" :src="pdfSourceUrl(pdfUrl, source.location.page_start)" :title="source.filename" referrerpolicy="no-referrer"></iframe>
+      <iframe v-if="pdfUrl" class="source-pdf" :src="pdfSourceUrl(pdfUrl, targetPage)" :title="source.filename" referrerpolicy="no-referrer"></iframe>
       <div v-for="chunk in source.chunks" :key="chunk.chunk_index" class="source-chunk">
         <div class="source-chunk-head">{{ t('chat.citations.chunk', { index: chunk.chunk_index + 1 }) }}<span>{{ sourceLocationLabels(chunk.location, t).join(' · ') }}</span></div>
         <pre>{{ chunk.content }}</pre>
@@ -22,7 +23,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { docApi, type Citation, type SourcePreview } from '@/api'
-import { pdfSourceUrl, sourceLocationLabels } from '@/utils/sourceLocation'
+import { pdfSourceUrl, sourceLocationLabels, sourceTargetPage } from '@/utils/sourceLocation'
 
 const props = defineProps<{ modelValue: boolean; kbId: string; citation: Citation | null }>()
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
@@ -35,6 +36,8 @@ const pdfError = ref('')
 const pdfUrl = ref('')
 let generation = 0
 const position = computed(() => source.value ? sourceLocationLabels(source.value.location, t) : [])
+const isPdf = computed(() => source.value?.file_ext.toLowerCase() === '.pdf')
+const targetPage = computed(() => source.value ? sourceTargetPage(source.value) : null)
 
 function clearPdf() {
   if (pdfUrl.value) URL.revokeObjectURL(pdfUrl.value)

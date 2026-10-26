@@ -1,4 +1,4 @@
-import type { SourceLocation } from '../api/index.ts'
+import type { SourceLocation, SourcePreview } from '../api/index.ts'
 
 type Translate = (key: string, values?: Record<string, string | number>) => string
 
@@ -17,6 +17,16 @@ export function sourceLocationLabels(location: SourceLocation, translate: Transl
     labels.push(last === start ? translate(single, { index: start! }) : translate(range, { start: start!, end: last }))
   }
   return labels
+}
+
+type PdfSource = Pick<SourcePreview, 'chunk_index' | 'chunks' | 'location'>
+
+/** 合并相邻片段后仍跳到真正命中的片段，而不是范围内的第一页。 */
+export function sourceTargetPage(source: PdfSource): number | null {
+  const anchor = source.chunks.find(chunk => chunk.chunk_index === source.chunk_index)
+  // 命中片段存在但没有可核验页码时，不能拿相邻片段的位置代替。
+  const page = anchor ? anchor.location.page_start : source.location.page_start
+  return Number.isInteger(page) && page! >= 1 ? page! : null
 }
 
 export function pdfSourceUrl(blobUrl: string, page?: number | null): string {
