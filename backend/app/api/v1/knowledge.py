@@ -167,11 +167,7 @@ def get_source_pdf(kb_id: uuid.UUID, doc_id: uuid.UUID, index_version: int = Que
                    db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     _get_kb_for_user(db, kb_id, user)
     doc = source_documents.ready_document(db, kb_id, doc_id, index_version)
-    if doc.file_ext.lower() != ".pdf":
-        raise HTTPException(400, "该文档不是 PDF，请使用文本原文预览")
-    path = Path(doc.stored_path).resolve()
-    if not path.is_relative_to(upload_service.upload_root().resolve()) or not path.is_file():
-        raise HTTPException(404, "原文件不存在")
+    path = source_documents.pdf_file_path(doc)
     return FileResponse(path, media_type="application/pdf", filename=doc.filename, content_disposition_type="inline",
                         headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 

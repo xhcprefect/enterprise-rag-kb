@@ -250,7 +250,13 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                 yield _sse("done", done)
         except Exception as exc:
             cleanup("failed")
-            logger.exception("问答失败: %s user=%s request=%s", scope, username, reservation.request_id)
+            if isinstance(exc, chat_turns.ChatLeaseLost):
+                # 用户停止或另一请求接管后，模型才返回：这是预期的取消路径，不是故障，
+                # 记 INFO 即可，否则每次点「停止」都会留下一条看似严重的 traceback。
+                logger.info("问答已结束（取消或被新请求替代）: %s user=%s request=%s",
+                            scope, username, reservation.request_id)
+            else:
+                logger.exception("问答失败: %s user=%s request=%s", scope, username, reservation.request_id)
             message = str(exc) if isinstance(exc, (CloudModelError, ContextBudgetError, chat_turns.ChatLeaseLost)) else "问答处理失败，请稍后重试"
             for key in (settings.LLM_API_KEY, settings.EMBEDDING_API_KEY, settings.RERANK_API_KEY):
                 if key:

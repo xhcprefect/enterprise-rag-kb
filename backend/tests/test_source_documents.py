@@ -90,6 +90,83 @@ class SourceDocumentTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 404)
         read.assert_not_called()
 
+    def make_pdf(self, pages):
+        import pymupdf
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        patcher = patch.object(settings, "UPLOAD_DIR", root.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        path = Path(root.name) / "legacy.pdf"
+        with pymupdf.open() as pdf:
+            for text in pages:
+                page = pdf.new_page()
+                if text:
+                    page.insert_text((50, 50), text)
+            pdf.save(path)
+            contents = [page.get_text("text").strip() for page in pdf]
+        self.doc.stored_path, self.doc.index_version = str(path), 0
+        return contents
+
+    def legacy_preview(self, content, chunk_index=38):
+        self.rows = [SimpleNamespace(chunk_index=chunk_index, content=content, source_metadata={})]
+        self.db.scalars.return_value.all.return_value = self.rows
+        return sources.read_source(self.db, self.kb_id, self.doc_id, chunk_index, 0)
+
+    def test_screenshot_legacy_marker_restores_physical_page_21_without_reindexing(self):
+        pages = self.make_pdf([f"Physical page {number}. Unique article {number:03d}. Evidence for this page." for number in range(1, 89)])
+        result = self.legacy_preview("<!-- page 21 -->\n" + pages[20])
+        self.assertEqual(result["location"], {"page_start": 21, "page_end": 21})
+        self.assertEqual(result["chunks"][0]["location"], result["location"])
+        self.assertEqual(result["index_version"], 0)
+        self.assertEqual(self.rows[0].source_metadata, {})
+        self.db.commit.assert_not_called()
+
+    def test_legacy_content_without_its_own_marker_uses_unique_original_text(self):
+        pages = self.make_pdf([f"Physical page {number}. Unique article {number:03d}. Evidence for this page." for number in range(1, 4)])
+        result = self.legacy_preview(pages[1][10:])
+        self.assertEqual(result["location"], {"page_start": 2, "page_end": 2})
+
+    def test_legacy_chunk_before_a_page_marker_retains_the_actual_previous_page(self):
+        pages = self.make_pdf([f"Physical page {number}. Unique article {number:03d}. Evidence for this page." for number in range(1, 4)])
+        result = self.legacy_preview(pages[0][-24:] + "\n<!-- page 2 -->\n" + pages[1][:40])
+        self.assertEqual(result["location"], {"page_start": 1, "page_end": 2})
+
+    def test_wrong_page_markers_and_ambiguous_text_never_guess_a_page(self):
+        pages = self.make_pdf([f"Repeated heading.\nUnique article {number:03d}." for number in range(1, 4)])
+        for content in ["<!-- page 99 -->\n" + pages[1], "<!-- page 3 -->\n" + pages[1], "Repeated heading."]:
+            with self.subTest(content=content):
+                self.assertEqual(self.legacy_preview(content)["location"], {})
+        self.assertEqual(self.legacy_preview("<!-- page 2 -->\nRepeated heading.")["location"],
+                         {"page_start": 2, "page_end": 2})
+
+    def test_blank_pdf_pages_do_not_shift_the_recovered_physical_page(self):
+        pages = self.make_pdf(["", "Unique evidence on the second physical page.", ""])
+        self.assertEqual(self.legacy_preview("<!-- page 2 -->\n" + pages[1])["location"],
+                         {"page_start": 2, "page_end": 2})
+
+    def test_modern_page_metadata_skips_legacy_pdf_scanning(self):
+        with patch.object(sources, "_recover_pdf_locations") as lookup:
+            result = sources.read_source(self.db, self.kb_id, self.doc_id, 2, 2, 2, 3)
+        lookup.assert_not_called()
+        self.assertEqual(result["location"]["page_start"], 2)
+
+    def test_legacy_pdf_lookup_limits_preserve_text_preview_without_false_positions(self):
+        pages = self.make_pdf(["Unique first physical page.", "Unique second physical page."])
+        for limit in ["MAX_PAGE_LOOKUP_PAGES", "MAX_PAGE_LOOKUP_CHARS"]:
+            with self.subTest(limit=limit), patch.object(sources, limit, 1):
+                result = self.legacy_preview("<!-- page 2 -->\n" + pages[1])
+                self.assertEqual(result["location"], {})
+                self.assertIn("second physical", result["chunks"][0]["content"])
+
+    def test_legacy_lookup_cannot_read_a_pdf_outside_the_upload_root(self):
+        import pymupdf
+        pages = self.make_pdf(["Unique evidence inside an otherwise valid PDF."])
+        with tempfile.TemporaryDirectory() as other_root, patch.object(settings, "UPLOAD_DIR", other_root), \
+             patch.object(pymupdf, "open") as open_pdf:
+            self.assertEqual(self.legacy_preview("<!-- page 1 -->\n" + pages[0])["location"], {})
+        open_pdf.assert_not_called()
+
     def test_pdf_preview_requires_current_version_pdf_type_and_upload_root(self):
         user = SimpleNamespace(id=uuid.uuid4())
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside, \

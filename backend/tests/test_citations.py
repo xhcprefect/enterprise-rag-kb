@@ -15,7 +15,7 @@ from langchain_core.documents import Document as LCDocument
 
 from app.api.v1 import chat
 from app.schemas.chat import ChatRequest
-from app.services import rag
+from app.services import chat_turns, rag
 from app.services.cloud_models import CloudModelError
 
 
@@ -146,6 +146,37 @@ class CitationApiTests(unittest.TestCase):
         self.assertEqual(events[-1][0], "error")
         self.assertNotIn("done", [event for event, _ in events])
         writer.add.assert_not_called()
+
+    def test_user_cancellation_is_logged_without_a_failure_traceback(self):
+        """点「停止」后模型才返回是预期路径；不能每次都留下 ERROR 级 traceback。"""
+        def cancelled(*_args, **_kwargs):
+            raise chat_turns.ChatLeaseLost("该回答已取消或处理租约已失效，请刷新会话后重试")
+
+        conv = SimpleNamespace(id=uuid.uuid4(), kb_id=self.kb.id, mode="rag")
+        db, writer = MagicMock(), MagicMock()
+        db.scalars.return_value.all.return_value = []
+        writer.get.return_value = self.user
+
+        async def consume(response):
+            return [frame async for frame in response.body_iterator]
+
+        with ExitStack() as stack:
+            mock_turns(stack, conv.id, writer)
+            stack.enter_context(patch.object(chat_turns, "complete_turn", side_effect=cancelled))
+            stack.enter_context(patch.object(chat, "_get_conversation", return_value=conv))
+            stack.enter_context(patch.object(chat, "_get_kb", return_value=self.kb))
+            stack.enter_context(patch.object(rag, "retrieve", return_value=documents()))
+            stack.enter_context(patch.object(rag, "answer_stream", return_value=iter(["回答[1]"])))
+            stack.enter_context(patch.object(chat, "SessionLocal", return_value=writer))
+            stack.enter_context(patch.object(chat, "write_audit"))
+            failure = stack.enter_context(patch.object(chat.logger, "exception"))
+            info = stack.enter_context(patch.object(chat.logger, "info"))
+            response = chat.chat_stream(ChatRequest(question="百度网址是啥", conversation_id=conv.id), self.request, db, self.user)
+            frames = asyncio.run(consume(response))
+
+        failure.assert_not_called()
+        self.assertTrue(any("问答已结束" in str(call.args[0]) for call in info.call_args_list))
+        self.assertIn("event: error", "\n".join(frames))
 
     def history(self, answer, candidates, mode="rag"):
         now = datetime.now(timezone.utc)
