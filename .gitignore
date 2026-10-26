@@ -24,6 +24,7 @@ Thumbs.db
 # 部署运行时数据（数据库、上传文件、日志、备份）
 data/
 _testdata/
+backend/evaluation-results/
 compose-test.yml
 
 # 本地临时文件

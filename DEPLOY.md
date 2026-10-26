@@ -176,6 +176,16 @@ docker compose logs -f api        # 看启动日志
 > 数据量小的时候建不建都一样快，等文档多了才发现是全表扫描，排查成本高。
 > 索引用 `CREATE INDEX CONCURRENTLY` 建，不阻塞读写；重复执行是幂等的。
 
+关键词检索使用另一个 GIN 索引，新版 API 完成表结构迁移后即可建立：
+
+```bash
+docker compose exec api python -m scripts.migrate_keyword_index --dry-run
+docker compose exec api python -m scripts.migrate_keyword_index
+```
+
+这一步只建立索引，不填充旧分块。旧文档仍可向量检索，在页面重新索引后获得关键词、
+页码、章节与表格行信息；重新索引期间该文档暂不参与问答。扫描 PDF 仍需预先 OCR。
+
 - **备份与升级注意事项**：备份现在会短暂停止 API/worker，以保证数据库和上传文件一致；升级必须同步更新 API、worker 与前端，见 [OPTIMIZATION.md](OPTIMIZATION.md)。
 
 ## 数据与备份
@@ -275,6 +285,36 @@ docker compose up -d --build      # 只重建有变化的容器
 >
 > 新增列与 `DROP NOT NULL` 在 PG11+ 都是仅元数据操作，很快，但会短暂取
 > `ACCESS EXCLUSIVE` 锁，建议避开访问高峰部署。
+
+#### 会话并发、混合检索与原文定位版本升级
+
+本次新增 `chat_turns` 请求记录、会话生成租约、消息的问答关联与状态，以及分块的
+结构位置和关键词列。`init_db()` 幂等迁移，保留已有会话、消息与文档；无需清库。
+为了避免旧 API 绕过会话租约、旧 worker 写入缺少新字段的分块，请安排维护窗口，
+先备份并停止旧进程，再统一更新三个服务：
+
+```bash
+./deploy/backup.sh
+docker compose stop api worker
+git pull
+docker compose up -d --build
+# 等 API 健康后，在新镜像内建立关键词索引
+docker compose exec api python -m scripts.migrate_keyword_index --dry-run
+docker compose exec api python -m scripts.migrate_keyword_index
+```
+
+`HYBRID_RETRIEVAL_ENABLED=true` 默认启用关键词与向量排名融合。
+`RERANK_ENABLED=false` 默认关闭外部重排；启用前配置 `RERANK_BASE_URL`、
+`RERANK_MODEL` 和服务所需密钥，再通过固定问题集比较质量、延迟和费用。
+原文预览及 PDF 读取都需要登录，并重新验证当前知识库权限与索引代次。
+
+验收时用同一会话在两个标签页同时提交，后一请求应返回 409；复用已经完成的
+`request_id` 应重放原答案；停止后重新提交应使用新请求 ID。删除会话后旧请求 ID
+仍不能重新创建会话。`CHAT_LEASE_SECONDS=300` 控制崩溃后的过期恢复，正常生成会续期。
+
+自动化回归和付费模型联调分开执行。真实数据库测试必须指向可清空的专用 `_test` 库，
+业务问题集与合成样例的运行方法见 [评测说明](backend/evaluation/README.md)。
+旧文档按需重新索引以获得结构信息，旧引用遇到文档重建后会提示失效。
 
 #### 服务器首次接入 git
 
