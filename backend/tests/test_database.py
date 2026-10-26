@@ -1,5 +1,6 @@
 """真实 PostgreSQL/pgvector 回归；只接受显式提供、数据库名以 _test 结尾的连接。"""
 import hashlib
+import json
 import os
 import tempfile
 import unittest
@@ -303,6 +304,31 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200, result.text)
         self.assertIn("event: done", result.text)
         self.assertEqual(chat_admission._total, 0)
+
+    def test_rag_final_citations_match_saved_and_reloaded_messages(self):
+        import asyncio
+        from langchain_core.documents import Document as LCDocument
+        from app.models import Message
+        docs = [(LCDocument(page_content=f"条文 {index}", metadata={
+            "document_id": str(self.add_doc()), "filename": f"law-{index}.txt", "chunk_index": 0,
+        }), 0.1) for index in range(1, 4)]
+        async def consume(response):
+            return [frame async for frame in response.body_iterator]
+        for answer, expected in [("根据现有知识库无法回答。", []), ("法律规定见[3]。", [3])]:
+            with self.subTest(answer=answer), SessionLocal() as db:
+                with patch.object(rag, "retrieve", return_value=docs), patch.object(rag, "answer_stream", return_value=iter([answer])):
+                    response = chat.chat_stream(ChatRequest(question="测试引用", kb_id=self.kb.id), self.request, db, self.admin)
+                    frames = asyncio.run(consume(response))
+                meta = json.loads(frames[0].split("data: ", 1)[1])
+                done = json.loads(frames[-1].split("data: ", 1)[1])
+                self.assertEqual(meta["citations"], [])
+                self.assertEqual([item["source_index"] for item in done["citations"]], expected)
+                conv_id = uuid.UUID(meta["conversation_id"])
+                stored = db.scalar(select(Message).where(Message.conversation_id == conv_id, Message.role == "assistant"))
+                self.assertEqual(stored.citations, done["citations"] or None)
+                history = chat.get_conversation(conv_id, db, self.admin).data
+                assistant = next(message for message in history.messages if message.role == "assistant")
+                self.assertEqual([item.source_index for item in assistant.citations or []], expected)
 
     def test_admin_reset_and_legacy_login_upgrade(self):
         import bcrypt

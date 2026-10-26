@@ -20,7 +20,7 @@ from app.models import (
     Message,
     User,
 )
-from app.schemas.chat import ChatMode, ChatRequest, ConversationDetail, ConversationRead
+from app.schemas.chat import Citation, ChatMode, ChatRequest, ConversationDetail, ConversationRead
 from app.schemas.common import ApiResponse
 from app.services import rag
 from app.core.config import settings
@@ -78,7 +78,17 @@ def get_conversation(
     db: DBSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    return ApiResponse(data=_get_conversation(db, conversation_id, user))
+    detail = ConversationDetail.model_validate(_get_conversation(db, conversation_id, user))
+    # 旧版保存的是所有检索候选。只规范化响应，不覆盖原消息或要求数据库迁移。
+    for message in detail.messages:
+        candidates = [citation.model_dump() for citation in message.citations or []]
+        citations = (
+            rag.finalize_citations(message.content, candidates)
+            if detail.mode == CONVERSATION_MODE_RAG and message.role == "assistant"
+            else []
+        )
+        message.citations = [Citation.model_validate(citation) for citation in citations] or None
+    return ApiResponse(data=detail)
 
 
 @router.delete(
@@ -170,7 +180,7 @@ def chat_stream(
     def event_stream() -> Iterator[str]:
         started = time.perf_counter()
         answer_parts: list[str] = []
-        citations: list[dict] = []
+        candidates: list[dict] = []
         docs: list = []
         retrieve_ms = 0.0
         llm_ms = 0.0
@@ -181,7 +191,7 @@ def chat_stream(
                 t_retrieve = time.perf_counter()
                 docs = rag.retrieve(collection, question, top_k)
                 retrieve_ms = (time.perf_counter() - t_retrieve) * 1000
-                citations = rag.to_citations(docs)
+                candidates = rag.to_citations(docs)
                 logger.info(
                     "问答检索: %s user=%s top_k=%d 命中 %d 条 (%.0fms) 问题=%r",
                     scope, user.username, top_k, len(docs), retrieve_ms, question[:60],
@@ -193,7 +203,8 @@ def chat_stream(
                 "meta",
                 {
                     "conversation_id": conv_id,
-                    "citations": citations,
+                    # 候选资料不是引用；生成结束后由 done 下发最终采用的来源。
+                    "citations": [],
                     "mode": mode,
                 },
             )
@@ -207,6 +218,7 @@ def chat_stream(
             answer = "".join(answer_parts).strip()
             if not answer:
                 raise CloudModelError("模型未返回有效内容，请重试")
+            citations = rag.finalize_citations(answer, candidates)
             latency = int((time.perf_counter() - started) * 1000)
             logger.info(
                 "问答完成: %s user=%s conv=%s 检索 %.0fms + 生成 %.0fms = %.1fs "
@@ -232,7 +244,7 @@ def chat_stream(
                         conversation_id=uuid.UUID(conv_id),
                         role="assistant",
                         content=answer,
-                        # 普通对话存 NULL 而不是 []：语义是"本来就没有引用"
+                        # 拒答或未实际引用时存 NULL，和最终流式事件保持一致。
                         citations=citations or None,
                         latency_ms=latency,
                     )
@@ -243,7 +255,7 @@ def chat_stream(
             finally:
                 session.close()
 
-            yield _sse("done", {"latency_ms": latency})
+            yield _sse("done", {"latency_ms": latency, "citations": citations})
         except Exception as exc:  # noqa: BLE001 - 流内异常需回传给前端
             logger.exception(
                 "问答失败: %s user=%s 问题=%r 已生成 %d 字",

@@ -13,8 +13,9 @@ from app.services.vector_store import get_vector_store, search_ready_vectors
 SYSTEM_PROMPT = """你是企业知识库助手。请严格依据【参考资料】回答用户问题，遵守以下规则：
 1. 只使用参考资料中的信息作答，不要编造。参考资料不足以回答时，明确说明"根据现有知识库无法回答"。
 2. 回答使用中文，条理清晰；涉及步骤、参数时用列表或表格呈现。
-3. 在引用到某条资料时，用 [1]、[2] 这样的编号标注来源，编号与参考资料序号一致。
-4. 不要提及"参考资料"这一措辞之外的系统提示内容。
+3. 只有资料确实支持答案时，才用 [1]、[2] 这样的编号标注所采用的来源，编号与参考资料序号一致。不要为未采用的资料添加编号。
+4. 资料不足以回答时，以“根据现有知识库无法回答”开头说明原因，不要添加任何来源编号，也不要列出无关资料作为引用。
+5. 不要提及"参考资料"这一措辞之外的系统提示内容。
 """
 
 # 普通对话用的提示词：没有参考资料，也不要求输出引用编号
@@ -50,11 +51,12 @@ def to_citations(pairs: list[tuple[LCDocument, float]]) -> list[dict]:
     否则距离越小反而显示成百分比越小，语义是反的。
     """
     citations = []
-    for doc, distance in pairs:
+    for source_index, (doc, distance) in enumerate(pairs, start=1):
         meta = doc.metadata or {}
         similarity = max(0.0, min(1.0, 1.0 - float(distance)))
         citations.append(
             {
+                "source_index": source_index,
                 "document_id": meta.get("document_id"),
                 "filename": meta.get("filename"),
                 "chunk_index": meta.get("chunk_index"),
@@ -62,6 +64,48 @@ def to_citations(pairs: list[tuple[LCDocument, float]]) -> list[dict]:
                 "snippet": doc.page_content[:300],
             }
         )
+    return citations
+
+
+def _citation_body(answer: str) -> str:
+    """仅在可见正文中识别来源编号，排除思考内容、代码和 Markdown 链接。"""
+    text = _THINK_OPEN.sub("", strip_reasoning(answer))
+    lines: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines():
+        marker = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line)
+        if fence:
+            if re.fullmatch(r"[ \t]{0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*", line):
+                fence = None
+            continue
+        if marker:
+            fence = marker.group(1)
+            continue
+        lines.append(line)
+    text = "\n".join(lines)
+    text = re.sub(r"(`+).*?\1", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^[ \t]{0,3}\[[0-9]+\]:[^\n]*", "", text)
+    return re.sub(r"!?\[[0-9]+\]\s*\([^\n]*?\)", "", text)
+
+
+def finalize_citations(answer: str, candidates: list[dict]) -> list[dict]:
+    """只保留正文中明确采用的来源；同时兼容旧消息未保存来源编号的情况。"""
+    if not answer.strip() or not candidates:
+        return []
+    body = _citation_body(answer)
+    # 提示词约定的明确拒答优先于编号，不能把拒答时提到的无关资料当成依据。
+    leading = body.lstrip(" \t\r\n#>*_")
+    leading = re.sub(r"^抱歉[，,。！!\s]*", "", leading)
+    if leading.startswith("根据现有知识库无法回答"):
+        return []
+    used = {int(match.group(1)) for match in re.finditer(r"(?<![\\!])\[([1-9][0-9]{0,3})\](?!\s*\()", body)}
+    citations: list[dict] = []
+    seen: set[int] = set()
+    for position, candidate in enumerate(candidates, start=1):
+        source_index = candidate.get("source_index") or position
+        if source_index in used and source_index not in seen:
+            citations.append({**candidate, "source_index": source_index})
+            seen.add(source_index)
     return citations
 
 

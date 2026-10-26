@@ -79,7 +79,7 @@
                 <el-collapse><el-collapse-item>
                   <template #title><span class="citation-title"><el-icon><DocumentCopy /></el-icon>{{ t('chat.citations.title') }}<span class="citation-count">{{ formatNumber(msg.citations.length) }}</span></span></template>
                     <div v-for="(c, i) in msg.citations" :key="i" class="citation-item">
-                    <div class="citation-head"><span class="citation-index">{{ formatNumber(i + 1) }}</span><span class="citation-name" :title="c.filename || t('chat.citations.untitled')">{{ c.filename || t('chat.citations.untitled') }}</span><span v-if="c.chunk_index !== null" class="citation-meta">{{ t('chat.citations.chunk', { index: formatNumber(c.chunk_index! + 1) }) }}</span><span v-if="c.score !== null" class="citation-score">{{ t('chat.citations.score', { percent: formatNumber(Math.round(c.score! * 100)) }) }}</span></div>
+                    <div class="citation-head"><span class="citation-index">{{ formatNumber(c.source_index ?? (i + 1)) }}</span><span class="citation-name" :title="c.filename || t('chat.citations.untitled')">{{ c.filename || t('chat.citations.untitled') }}</span><span v-if="c.chunk_index !== null" class="citation-meta">{{ t('chat.citations.chunk', { index: formatNumber(c.chunk_index! + 1) }) }}</span><span v-if="c.score !== null" class="citation-score">{{ t('chat.citations.score', { percent: formatNumber(Math.round(c.score! * 100)) }) }}</span></div>
                       <div class="citation-snippet">{{ c.snippet }}</div>
                     </div>
                 </el-collapse-item></el-collapse>
@@ -117,6 +117,7 @@ import hljs from 'highlight.js/lib/common'
 import 'highlight.js/styles/github.css'
 import { useResponsiveDrawer } from '@/composables/useResponsiveDrawer'
 import { formatNumber } from '@/i18n/format'
+import { getCompletedCitations, type ChatCompletion } from '@/utils/citations'
 import {
   chatApi,
   kbApi,
@@ -423,8 +424,8 @@ async function send() {
   controller = myController
   // 持有信号引用：stopStreaming 会把 controller 置空，但信号上的 aborted 仍然有效
   const signal = myController.signal
-  // meta 里的引用先攒着，等回答生成完再挂到气泡上（避免边吐字边露出引用块）
-  let pendingCitations: Citation[] = []
+  // 最终引用只信任 done，meta 中的旧版检索候选不能当成回答依据。
+  let completion: ChatCompletion | undefined
   await scrollToBottom()
 
   // ---- 流式渲染节流 ----
@@ -456,17 +457,19 @@ async function send() {
         onMeta(data) {
           if (signal.aborted || disposed || controller !== myController) return
           currentConversationId.value = data.conversation_id
-          pendingCitations = data.citations
         },
         onDelta(token) {
           if (signal.aborted || disposed || controller !== myController) return
           pending += token
           if (!rafId) rafId = requestAnimationFrame(flush)
         },
-        onDone() {
+        onDone(data) {
+          if (signal.aborted || disposed || controller !== myController) return
+          completion = data
           assistant.streaming = false
         },
         onError(message) {
+          completion = undefined
           assistant.streaming = false
           // 已被新请求接管时不要把旧请求的错误顶上去
           if (controller === myController) errorMessage.value = message
@@ -475,6 +478,7 @@ async function send() {
       signal
     )
   } catch (err: any) {
+    completion = undefined
     assistant.streaming = false
     if (controller === myController && !disposed && err?.name !== 'AbortError') {
       errorMessage.value = err?.message || t('errors.request')
@@ -508,9 +512,8 @@ async function send() {
           ? t('chat.emptyReply.rag')
           : t('chat.emptyReply.chat')
     }
-    // 回答已收口，此时再挂引用来源，视觉上"先答案后出处"。
-    // 只有真正产出了回答才挂：报错/空回答时引用块只会让人困惑。
-    assistant.citations = answered ? pendingCitations : undefined
+    // 收到完整 done 后才展示最终引用；拒答、空回答、报错或中途停止均不挂候选资料。
+    assistant.citations = getCompletedCitations(completion, answered, aborted)
     if (!disposed && isCurrent) await loadConversations()
     // 用 followTail 而不是 scrollToBottom：用户中途往回翻时不该在收尾瞬间被拽回去。
     // 但新会话的第一条回答必须让它可见——那时用户本来就在底部，stick 为 true，

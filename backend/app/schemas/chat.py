@@ -18,6 +18,8 @@ class ChatRequest(BaseModel):
 
 
 class Citation(BaseModel):
+    # 保留参考资料的原始编号，筛选后不能把 [3] 重新标成 [1]。
+    source_index: int | None = Field(default=None, ge=1)
     document_id: str | None = None
     filename: str | None = None
     chunk_index: int | None = None

@@ -1,6 +1,7 @@
 import client from './client'
 import { consumeEventStream, StreamProtocolError } from '@/utils/stream'
 import { i18n } from '@/i18n'
+import type { ChatCompletion } from '@/utils/citations'
 
 // ---------- 类型 ----------
 export interface User {
@@ -39,6 +40,8 @@ export interface DocumentItem {
 }
 
 export interface Citation {
+  /** 参考资料的原始编号；旧消息可能没有此字段。 */
+  source_index?: number | null
   document_id: string | null
   filename: string | null
   chunk_index: number | null
@@ -262,7 +265,7 @@ export async function streamChat(
   handlers: {
     onMeta?: (data: { conversation_id: string; citations: Citation[]; mode?: ChatMode }) => void
     onDelta?: (text: string) => void
-    onDone?: (data: { latency_ms: number }) => void
+    onDone?: (data: ChatCompletion) => void
     onError?: (message: string) => void
   },
   signal?: AbortSignal

@@ -196,6 +196,7 @@ npm run dev
 **例外**
 
 - `POST /api/v1/chat/stream`：返回 `text/event-stream`，事件为 `meta` / `delta` / `done` / `error`。
+  `meta.citations` 固定为空数组；候选资料不提前作为引用公开。`done` 返回 `latency_ms` 和最终 `citations`，前端仅在完整收到 `done` 后显示引用。
 - `GET /health`、`GET /`：探活/入口信息，保持扁平结构，便于监控直接取字段。
 - `GET /api/v1/users/import/template`：直接返回 xlsx 二进制（`Content-Disposition: attachment`），
   不套 `data` 字段。
@@ -226,6 +227,8 @@ npm run dev
   → 对话模型流式生成（SSE 推送）
   → 保存消息（引用为 NULL）、审计日志
 ```
+
+**引用来源规则**：检索候选不等于回答依据。回答完成后，仅保留正文中以 `[1]`、`[2]` 等编号明确引用的候选片段；未引用的资料不会全部列出。资料不足时，模型按提示词以“根据现有知识库无法回答”开头拒答，并返回空引用；代码、思考内容、数字链接和无效编号不作为引用。来源包含 `source_index` 原始编号，筛选后不会把正文中的 `[3]` 重新标成 `[1]`。新消息只保存最终引用，旧会话读取时按相同规则规范化响应，无需迁移或清空历史。中途停止、异常或未收到完整 `done` 的回答不展示来源。编号校验只确认引用了哪条资料，不替代对答案事实正确性的核验。
 
 **历史对话的裁剪规则**（两种模式共用）：取最近 `HISTORY_MAX_TURNS` 轮（默认 10 轮，
 user + assistant 各算一条），并受 `HISTORY_MAX_CHARS` 字符预算（默认 8000）约束。

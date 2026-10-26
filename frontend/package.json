@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit --incremental false && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test tests/stream.test.ts tests/upload.test.ts tests/preferences.test.ts tests/i18n.test.ts tests/router.test.ts tests/build.test.ts",
+    "test": "node --experimental-strip-types --test tests/stream.test.ts tests/upload.test.ts tests/preferences.test.ts tests/i18n.test.ts tests/router.test.ts tests/build.test.ts tests/citations.test.ts",
     "typecheck": "vue-tsc --noEmit --incremental false"
   },
   "dependencies": {
