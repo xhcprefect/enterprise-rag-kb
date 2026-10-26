@@ -358,6 +358,74 @@ class DatabaseTests(unittest.TestCase):
             db.refresh(conv)
             self.assertGreater(conv.updated_at, fixed)
 
+    def test_document_choice_persists_topic_and_verified_body_across_short_history_requests(self):
+        import asyncio
+        from types import SimpleNamespace
+        from langchain_core.documents import Document as LCDocument
+
+        definitions = [
+            ("数据安全指南.txt", "数据安全指南：一级公开、二级内部、三级机密。"),
+            ("星海科技内部管理手册（2026版）.txt", "第四章 信息安全：数据分为四级：公开级、内部级、机密级、绝密级。内部级仅限内部使用，机密级和绝密级按授权范围访问。"),
+        ]
+        pairs = []
+        for filename, content in definitions:
+            identifier = self.add_doc()
+            with SessionLocal() as db:
+                db.get(Document, identifier).filename = filename
+                chunk = db.scalar(select(DocumentChunk).where(DocumentChunk.document_id == identifier))
+                chunk.content, chunk.source_metadata = content, {"section": "信息安全"}
+                db.commit()
+            ingest.ingest_document_task(str(identifier))
+            pairs.append((LCDocument(page_content=content, metadata={"document_id": str(identifier),
+                         "filename": filename, "chunk_index": 0, "index_version": 0}), 0.1))
+        citations = rag.to_citations(pairs)
+        with SessionLocal() as db:
+            conv = Conversation(user_id=self.admin.id, kb_id=self.kb.id, mode="rag", title="文档选择追问")
+            db.add(conv)
+            db.flush()
+            beginning = datetime.now(timezone.utc) - timedelta(minutes=1)
+            for index, (role, content, sources) in enumerate([
+                ("user", "数据安全分几级", None),
+                ("assistant", "《数据安全指南》分三级[1]。\n《星海科技内部管理手册（2026版）》分四级[2]。", citations),
+                ("user", "具体点呢", None),
+                ("assistant", "您想了解《数据安全指南》还是《星海科技内部管理手册（2026版）》？", None),
+            ]):
+                db.add(Message(conversation_id=conv.id, role=role, content=content, citations=sources,
+                               created_at=beginning + timedelta(seconds=index)))
+            db.commit()
+            conversation_id = conv.id
+
+        async def consume(response):
+            return "".join([frame async for frame in response.body_iterator])
+
+        with patch.object(rag, "retrieve") as search, patch.object(rag, "get_llm") as model:
+            model.return_value.stream.return_value = [SimpleNamespace(content="按手册，数据安全分为四级：公开级、内部级、机密级、绝密级[1]。")]
+            with SessionLocal() as db:
+                response = chat.chat_stream(ChatRequest(question="星海科技内部管理手册", conversation_id=conversation_id),
+                                            self.request, db, self.admin)
+                self.assertIn("event: done", asyncio.run(consume(response)))
+            with SessionLocal() as db:
+                previous = db.scalar(select(ChatTurn).where(ChatTurn.conversation_id == conversation_id))
+                self.assertEqual(previous.trace["status"], "document_followup")
+                self.assertIn("数据安全分几级", previous.trace["followup_topic"])
+            # 新请求只载入最近一轮，原问题已不在 Message 历史窗口内。
+            with patch.object(settings, "HISTORY_MAX_TURNS", 1), SessionLocal() as db:
+                response = chat.chat_stream(ChatRequest(question="再详细一点", conversation_id=conversation_id),
+                                            self.request, db, self.admin)
+                self.assertIn("event: done", asyncio.run(consume(response)))
+            search.assert_not_called()
+            prompt = model.return_value.stream.call_args.args[0][-1].content
+            self.assertIn("数据安全分几级", prompt)
+            self.assertIn(definitions[1][1], prompt)
+            self.assertNotIn(definitions[0][1], prompt)
+        with SessionLocal() as db:
+            answers = db.scalars(select(Message).where(Message.conversation_id == conversation_id,
+                                                       Message.role == "assistant", Message.turn_id.is_not(None))).all()
+            self.assertEqual(len(answers), 2)
+            for answer in answers:
+                self.assertEqual([item["document_id"] for item in answer.citations], [str(pairs[1][0].metadata["document_id"])])
+                self.assertEqual([item["source_index"] for item in answer.citations], [1])
+
     def test_worker_recovers_legacy_and_expired_leases(self):
         from worker import claim_one, recover_stale
         did = self.add_doc()

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tests.fake_turns import mock_turns
+from tests.test_followup import security_history
 
 from fastapi import Request
 from langchain_core.documents import Document as LCDocument
@@ -15,7 +16,7 @@ from langchain_core.documents import Document as LCDocument
 from app.api.v1 import chat
 from app.core.config import settings
 from app.schemas.chat import ChatRequest
-from app.services import followup, rag
+from app.services import chat_turns, followup, rag
 
 
 def source(content="盗窃罪的未成年人量刑规定", **metadata):
@@ -37,10 +38,12 @@ class FollowupApiTests(unittest.TestCase):
             SimpleNamespace(id=uuid.uuid4(), role="assistant", content="量刑取决于具体条件[3]。", citations=[citation]),
         ]
 
-    def stream(self, question, *, history=None, mode="rag", docs=None, patches=(), real_answer=False):
+    def stream(self, question, *, history=None, mode="rag", docs=None, patches=(), real_answer=False,
+               verified_docs=None, topic_rows=()):
         conv = SimpleNamespace(id=uuid.uuid4(), kb_id=self.kb.id if mode == "rag" else None, mode=mode)
         db, writer = MagicMock(), MagicMock()
         db.scalars.return_value.all.return_value = list(reversed(self.history if history is None else history))
+        db.execute.return_value.all.return_value = list(topic_rows)
         writer.get.return_value = self.user
 
         async def consume(response):
@@ -53,7 +56,7 @@ class FollowupApiTests(unittest.TestCase):
             stack.enter_context(patch.object(chat, "_get_conversation", return_value=conv))
             stack.enter_context(patch.object(chat, "_get_kb", return_value=self.kb))
             retrieve = stack.enter_context(patch.object(rag, "retrieve", return_value=[source()] if docs is None else docs))
-            load_sources = stack.enter_context(patch.object(chat, "load_ready_citations", return_value=[self.previous_source]))
+            load_sources = stack.enter_context(patch.object(chat, "load_ready_citations", return_value=[self.previous_source] if verified_docs is None else verified_docs))
             answer = None if real_answer else stack.enter_context(patch.object(rag, "answer_stream", return_value=iter(["本轮说明[1]。"])))
             stack.enter_context(patch.object(chat, "SessionLocal", return_value=writer))
             audit = stack.enter_context(patch.object(chat, "write_audit"))
@@ -64,6 +67,87 @@ class FollowupApiTests(unittest.TestCase):
                    json.loads(frame.split("data: ", 1)[1])) for frame in frames]
         return SimpleNamespace(events=events, db=db, writer=writer, retrieve=retrieve,
                                load_sources=load_sources, answer=answer, audit=audit)
+
+    def security_context(self, clarification=True):
+        items = security_history(clarification=clarification)
+        guide = source("数据安全指南：一级公开、二级内部、三级机密。", **{
+            key: value for key, value in items[1]["citations"][0].items() if key != "source_index"
+        })
+        manual = source("第四章 信息安全：数据分为四级：公开级、内部级、机密级、绝密级。公开级可对外公开；内部级限内部使用；机密级限授权人员；绝密级严格控制访问。", **{
+            key: value for key, value in items[1]["citations"][1].items() if key != "source_index"
+        })
+        return [SimpleNamespace(**item) for item in items], guide, manual
+
+    def test_screenshot_document_choice_reuses_verified_body_not_a_new_table_of_contents_hit(self):
+        history, guide, manual = self.security_context()
+        toc = source("目录：考勤与休假、薪酬与报销。", document_id=manual[0].metadata["document_id"], chunk_index=0)
+        with patch.object(followup, "complete_short_chat") as rewrite, patch.object(rag, "get_llm") as model:
+            model.return_value.stream.return_value = [SimpleNamespace(content="按手册，数据安全分为四级：公开级、内部级、机密级、绝密级[1]。")]
+            result = self.stream("星海科技内部管理手册", history=history, docs=[toc], verified_docs=[manual], real_answer=True)
+        rewrite.assert_not_called()
+        result.retrieve.assert_not_called()
+        requested = result.load_sources.call_args.args[1]
+        self.assertEqual([item["source_index"] for item in requested], [2])
+        self.assertEqual(requested[0]["document_id"], manual[0].metadata["document_id"])
+        current = model.return_value.stream.call_args.args[0][-1].content
+        self.assertIn("数据安全分几级", current)
+        self.assertIn(manual[0].page_content, current)
+        self.assertNotIn(guide[0].page_content, current)
+        self.assertNotIn(toc[0].page_content, current)
+        self.assertEqual(result.db.add.call_args.args[0].content, "星海科技内部管理手册")
+        self.assertEqual(result.events[-1][0], "done")
+        citations = result.events[-1][1]["citations"]
+        self.assertEqual([item["document_id"] for item in citations], [manual[0].metadata["document_id"]])
+        self.assertEqual([item["source_index"] for item in citations], [1])
+        self.assertEqual(result.writer.add.call_args.args[0].citations, citations)
+
+    def test_elaboration_has_both_actual_sources_and_no_additional_retrieval(self):
+        history, guide, manual = self.security_context(clarification=False)
+        with patch.object(followup, "complete_short_chat") as rewrite:
+            result = self.stream("具体点呢", history=history, verified_docs=[guide, manual])
+        rewrite.assert_not_called()
+        result.retrieve.assert_not_called()
+        self.assertEqual([item["source_index"] for item in result.load_sources.call_args.args[1]], [1, 2])
+        self.assertEqual(result.audit.call_args.args[-1]["retrieval_status"], "elaboration")
+        current = result.answer.call_args.kwargs["prepared"].messages[-1].content
+        self.assertIn(guide[0].page_content, current)
+        self.assertIn(manual[0].page_content, current)
+        self.assertIn("分别展开", current)
+
+    def test_updated_or_missing_chosen_source_does_not_use_other_document_hits(self):
+        history, guide, manual = self.security_context()
+        result = self.stream("星海科技内部管理手册", history=history, docs=[guide], verified_docs=[])
+        result.retrieve.assert_not_called()
+        result.answer.assert_not_called()
+        self.assertIn("已不可用", result.writer.add.call_args.args[0].content)
+        self.assertEqual(result.events[-1][1]["citations"], [])
+
+    def test_resolved_topic_is_saved_with_the_completed_request(self):
+        history, _, manual = self.security_context()
+        completed = MagicMock(return_value=uuid.uuid4())
+        result = self.stream("星海科技内部管理手册", history=history, verified_docs=[manual],
+                             patches=[patch.object(chat_turns, "complete_turn", completed)])
+        self.assertEqual(result.events[-1][0], "done")
+        trace = completed.call_args.args[-1]
+        self.assertEqual(trace["status"], "document_followup")
+        self.assertIn("数据安全分几级", trace["followup_topic"])
+        self.assertNotIn("分为四级", trace["followup_topic"])
+
+    def test_saved_topic_is_loaded_for_current_conversation_without_diagnostic_payload(self):
+        turn_id = uuid.uuid4()
+        self.history[0].content = "law.txt"
+        self.history[0].turn_id = self.history[1].turn_id = turn_id
+        self.history[1].reply_to_id = self.history[0].id
+        saved = "未成年人盗窃罪的量刑规定"
+        result = self.stream("具体点呢", topic_rows=[(turn_id, {"followup_topic": saved, "private_diagnostic": "never-pass-this-to-model"})])
+        result.db.execute.assert_called_once()
+        statement = str(result.db.execute.call_args.args[0])
+        self.assertIn("chat_turns.conversation_id =", statement)
+        self.assertIn("chat_turns.status =", statement)
+        current = result.answer.call_args.kwargs["prepared"].messages[-1].content
+        self.assertIn(saved, current)
+        self.assertNotIn("never-pass-this-to-model", current)
+        self.assertEqual(result.events[-1][0], "done")
 
     def test_rewrite_changes_retrieval_only_and_keeps_original_user_question(self):
         query = "未成年人犯盗窃罪的量刑规定是什么？"

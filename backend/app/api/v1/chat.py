@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session as DBSession
 from app.api.deps import admit_chat, get_current_user, write_audit
 from app.core.config import settings
 from app.db.session import SessionLocal, get_db
-from app.models import CONVERSATION_MODE_CHAT, CONVERSATION_MODE_RAG, Conversation, KnowledgeBase, Message, User
+from app.models import CONVERSATION_MODE_CHAT, CONVERSATION_MODE_RAG, ChatTurn, Conversation, KnowledgeBase, Message, User
 from app.schemas.chat import Citation, ChatMode, ChatRequest, ConversationDetail, ConversationRead
 from app.schemas.common import ApiResponse
 from app.services import chat_turns, followup, rag
@@ -163,9 +163,22 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         history_rows = db.scalars(select(Message).where(
             Message.conversation_id == reservation.conversation_id, Message.status == "completed",
         ).order_by(Message.created_at.desc(), Message.id.desc()).limit(settings.HISTORY_MAX_TURNS * 2)).all()
+        # 主题随已完成请求保存，刷新页面、跨进程或历史窗口缩短后也能继续澄清。
+        # 只读取当前会话的内部主题字段，不把诊断明细或旧答案变成本轮证据。
+        turn_ids = {m.turn_id for m in history_rows if isinstance(getattr(m, "turn_id", None), uuid.UUID)}
+        topics = {}
+        if mode == CONVERSATION_MODE_RAG and turn_ids:
+            traces = db.execute(select(ChatTurn.id, ChatTurn.trace).where(
+                ChatTurn.id.in_(turn_ids), ChatTurn.conversation_id == reservation.conversation_id,
+                ChatTurn.status == "completed",
+            )).all()
+            topics = {identifier: trace["followup_topic"] for identifier, trace in traces
+                      if isinstance(trace, dict) and isinstance(trace.get("followup_topic"), str)
+                      and 0 < len(trace["followup_topic"]) <= settings.HISTORY_MAX_CHARS}
         history = [{"id": str(m.id), "role": m.role, "content": m.content,
                     "reply_to_id": str(m.reply_to_id) if getattr(m, "reply_to_id", None) else None,
                     "turn_id": str(m.turn_id) if getattr(m, "turn_id", None) else None, "status": getattr(m, "status", "completed"),
+                    "followup_topic": topics.get(getattr(m, "turn_id", None)) if m.role == "assistant" else None,
                     "citations": rag.finalize_citations(m.content, m.citations or []) if m.role == "assistant" else []}
                    for m in reversed(history_rows)]
         db.commit()  # 流式等待期间不占请求会话的连接。
@@ -197,7 +210,7 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                     ensure_active()
                     if not plan.clarification:
                         t = time.perf_counter()
-                        if plan.status == "reference":
+                        if plan.status in {"reference", "document_followup", "elaboration"}:
                             docs = load_ready_citations(collection, plan.citations)
                             if len(docs) != len(plan.citations):
                                 docs = []
@@ -223,7 +236,8 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                 citations = rag.finalize_citations(answer, candidates)
                 generation_ms = (time.perf_counter() - t_llm) * 1000
                 latency = int((time.perf_counter() - started) * 1000)
-                trace = {"retrieval_query": plan.query, "status": plan.status, "candidate_sources": candidate_sources,
+                trace = {"retrieval_query": plan.query, "status": plan.status, "followup_topic": plan.topic,
+                         "candidate_sources": candidate_sources,
                          "supplied_sources": _source_identities(docs), "rewrite_ms": round(rewrite_ms, 2),
                          "retrieve_ms": round(retrieve_ms, 2), "generation_ms": round(generation_ms, 2),
                          "input_tokens_estimate": prepared.input_tokens if prepared else 0,
