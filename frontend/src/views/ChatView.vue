@@ -8,7 +8,7 @@
       </div>
       <div class="kb-picker">
         <span class="field-label">{{ t('chat.mode.label') }}</span>
-        <el-radio-group v-model="chatMode" size="small" class="mode-switch" :aria-label="t('chat.mode.label')" :disabled="streaming" @change="onModeChange">
+        <el-radio-group v-model="chatMode" size="small" class="mode-switch" :aria-label="t('chat.mode.label')" :disabled="busy" @change="onModeChange">
           <el-radio-button value="rag">{{ t('chat.mode.rag') }}</el-radio-button>
           <el-radio-button value="chat">{{ t('chat.mode.chat') }}</el-radio-button>
         </el-radio-group>
@@ -18,16 +18,16 @@
             <span>{{ kb.name }}</span><span class="kb-count">{{ t('chat.kb.docCount', { count: formatNumber(kb.document_count) }, kb.document_count) }}</span>
           </el-option>
         </el-select>
-        <el-button class="new-chat" :disabled="streaming || (chatMode === 'rag' && !kbId)" @click="newConversation"><el-icon><Plus /></el-icon>{{ t('chat.newChat') }}</el-button>
+        <el-button class="new-chat" :disabled="busy || (chatMode === 'rag' && !kbId)" @click="newConversation"><el-icon><Plus /></el-icon>{{ t('chat.newChat') }}</el-button>
       </div>
 
       <div class="conv-list">
         <div class="conv-title"><span>{{ t('chat.recent.title') }}</span><span class="conv-num">{{ formatNumber(conversations.length) }}</span></div>
         <div v-for="conv in conversations" :key="conv.id" class="conv-item" :class="{ active: conv.id === currentConversationId }">
-          <button class="conv-select" type="button" :disabled="streaming" :aria-current="conv.id === currentConversationId ? 'true' : undefined" :title="conv.title" @click="loadConversation(conv.id)">
+          <button class="conv-select" type="button" :disabled="busy" :aria-current="conv.id === currentConversationId ? 'true' : undefined" :title="conv.title" @click="loadConversation(conv.id)">
             <el-icon class="conv-icon" :size="15"><ChatLineRound /></el-icon><span class="conv-name">{{ conv.title }}</span>
           </button>
-          <button class="conv-del" type="button" :disabled="streaming" :aria-label="t('chat.recent.deleteAria', { title: conv.title })" @click="removeConversation(conv.id)"><el-icon :size="14"><Delete /></el-icon></button>
+          <button class="conv-del" type="button" :disabled="busy" :aria-label="t('chat.recent.deleteAria', { title: conv.title })" @click="removeConversation(conv.id)"><el-icon :size="14"><Delete /></el-icon></button>
         </div>
         <div v-if="!conversations.length" class="conv-empty"><el-icon :size="25"><ChatLineRound /></el-icon><span>{{ t('chat.recent.empty') }}</span><small>{{ t('chat.recent.emptyHint') }}</small></div>
         </div>
@@ -51,7 +51,7 @@
       </div>
 
       <template v-else>
-        <div ref="scrollRef" class="messages" :aria-label="t('chat.messagesAria')" :aria-busy="streaming" @scroll.passive="onScroll">
+        <div ref="scrollRef" class="messages" :aria-label="t('chat.messagesAria')" :aria-busy="busy" @scroll.passive="onScroll">
           <div v-if="!messages.length && !streaming" class="welcome">
             <span class="welcome-mark"><el-icon :size="29"><MagicStick /></el-icon></span>
             <span class="welcome-eyebrow">{{ t('chat.welcome.eyebrow') }}</span>
@@ -69,7 +69,7 @@
           <div v-for="msg in messages" :key="msg.id" class="message" :class="msg.role">
             <el-avatar :size="32" :class="msg.role === 'user' ? 'user-avatar' : 'ai-avatar'"><el-icon v-if="msg.role === 'user'"><User /></el-icon><el-icon v-else><MagicStick /></el-icon></el-avatar>
             <div class="bubble-wrap">
-              <div class="message-author">{{ msg.role === 'user' ? t('chat.author.you') : t('chat.author.assistant') }}<span v-if="msg.streaming" class="generating-label">{{ t('chat.generating') }}</span></div>
+              <div class="message-author">{{ msg.role === 'user' ? t('chat.author.you') : t('chat.author.assistant') }}<span v-if="msg.streaming" class="generating-label">{{ t('chat.generating') }}</span><span v-else-if="msg.status && msg.status !== 'completed'" class="generating-label">{{ requestStatusLabel(msg.status) }}</span></div>
               <div class="bubble">
                 <div v-if="msg.role === 'assistant' && msg.streaming && !msg.content" class="thinking" role="status"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="thinking-text">{{ chatMode === 'rag' ? t('chat.thinking.rag') : t('chat.thinking.chat') }}</span></div>
                 <div v-else-if="msg.role === 'assistant'" class="markdown-body" :class="{ streaming: msg.streaming }" v-html="renderMarkdown(msg.content, !!msg.streaming)"></div>
@@ -80,7 +80,9 @@
                   <template #title><span class="citation-title"><el-icon><DocumentCopy /></el-icon>{{ t('chat.citations.title') }}<span class="citation-count">{{ formatNumber(msg.citations.length) }}</span></span></template>
                     <div v-for="(c, i) in msg.citations" :key="i" class="citation-item">
                     <div class="citation-head"><span class="citation-index">{{ formatNumber(c.source_index ?? (i + 1)) }}</span><span class="citation-name" :title="c.filename || t('chat.citations.untitled')">{{ c.filename || t('chat.citations.untitled') }}</span><span v-if="c.chunk_index !== null" class="citation-meta">{{ t('chat.citations.chunk', { index: formatNumber(c.chunk_index! + 1) }) }}</span><span v-if="c.score !== null" class="citation-score">{{ t('chat.citations.score', { percent: formatNumber(Math.round(c.score! * 100)) }) }}</span></div>
+                      <div v-if="sourceLocationLabels(c, t).length" class="citation-location">{{ sourceLocationLabels(c, t).join(' · ') }}</div>
                       <div class="citation-snippet">{{ c.snippet }}</div>
+                      <el-button v-if="c.document_id && c.chunk_index != null" link type="primary" @click="viewSource(c)">{{ t('chat.citations.view') }}</el-button>
                     </div>
                 </el-collapse-item></el-collapse>
               </div>
@@ -91,12 +93,12 @@
 
         <div class="composer">
           <div class="composer-box">
-            <el-input v-model="question" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" resize="none" :aria-label="t('chat.composer.aria')" :placeholder="chatMode === 'rag' ? t('chat.composer.placeholderRag') : t('chat.composer.placeholderChat')" :disabled="streaming" @keydown="onComposerKeydown" />
+            <el-input v-model="question" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" resize="none" :aria-label="t('chat.composer.aria')" :placeholder="chatMode === 'rag' ? t('chat.composer.placeholderRag') : t('chat.composer.placeholderChat')" :disabled="busy" @keydown="onComposerKeydown" />
             <div class="composer-actions">
-              <div v-if="chatMode === 'rag'" class="topk"><span class="topk-label">{{ t('chat.composer.topk') }}</span><el-slider v-model="topK" :min="1" :max="12" size="small" :aria-label="t('chat.composer.topkAria')" :disabled="streaming" class="topk-slider" /><span class="topk-value">{{ formatNumber(topK) }}</span></div>
+              <div v-if="chatMode === 'rag'" class="topk"><span class="topk-label">{{ t('chat.composer.topk') }}</span><el-slider v-model="topK" :min="1" :max="12" size="small" :aria-label="t('chat.composer.topkAria')" :disabled="busy" class="topk-slider" /><span class="topk-value">{{ formatNumber(topK) }}</span></div>
               <span v-else class="composer-mode"><el-icon><ChatLineRound /></el-icon>{{ t('chat.mode.chat') }}</span>
               <span class="input-hint"><kbd>Enter</kbd> {{ t('chat.composer.hintSend') }} · <kbd>Shift + Enter</kbd> {{ t('chat.composer.hintNewline') }}</span>
-              <el-button v-if="streaming" class="composer-btn" type="danger" plain @click="stopStreaming"><el-icon><VideoPause /></el-icon>{{ t('chat.composer.stop') }}</el-button>
+              <el-button v-if="busy" class="composer-btn" type="danger" plain :loading="stopping" :disabled="stopping" @click="stopStreaming"><el-icon><VideoPause /></el-icon>{{ stopping ? t('chat.composer.stopping') : t('chat.composer.stop') }}</el-button>
               <el-button v-else class="composer-btn" type="primary" :disabled="!question.trim()" @click="send">{{ t('chat.composer.send') }}<el-icon class="send-icon"><Promotion /></el-icon></el-button>
               </div>
             </div>
@@ -104,6 +106,7 @@
         </div>
       </template>
     </section>
+    <SourcePreviewDrawer v-model="sourceOpen" :kb-id="kbId" :citation="selectedCitation" />
   </div>
 </template>
 
@@ -118,6 +121,9 @@ import 'highlight.js/styles/github.css'
 import { useResponsiveDrawer } from '@/composables/useResponsiveDrawer'
 import { formatNumber } from '@/i18n/format'
 import { getCompletedCitations, type ChatCompletion } from '@/utils/citations'
+import { createChatRequestId } from '@/utils/chatRequest'
+import { sourceLocationLabels } from '@/utils/sourceLocation'
+import SourcePreviewDrawer from '@/components/SourcePreviewDrawer.vue'
 import {
   chatApi,
   kbApi,
@@ -135,6 +141,7 @@ interface ChatMessage {
   content: string
   citations?: Citation[]
   streaming?: boolean
+  status?: 'processing' | 'completed' | 'failed' | 'cancelled'
 }
 
 const { t, locale } = useI18n()
@@ -210,6 +217,11 @@ const messages = ref<ChatMessage[]>([])
 const question = ref('')
 const topK = ref(6)
 const streaming = ref(false)
+const stopping = ref(false)
+const busy = computed(() => streaming.value || stopping.value)
+const sourceOpen = ref(false)
+const selectedCitation = ref<Citation | null>(null)
+let activeRequestId: string | null = null
 const errorMessage = ref('')
 const scrollRef = ref<HTMLElement>()
 let controller: AbortController | null = null
@@ -294,7 +306,8 @@ async function loadKbs() {
 }
 
 async function onKbChange() {
-  if (streaming.value) return
+  if (busy.value) return
+  sourceOpen.value = false
   currentConversationId.value = null
   messages.value = []
   await loadConversations()
@@ -309,8 +322,9 @@ let appliedMode: ChatMode = 'rag'
 async function onModeChange(value: string | number | boolean) {
   const next = value as ChatMode
   // 流式中途禁止切换（单选框也置灰了，这里是兜底）；重复点同一个不做事
-  if (streaming.value || next === appliedMode) return
+  if (busy.value || next === appliedMode) return
   appliedMode = next
+  sourceOpen.value = false
   currentConversationId.value = null
   messages.value = []
   errorMessage.value = ''
@@ -333,7 +347,8 @@ async function loadConversations() {
 }
 
 async function loadConversation(id: string) {
-  if (streaming.value) return
+  if (busy.value) return
+  sourceOpen.value = false
   const { data } = await chatApi.conversation(id)
   closeSidebar()
   currentConversationId.value = data.id
@@ -349,8 +364,9 @@ async function loadConversation(id: string) {
     switched = true
   }
   messages.value = data.messages.map((m) => ({
-    id: newMessageId(),
+    id: m.id,
     role: m.role,
+    status: m.status,
     content: m.content,
     citations: m.citations || undefined
   }))
@@ -361,8 +377,9 @@ async function loadConversation(id: string) {
 }
 
 function newConversation() {
-  if (streaming.value) return
+  if (busy.value) return
   closeSidebar()
+  sourceOpen.value = false
   currentConversationId.value = null
   messages.value = []
   question.value = ''
@@ -385,12 +402,35 @@ async function removeConversation(id: string) {
   ElMessage.success(t('common.deleted'))
 }
 
-function stopStreaming() {
+function viewSource(citation: Citation) {
+  selectedCitation.value = citation
+  sourceOpen.value = true
+}
+
+function requestStatusLabel(status: string) {
+  if (status === 'processing') return t('chat.requestStatus.processing')
+  if (status === 'cancelled') return t('chat.requestStatus.cancelled')
+  return t('chat.requestStatus.failed')
+}
+
+async function stopStreaming() {
+  if (stopping.value) return
+  const requestId = activeRequestId
+  stopping.value = true
   controller?.abort()
   controller = null
-  streaming.value = false
+  activeRequestId = null
   const last = messages.value[messages.value.length - 1]
   if (last?.streaming) last.streaming = false
+  try {
+    if (requestId) await chatApi.cancelRequest(requestId)
+  } catch {
+    // 断连清理与租约超时仍会兜底；上游停止计费取决于模型服务商。
+  } finally {
+    streaming.value = false
+    stopping.value = false
+    if (!disposed) await loadConversations()
+  }
 }
 
 function onComposerKeydown(event: KeyboardEvent) {
@@ -409,12 +449,15 @@ function askSuggestion(text: string) {
 async function send() {
   const text = question.value.trim()
   // 普通对话不需要知识库，只有 RAG 模式才要求先选库
-  if (!text || streaming.value || (chatMode.value === 'rag' && !kbId.value)) return
+  if (!text || busy.value || (chatMode.value === 'rag' && !kbId.value)) return
 
   const mode = chatMode.value
   errorMessage.value = ''
   question.value = ''
-  messages.value.push({ id: newMessageId(), role: 'user', content: text })
+  messages.value.push({ id: newMessageId(), role: 'user', content: text, status: 'processing' })
+  const userMessage = messages.value[messages.value.length - 1]!
+  const requestId = createChatRequestId()
+  activeRequestId = requestId
 
   messages.value.push({ id: newMessageId(), role: 'assistant', content: '', streaming: true })
   // 必须经由数组代理拿到响应式对象：push 进去的普通对象再改属性不会触发视图更新
@@ -449,6 +492,7 @@ async function send() {
         // 普通对话不传 kb_id；undefined 在 JSON.stringify 时会被整条丢掉
         kb_id: mode === 'rag' ? kbId.value : undefined,
         question: text,
+        request_id: requestId,
         conversation_id: currentConversationId.value,
         top_k: mode === 'rag' ? topK.value : undefined,
         mode
@@ -457,6 +501,7 @@ async function send() {
         onMeta(data) {
           if (signal.aborted || disposed || controller !== myController) return
           currentConversationId.value = data.conversation_id
+          if (data.user_message_id) userMessage.id = data.user_message_id
         },
         onDelta(token) {
           if (signal.aborted || disposed || controller !== myController) return
@@ -466,6 +511,8 @@ async function send() {
         onDone(data) {
           if (signal.aborted || disposed || controller !== myController) return
           completion = data
+          if (data.message_id) assistant.id = data.message_id
+          userMessage.status = 'completed'
           assistant.streaming = false
         },
         onError(message) {
@@ -492,6 +539,7 @@ async function send() {
     flush()
 
     const aborted = signal.aborted
+    userMessage.status = completion ? 'completed' : aborted ? 'cancelled' : 'failed'
     assistant.streaming = false
     // 只收拾自己的状态：用户点停止后可能在这次 finally 之前又发了新请求，
     // 那时 streaming / controller 已经属于新请求，不能被这条旧流重置。
@@ -499,6 +547,7 @@ async function send() {
     if (isCurrent) {
       streaming.value = false
       controller = null
+      activeRequestId = null
     }
     // 先记下是否真的产出了回答：下面的兜底文案不是回答，不能给它配引用来源。
     // 否则模型报错时会同时出现「引用来源 6」和一句"抱歉，模型未返回内容"，
@@ -526,8 +575,11 @@ async function send() {
 onMounted(loadKbs)
 onBeforeUnmount(() => {
   disposed = true
+  const requestId = activeRequestId
   controller?.abort()
   controller = null
+  activeRequestId = null
+  if (requestId) void chatApi.cancelRequest(requestId).catch(() => {})
 })
 </script>
 
@@ -662,6 +714,7 @@ onBeforeUnmount(() => {
 .citation-name { overflow: hidden; max-width: 100%; color: var(--text); font-size: 12px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .citation-meta, .citation-score { color: var(--text-3); font-size: 12px; white-space: nowrap; }
 .citation-score { margin-left: auto; padding: 1px 6px; border-radius: 4px; background: var(--surface-soft); color: var(--text-3); }
+.citation-location { margin: 6px 0; color: var(--text-3); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .citation-snippet { display: -webkit-box; overflow: hidden; -webkit-line-clamp: 3; -webkit-box-orient: vertical; color: var(--text-2); font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
 .error-tip { max-width: 950px; margin: 0 auto 14px; }
 .composer { flex-shrink: 0; padding: 8px clamp(22px, 3vw, 55px) 14px; background: var(--surface); }

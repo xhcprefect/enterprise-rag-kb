@@ -3,6 +3,8 @@ import type { Citation } from '../api/index.ts'
 /** done 事件是最终引用的唯一来源；旧后端未提供时保守地不显示候选资料。 */
 export interface ChatCompletion {
   latency_ms: number
+  message_id?: string
+  replayed?: boolean
   citations?: Citation[]
 }
 

@@ -74,8 +74,17 @@ export default {
         title: '引用来源',
         untitled: '未命名文档',
         chunk: '第 {index} 段',
-        score: '相似度 {percent}%'
+        score: '相似度 {percent}%',
+        view: '查看原文'
       },
+      source: {
+        title: '引用原文', loading: '正在核验并读取原文…', unavailable: '原文已更新、不可用或无法读取，请重新检索。',
+        noPosition: '旧索引未记录页码或章节，可查看下方原文；重新索引后补充位置。',
+        version: '索引版本 {version}', previewPdf: '预览 PDF 并定位页码', truncated: '预览内容过长，已截短显示。',
+        page: '第 {index} 页', pages: '第 {start}–{end} 页', sheet: '工作表：{name}',
+        row: '表格第 {index} 行', rows: '表格第 {start}–{end} 行', line: '文本第 {index} 行', lines: '文本第 {start}–{end} 行'
+      },
+      requestStatus: { processing: '请求处理中', failed: '请求未完成', cancelled: '已停止' },
       composer: {
         aria: '输入问题',
         placeholderRag: '向知识库提问，让资料为你提供线索…',
@@ -85,6 +94,7 @@ export default {
         hintSend: '发送',
         hintNewline: '换行',
         stop: '停止',
+        stopping: '正在停止',
         send: '发送',
         disclaimerRag: '回答由 AI 生成，请结合引用来源核对关键信息。',
         disclaimerChat: '回答由 AI 生成，请核对重要信息。'
@@ -172,8 +182,17 @@ export default {
         title: 'Sources',
         untitled: 'Untitled document',
         chunk: 'Chunk {index}',
-        score: 'Relevance {percent}%'
+        score: 'Relevance {percent}%',
+        view: 'View source'
       },
+      source: {
+        title: 'Source text', loading: 'Verifying and loading source…', unavailable: 'The source has changed or is unavailable. Please search again.',
+        noPosition: 'This older index has no page or section metadata. Source text is shown below; reindex to add locations.',
+        version: 'Index version {version}', previewPdf: 'Preview PDF at the source page', truncated: 'The preview was shortened because it is too long.',
+        page: 'Page {index}', pages: 'Pages {start}–{end}', sheet: 'Sheet: {name}',
+        row: 'Table row {index}', rows: 'Table rows {start}–{end}', line: 'Text line {index}', lines: 'Text lines {start}–{end}'
+      },
+      requestStatus: { processing: 'Request in progress', failed: 'Request incomplete', cancelled: 'Stopped' },
       composer: {
         aria: 'Enter your question',
         placeholderRag: 'Ask your knowledge base and let the documents guide the answer…',
@@ -183,6 +202,7 @@ export default {
         hintSend: 'to send',
         hintNewline: 'for a new line',
         stop: 'Stop',
+        stopping: 'Stopping',
         send: 'Send',
         disclaimerRag: 'Answers are AI-generated. Verify key details against the cited sources.',
         disclaimerChat: 'Answers are AI-generated. Please verify important information.'

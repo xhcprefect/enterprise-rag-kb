@@ -2,6 +2,7 @@ import client from './client'
 import { consumeEventStream, StreamProtocolError } from '@/utils/stream'
 import { i18n } from '@/i18n'
 import type { ChatCompletion } from '@/utils/citations'
+import { createChatRequestId } from '@/utils/chatRequest'
 
 // ---------- 类型 ----------
 export interface User {
@@ -39,12 +40,26 @@ export interface DocumentItem {
   created_at: string
 }
 
-export interface Citation {
+export interface SourceLocation {
+  page_start?: number | null
+  page_end?: number | null
+  section?: string | null
+  sheet?: string | null
+  row_start?: number | null
+  row_end?: number | null
+  line_start?: number | null
+  line_end?: number | null
+}
+
+export interface Citation extends SourceLocation {
   /** 参考资料的原始编号；旧消息可能没有此字段。 */
   source_index?: number | null
+  index_version?: number | null
   document_id: string | null
   filename: string | null
   chunk_index: number | null
+  chunk_start?: number | null
+  chunk_end?: number | null
   score: number | null
   snippet: string | null
 }
@@ -52,6 +67,9 @@ export interface Citation {
 export interface MessageItem {
   id: string
   role: 'user' | 'assistant'
+  status?: 'processing' | 'completed' | 'failed' | 'cancelled'
+  turn_id?: string | null
+  reply_to_id?: string | null
   content: string
   citations: Citation[] | null
   latency_ms: number
@@ -226,7 +244,27 @@ export const uploadApi = {
 }
 
 // ---------- 文档 ----------
+export interface SourcePreview {
+  document_id: string
+  filename: string
+  file_ext: string
+  index_version: number
+  chunk_index: number
+  chunk_start: number
+  chunk_end: number
+  location: SourceLocation
+  chunks: { chunk_index: number; content: string; location: SourceLocation }[]
+  truncated: boolean
+}
+
 export const docApi = {
+  source: (kbId: string, citation: Citation) => client.get<SourcePreview>(`/knowledge-bases/${kbId}/documents/${citation.document_id}/source`, {
+    params: { chunk_index: citation.chunk_index, index_version: citation.index_version ?? 0,
+      chunk_start: citation.chunk_start, chunk_end: citation.chunk_end }
+  }),
+  pdf: (kbId: string, docId: string, indexVersion: number) => client.get<Blob>(`/knowledge-bases/${kbId}/documents/${docId}/pdf`, {
+    params: { index_version: indexVersion }, responseType: 'blob'
+  }),
   get: (kbId: string, docId: string) => client.get<DocumentItem>(`/knowledge-bases/${kbId}/documents/${docId}`),
   list: (kbId: string, params: { page?: number; page_size?: number; status?: string }) =>
     client.get<PageResult<DocumentItem>>(`/knowledge-bases/${kbId}/documents`, { params }),
@@ -240,6 +278,11 @@ export const docApi = {
 
 // ---------- 问答 ----------
 export const chatApi = {
+  cancelRequest: (requestId: string) => client.post(`/chat/requests/${requestId}/cancel`, undefined, {
+    // 停止可能早于服务端认领，404 交给断连清理兜底，无需重复弹错。
+    timeout: 5000,
+    validateStatus: status => status === 404 || (status >= 200 && status < 300)
+  }),
   /** kbId 与 mode 都可选：普通对话只传 mode，RAG 两个都传。 */
   conversations: (params?: { kbId?: string; mode?: ChatMode }) =>
     client.get<Conversation[]>('/chat/conversations', {
@@ -257,13 +300,14 @@ export async function streamChat(
     /** 普通对话不传 */
     kb_id?: string
     question: string
+    request_id?: string
     conversation_id?: string | null
     top_k?: number
     /** 只在新建会话时生效，续聊以会话已存的模式为准 */
     mode?: ChatMode
   },
   handlers: {
-    onMeta?: (data: { conversation_id: string; citations: Citation[]; mode?: ChatMode }) => void
+    onMeta?: (data: { conversation_id: string; request_id?: string; user_message_id?: string; citations: Citation[]; mode?: ChatMode }) => void
     onDelta?: (text: string) => void
     onDone?: (data: ChatCompletion) => void
     onError?: (message: string) => void
@@ -279,7 +323,7 @@ export async function streamChat(
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {})
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, request_id: payload.request_id ?? createChatRequestId() }),
       signal
     })
   } catch (error) {
