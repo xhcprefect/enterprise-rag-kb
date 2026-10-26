@@ -542,7 +542,10 @@ onBeforeUnmount(() => {
 .field-label { display: block; margin-bottom: 9px; color: var(--text-3); font-size: 12px; font-weight: 500; letter-spacing: .03em; }
 .mode-switch { display: flex; width: 100%; margin-bottom: 21px; padding: 4px; border: 1px solid var(--line); border-radius: 9px; background: var(--brand-soft); }
 .mode-switch :deep(.el-radio-button) { flex: 1; min-width: 0; }
-.mode-switch :deep(.el-radio-button__inner) { width: 100%; padding: 9px 0; border: 0 !important; border-radius: 6px !important; background: transparent; color: var(--text-3); box-shadow: none !important; font-size: 12px; line-height: 1.35; white-space: normal; }
+.mode-switch :deep(.el-radio-button__inner) { width: 100%; padding: 9px 0; border: 0 !important; border-radius: 0 !important; background: transparent; color: var(--text-3); box-shadow: none !important; font-size: 12px; line-height: 1.35; white-space: normal; }
+/* 分段控件：只保留整组外侧的圆角，相邻按钮之间的接缝必须是直角。 */
+.mode-switch :deep(.el-radio-button:first-child .el-radio-button__inner) { border-radius: 6px 0 0 6px !important; }
+.mode-switch :deep(.el-radio-button:last-child .el-radio-button__inner) { border-radius: 0 6px 6px 0 !important; }
 .mode-switch :deep(.el-radio-button.is-active .el-radio-button__inner) { color: var(--brand-dark); background: var(--surface); box-shadow: var(--shadow-sm) !important; font-weight: 550; }
 .mode-switch :deep(.el-radio-button.is-disabled .el-radio-button__inner) { color: var(--placeholder); cursor: not-allowed; }
 .kb-select { width: 100%; }
