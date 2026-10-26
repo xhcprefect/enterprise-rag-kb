@@ -9,13 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-TEST_URL = os.environ.get("TEST_DATABASE_URL", "")
-if TEST_URL:
-    from sqlalchemy.engine import make_url
-    if not (make_url(TEST_URL).database or "").endswith("_test"):
-        raise RuntimeError("TEST_DATABASE_URL 必须指向以 _test 结尾的专用数据库")
-    os.environ["DATABASE_URL"] = TEST_URL
-    os.environ["JWT_SECRET"] = "regression-tests-only-not-for-production"
+from tests._env import TEST_URL
 
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials
@@ -27,7 +21,35 @@ from app.api.v1 import auth, chat, knowledge, users
 from app.core.config import settings
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.init_db import init_db
-from app.db.session import SessionLocal, engine
+from app.db import session as db_session
+
+
+def _bind_test_engine() -> None:
+    """把应用 engine 重绑到专用测试库。
+
+    `app.db.session` 在导入时就按当时的 DATABASE_URL 建好 engine，而
+    `unittest discover` 按文件名导入测试模块，任何排在 `test_database` 之前、
+    又导入了 `app.*` 的模块都会让 engine 先绑定到开发库。这里显式重建，
+    使结果与导入顺序无关；未提供 TEST_DATABASE_URL 时保持原样。
+    """
+    if not TEST_URL:
+        return
+    from sqlalchemy import create_engine
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.orm import sessionmaker
+
+    target = make_url(TEST_URL)
+    if db_session.engine.url == target:
+        return
+    db_session.engine.dispose()
+    db_session.engine = create_engine(
+        TEST_URL, pool_pre_ping=True, pool_size=10, max_overflow=20, pool_recycle=1800
+    )
+    db_session.SessionLocal.configure(bind=db_session.engine)
+
+
+_bind_test_engine()
+SessionLocal, engine = db_session.SessionLocal, db_session.engine
 from app.models import Conversation, Document, DocumentChunk, KnowledgeBase, UploadSession, User
 from app.schemas.auth import LoginRequest
 from app.schemas.chat import ChatRequest
