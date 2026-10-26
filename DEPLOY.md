@@ -28,7 +28,7 @@
 共享卷：${DATA_DIR}/uploads（api 与 worker 必须共用）、${DATA_DIR}/logs、${DATA_DIR}/pgdata
 ```
 
-**外部依赖**：向量化与对话都走云端 API（硅基流动 + sheapi.top），服务器本身不做推理，
+**外部依赖**：向量化与对话都走云端 API（硅基流动 + DeepSeek 官方），服务器本身不做推理，
 所以不需要 GPU。
 
 ## 首次部署

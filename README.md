@@ -1,8 +1,8 @@
 # 企业知识库问答系统（RAG）
 
 基于 **FastAPI + LangChain + pgvector** 的企业级检索增强生成（RAG）知识库问答平台，
-前端使用 **Vue 3 + Pinia + Vite + Element Plus**。模型服务商可在**硅基流动云端**
-与 **Ollama 本地**之间自由切换（向量与对话可分别配置）。
+前端使用 **Vue 3 + Pinia + Vite + Element Plus**。模型服务商可在 **OpenAI 兼容云端服务**
+（如硅基流动、DeepSeek）与 **Ollama 本地**之间切换，向量与对话可分别配置。
 
 > 最新的安全修复、数据库兼容升级、测试与备份维护说明见 [OPTIMIZATION.md](OPTIMIZATION.md)。
 
@@ -14,7 +14,7 @@
 | 编排框架 | LangChain |
 | 向量数据库 | PostgreSQL 18 + pgvector 0.8 |
 | 向量模型 | bge-m3（1024 维）— 硅基流动云端 / Ollama 本地 |
-| 对话模型 | deepseek-v4.1-flash（sheapi.top） / qwen3.5:0.8b（Ollama 本地） |
+| 对话模型 | deepseek-flash（DeepSeek 官方） / qwen3.5:0.8b（Ollama 本地） |
 | 认证 | JWT（HS256）+ bcrypt 密码哈希 |
 | 前端 | Vue 3 + TypeScript + Pinia + Vite + Element Plus + Vue I18n |
 
@@ -78,7 +78,7 @@ enterprise-rag-kb/
 
 1. **Docker**：pgvector 容器运行中（本例映射到宿主 `9999` 端口）
 2. **模型服务**（云端 / 本地，可按需混用）：
-   - **云端**（默认）：向量走硅基流动、对话走 sheapi.top，两处 API Key 分别填到 `.env` 的
+   - **云端**（默认）：向量走硅基流动、对话走 DeepSeek 官方，两处 API Key 分别填到 `.env` 的
      `EMBEDDING_API_KEY` 与 `LLM_API_KEY`。无需本地 GPU，`BAAI/bge-m3` 向量模型当前免费。
    - **Ollama 本地**：安装后拉取模型，并把 `EMBEDDING_PROVIDER` / `LLM_PROVIDER` 改成 `ollama`
      ```bash
@@ -157,16 +157,31 @@ npm run dev
 | `EMBEDDING_API_KEY` | 向量服务 Key，**不要提交** | 空 |
 | `EMBEDDING_TIMEOUT` | 向量请求超时（秒） | 120 |
 | `EMBEDDING_BATCH_SIZE` | 单次向量化请求的文本条数 | 16 |
-| `LLM_BASE_URL` | 对话服务地址（OpenAI 兼容） | `https://www.sheapi.top/v1` |
+| `LLM_BASE_URL` | 对话服务地址（OpenAI 兼容） | `https://api.deepseek.com` |
 | `LLM_API_KEY` | 对话服务 Key，**不要提交** | 空 |
 | `LLM_TIMEOUT` | 对话请求超时（秒） | 180 |
+| `LLM_REASONING_EFFORT` | DeepSeek 设为 `none` 关闭思考；不支持该参数的服务留空 | `none`（示例配置） |
 | `OLLAMA_BASE_URL` | Ollama 服务地址 | `http://localhost:11434` |
 | `EMBEDDING_MODEL` | 向量模型 | `BAAI/bge-m3` |
-| `LLM_MODEL` | 对话模型 | `deepseek-v4.1-flash` |
+| `LLM_MODEL` | 对话模型 | `deepseek-flash` |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | 文本切分粒度 | 800 / 120 |
 | `RETRIEVAL_TOP_K` | 默认检索条数 | 6 |
 | `RETRIEVAL_MAX_PER_DOC` | 单份文档最多占几条检索结果 | 3 |
 | `MAX_UPLOAD_MB` | 单文件大小上限 | 50 |
+
+### DeepSeek 关闭思考模式
+
+示例配置使用 DeepSeek 官方 `https://api.deepseek.com`、`deepseek-flash` 模型，并设置
+`LLM_REASONING_EFFORT=none`。该值作为 Chat Completions 的 `reasoning_effort` 发送，
+按照[官方接口说明](https://api-docs.deepseek.com/api/create-chat-completion)关闭模型端思考，
+而非仅在界面隐藏思考内容。知识库问答、普通对话、非流式调用和追问补全共用这一配置。
+
+- 配置留空时不发送此字段；切换到不支持该参数的其他兼容服务时应留空。
+- `low` / `high` / `max` 会开启思考，不能用来关闭；拼写错误会在后端启动时被配置校验拦截。
+- 修改后需重启 API。Compose 部署需重建容器才能载入 `.env` 的变化；代码也有变化时需重新构建后端镜像。
+- 可在 `backend` 目录运行 `.\.venv\Scripts\python.exe -m scripts._probe_llm --live` 做单次核验。
+  此命令仅发送固定公开合成文本，最多生成 64 token，可能产生少量费用；
+  只报告响应长度、用量和耗时，不输出密钥、正文或思考内容。`reasoning_tokens=null` 表示服务未报告该字段，不能解读为零。
 
 ## 接口返回规范
 

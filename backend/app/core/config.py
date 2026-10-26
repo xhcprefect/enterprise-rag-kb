@@ -2,7 +2,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -54,10 +54,13 @@ class Settings(BaseSettings):
     EMBEDDING_TIMEOUT: int = 120        # 单次请求超时（秒）；大文档向量化会变长
     EMBEDDING_BATCH_SIZE: int = 16      # 单次请求最多的文本条数
 
-    LLM_BASE_URL: str = "https://www.sheapi.top/v1"
+    LLM_BASE_URL: str = "https://api.deepseek.com"
     LLM_API_KEY: str = ""
     LLM_TIMEOUT: int = 180              # 长回答 + 思考模型可能较慢，留足余量
     LLM_STREAM_INCLUDE_USAGE: bool = False  # 仅在服务支持 stream_options 时打开
+    # DeepSeek 官方 Chat Completions 的 none 会关闭思考，low/high/max 会开启思考。
+    # 默认留空、不发送该字段，兼容不支持 reasoning_effort 的其他服务；别名取决于服务商。
+    LLM_REASONING_EFFORT: Literal["", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] = ""
 
     # 模型名（当前生效的那个；切换服务商时同步改这里）
     EMBEDDING_MODEL: str = "bge-m3:latest"
@@ -115,6 +118,11 @@ class Settings(BaseSettings):
     LOG_MAX_BYTES: int = 10 * 1024 * 1024   # 单文件 10MB
     LOG_BACKUP_COUNT: int = 5               # 保留 5 份历史
     LOG_SLOW_REQUEST_MS: int = 3000         # 超过该耗时的请求按 WARNING 记录
+
+    @field_validator("LLM_REASONING_EFFORT", mode="before")
+    @classmethod
+    def normalize_reasoning_effort(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
 
     @model_validator(mode="after")
     def validate_runtime(self):

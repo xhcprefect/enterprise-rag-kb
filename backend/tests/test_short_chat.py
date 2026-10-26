@@ -44,18 +44,44 @@ class ShortChatTests(unittest.TestCase):
         self.assertIs(payload["enable_thinking"], False)
         self.assertEqual([item["role"] for item in payload["messages"]], ["system", "user"])
 
+    def test_deepseek_followup_uses_disabled_reasoning_and_ignores_reasoning_frames(self):
+        def handle(request):
+            self.requests.append(request)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=(
+                'data: {"choices":[{"delta":{"reasoning_content":"不应进入检索问题"}}]}\n\n'
+                'data: {"choices":[{"delta":{"content":"补全结果"}}]}\n\n'
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            ))
+        with patch.object(settings, "LLM_PROVIDER", "cloud"), patch.object(settings, "LLM_MODEL", "deepseek-flash"), \
+             patch.object(settings, "LLM_BASE_URL", "https://api.deepseek.com"), \
+             patch.object(settings, "LLM_API_KEY", "test-only-key"), patch.object(settings, "LLM_REASONING_EFFORT", "none"), \
+             patch.object(httpx, "AsyncClient", side_effect=self.client(handle)), patch.object(cloud_models, "_post") as normal_request:
+            self.assertEqual(cloud_models.complete_short_chat(self.messages, timeout=1, max_tokens=64), "补全结果")
+        normal_request.assert_not_called()
+        self.assertEqual(len(self.requests), 1)
+        payload = json.loads(self.requests[0].content)
+        self.assertEqual(str(self.requests[0].url), "https://api.deepseek.com/chat/completions")
+        self.assertEqual(payload["model"], "deepseek-flash")
+        self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertEqual(payload["max_tokens"], 64)
+        self.assertEqual(payload["temperature"], 0)
+        self.assertIs(payload["stream"], True)
+        self.assertNotIn("enable_thinking", payload)
+
     def test_ollama_uses_same_context_window_without_cloud_auth(self):
         def handle(request):
             self.requests.append(request)
             return httpx.Response(200, json={"message": {"content": "本地补全结果"}})
         with patch.object(settings, "LLM_PROVIDER", "ollama"), patch.object(settings, "OLLAMA_BASE_URL", "http://localhost:11434/"), \
-             patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 8192), patch.object(httpx, "AsyncClient", side_effect=self.client(handle)):
+             patch.object(settings, "LLM_REASONING_EFFORT", "none"), patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 8192), \
+             patch.object(httpx, "AsyncClient", side_effect=self.client(handle)):
             self.assertEqual(cloud_models.complete_short_chat(self.messages, timeout=1, max_tokens=48), "本地补全结果")
         request = self.requests[0]
         self.assertEqual(str(request.url), "http://localhost:11434/api/chat")
         self.assertNotIn("Authorization", request.headers)
         payload = json.loads(request.content)
         self.assertIs(payload["think"], False)
+        self.assertNotIn("reasoning_effort", payload)
         self.assertEqual(payload["options"], {"temperature": 0, "num_predict": 48, "num_ctx": 8192})
 
     def test_error_statuses_are_not_retried(self):

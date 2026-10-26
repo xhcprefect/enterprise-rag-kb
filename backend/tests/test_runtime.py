@@ -1,4 +1,5 @@
 """部署配置和问答准入限制。"""
+import os
 import unittest
 from unittest.mock import patch
 
@@ -28,6 +29,21 @@ class RuntimeTests(unittest.TestCase):
                 Settings(_env_file=None, **overrides)
         no_history = Settings(_env_file=None, HISTORY_MAX_TURNS=0, HISTORY_MAX_CHARS=0)
         self.assertEqual(no_history.HISTORY_MAX_TURNS, 0)
+
+    def test_reasoning_effort_accepts_supported_modes_and_normalizes_env_values(self):
+        for mode in ("", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+            with self.subTest(mode=mode):
+                config = Settings(_env_file=None, LLM_REASONING_EFFORT=mode)
+                self.assertEqual(config.LLM_REASONING_EFFORT, mode)
+        for value, expected in [(" NONE ", "none"), (" High ", "high"), ("   ", "")]:
+            with self.subTest(value=value), patch.dict(os.environ, {"LLM_REASONING_EFFORT": value}):
+                self.assertEqual(Settings(_env_file=None).LLM_REASONING_EFFORT, expected)
+
+    def test_invalid_reasoning_effort_fails_at_startup_without_disclosing_keys(self):
+        with self.assertRaises(ValidationError) as error:
+            Settings(_env_file=None, LLM_REASONING_EFFORT="disabled", LLM_API_KEY="never-print-this-key")
+        self.assertIn("LLM_REASONING_EFFORT", str(error.exception))
+        self.assertNotIn("never-print-this-key", str(error.exception))
 
     def test_admission_rejects_overload_and_releases_after_error(self):
         limiter = ChatAdmission()

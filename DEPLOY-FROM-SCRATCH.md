@@ -17,7 +17,7 @@
 | 云账号 | 已完成实名认证 | 必需 |
 | 本地终端 | Xshell / PuTTY / Windows Terminal（`ssh` 命令） | 必需 |
 | 向量模型 Key | 硅基流动 <https://cloud.siliconflow.cn/account/ak>，`BAAI/bge-m3` 当前免费 | 必需 |
-| 对话模型 Key | 任意 OpenAI 兼容服务（本项目默认 sheapi.top） | 必需 |
+| 对话模型 Key | 任意 OpenAI 兼容服务（本项目默认 DeepSeek 官方） | 必需 |
 | 域名 | 想用 HTTPS / 好记的地址时需要 | 可选 |
 | 备案 | 中国大陆地域用域名访问 80 端口**必须**先备案 | 条件必需 |
 
@@ -512,7 +512,7 @@ curl -s http://localhost/health
 {
   "status": "ok",
   "app": "Enterprise RAG Knowledge Base",
-  "llm": "deepseek-v4.1-flash",
+  "llm": "deepseek-flash",
   "llm_provider": "cloud",
   "embedding": "BAAI/bge-m3",
   "embedding_provider": "cloud",

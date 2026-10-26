@@ -1,4 +1,4 @@
-"""OpenAI 兼容协议（硅基流动、sheapi.top 等）的向量与对话适配器。
+"""OpenAI 兼容协议（DeepSeek、硅基流动等）的向量与对话适配器。
 
 为什么不直接用 ``langchain_openai``：项目约定不新增第三方依赖，而这类服务的
 ``/embeddings`` 与 ``/chat/completions`` 都是 OpenAI 协议，用已在依赖里的
@@ -249,14 +249,17 @@ class OpenAICompatibleChat:
             "stream": stream,
             "max_tokens": settings.LLM_MAX_OUTPUT_TOKENS,
         }
-        # 与本地 ChatOllama(reasoning=False) 对齐：Qwen3 系列不进入思考模式。
-        # 思考模式会先吐 reasoning_content，长上下文下能拖到几十秒才出正文。
-        # 只对 Qwen3 发送：其他模型（DeepSeek、Qwen2.5 等）不认识这个参数，
-        # 部分网关会直接 400，所以按模型名判断而不是无条件带上。
         if stream and settings.LLM_STREAM_INCLUDE_USAGE:
             payload["stream_options"] = {"include_usage": True}
+        # Qwen3 的开关与 DeepSeek 不同，不能把 enable_thinking 发给所有模型。
         if "qwen3" in self.model.lower():
             payload["enable_thinking"] = False
+        # DeepSeek Chat Completions 支持 reasoning_effort=none，真正停止模型端思考，
+        # 而非仅丢弃 reasoning_content。invoke、主问答和追问补全共用该请求构造。
+        # 其他 OpenAI 兼容服务未必支持此字段；配置留空时保持原请求不变。
+        # https://api-docs.deepseek.com/api/create-chat-completion
+        if settings.LLM_REASONING_EFFORT:
+            payload["reasoning_effort"] = settings.LLM_REASONING_EFFORT
         return payload
 
     def invoke(self, messages: list[BaseMessage]) -> AIMessageChunk:
