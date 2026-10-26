@@ -71,6 +71,8 @@ import AppearanceControls from '@/components/AppearanceControls.vue'
 import { formatDateTime } from '@/i18n/format'
 import { useUserStore } from '@/stores/user'
 import { useResponsiveDrawer } from '@/composables/useResponsiveDrawer'
+import { getNavigationItems } from '@/router/access'
+import { workspaceRoute } from '@/router/routes'
 
 const route = useRoute()
 const router = useRouter()
@@ -81,18 +83,9 @@ const { isNarrow, isOpen: mobileNavOpen, panelRef: navPanelRef, close: closeNav,
 const displayName = computed(() => userStore.profile?.display_name || userStore.profile?.username || t('common.user'))
 const today = computed(() => formatDateTime(new Date(), { month: 'long', day: 'numeric', weekday: 'short' }))
 const currentTitle = computed(() => t(typeof route.meta.titleKey === 'string' ? route.meta.titleKey : 'nav.chat'))
-const activeMenu = computed(() => route.name === 'documents' ? '/knowledge' : route.name === 'profile' ? '' : route.path)
-const menus = computed(() => {
-  const items = [
-    { path: '/chat', title: t('nav.chat'), icon: 'ChatDotRound' },
-    { path: '/knowledge', title: t('nav.knowledge'), icon: 'Files' }
-  ]
-  if (userStore.isAdmin) items.push(
-    { path: '/users', title: t('nav.users'), icon: 'UserFilled' },
-    { path: '/audit', title: t('nav.audit'), icon: 'Tickets' }
-  )
-  return items
-})
+const activeMenu = computed(() => route.meta.activeMenu ?? route.path)
+const menus = computed(() => getNavigationItems(workspaceRoute, userStore.profile?.role)
+  .map(item => ({ ...item, title: t(item.titleKey) })))
 watch(() => route.fullPath, closeNav)
 async function onCommand(command: string) {
   if (command === 'profile') { router.push('/profile'); return }

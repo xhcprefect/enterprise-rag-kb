@@ -57,6 +57,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import AppearanceControls from '@/components/AppearanceControls.vue'
 import { useUserStore } from '@/stores/user'
+import { getLoginRedirect } from '@/router/guards'
 
 const router = useRouter()
 const route = useRoute()
@@ -79,8 +80,7 @@ async function onSubmit() {
     if (!valid) return
     await userStore.login(form.username, form.password)
     ElMessage.success(t('login.success'))
-    const redirect = (route.query.redirect as string) || '/chat'
-    router.push(redirect)
+    await router.replace(getLoginRedirect(route.query.redirect))
   } catch {
     /* 错误提示由拦截器统一处理。 */
   } finally { loading.value = false }

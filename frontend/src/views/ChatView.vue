@@ -30,7 +30,7 @@
           <button class="conv-del" type="button" :disabled="streaming" :aria-label="t('chat.recent.deleteAria', { title: conv.title })" @click="removeConversation(conv.id)"><el-icon :size="14"><Delete /></el-icon></button>
         </div>
         <div v-if="!conversations.length" class="conv-empty"><el-icon :size="25"><ChatLineRound /></el-icon><span>{{ t('chat.recent.empty') }}</span><small>{{ t('chat.recent.emptyHint') }}</small></div>
-      </div>
+        </div>
       <div class="sidebar-note"><el-icon><InfoFilled /></el-icon><span>{{ t('chat.sidebar.note') }}</span></div>
     </aside>
 
@@ -78,10 +78,10 @@
               <div v-if="msg.citations?.length" class="citations">
                 <el-collapse><el-collapse-item>
                   <template #title><span class="citation-title"><el-icon><DocumentCopy /></el-icon>{{ t('chat.citations.title') }}<span class="citation-count">{{ formatNumber(msg.citations.length) }}</span></span></template>
-                  <div v-for="(c, i) in msg.citations" :key="i" class="citation-item">
+                    <div v-for="(c, i) in msg.citations" :key="i" class="citation-item">
                     <div class="citation-head"><span class="citation-index">{{ formatNumber(i + 1) }}</span><span class="citation-name" :title="c.filename || t('chat.citations.untitled')">{{ c.filename || t('chat.citations.untitled') }}</span><span v-if="c.chunk_index !== null" class="citation-meta">{{ t('chat.citations.chunk', { index: formatNumber(c.chunk_index! + 1) }) }}</span><span v-if="c.score !== null" class="citation-score">{{ t('chat.citations.score', { percent: formatNumber(Math.round(c.score! * 100)) }) }}</span></div>
-                    <div class="citation-snippet">{{ c.snippet }}</div>
-                  </div>
+                      <div class="citation-snippet">{{ c.snippet }}</div>
+                    </div>
                 </el-collapse-item></el-collapse>
               </div>
             </div>
@@ -98,8 +98,8 @@
               <span class="input-hint"><kbd>Enter</kbd> {{ t('chat.composer.hintSend') }} · <kbd>Shift + Enter</kbd> {{ t('chat.composer.hintNewline') }}</span>
               <el-button v-if="streaming" class="composer-btn" type="danger" plain @click="stopStreaming"><el-icon><VideoPause /></el-icon>{{ t('chat.composer.stop') }}</el-button>
               <el-button v-else class="composer-btn" type="primary" :disabled="!question.trim()" @click="send">{{ t('chat.composer.send') }}<el-icon class="send-icon"><Promotion /></el-icon></el-button>
+              </div>
             </div>
-          </div>
           <p class="composer-disclaimer">{{ chatMode === 'rag' ? t('chat.composer.disclaimerRag') : t('chat.composer.disclaimerChat') }}</p>
         </div>
       </template>
@@ -114,6 +114,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js/lib/common'
+import 'highlight.js/styles/github.css'
 import { useResponsiveDrawer } from '@/composables/useResponsiveDrawer'
 import { formatNumber } from '@/i18n/format'
 import {

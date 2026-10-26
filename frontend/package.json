@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit --incremental false && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test tests/stream.test.ts tests/upload.test.ts tests/preferences.test.ts tests/i18n.test.ts",
+    "test": "node --experimental-strip-types --test tests/stream.test.ts tests/upload.test.ts tests/preferences.test.ts tests/i18n.test.ts tests/router.test.ts tests/build.test.ts",
     "typecheck": "vue-tsc --noEmit --incremental false"
   },
   "dependencies": {
@@ -27,6 +27,7 @@
     "@types/node": "^26.6.5",
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "~5.6.3",
+    "unplugin-vue-components": "^32.1.0",
     "vite": "^6.0.5",
     "vue-tsc": "^2.1.10"
   }

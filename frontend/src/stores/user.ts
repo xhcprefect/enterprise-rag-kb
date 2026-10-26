@@ -11,14 +11,22 @@ export const useUserStore = defineStore('user', () => {
 
   async function login(username: string, password: string) {
     const { data } = await authApi.login(username, password)
+    profile.value = null
     token.value = data.access_token
     localStorage.setItem('rag_token', data.access_token)
-    await fetchProfile()
+    try {
+      await fetchProfile()
+    } catch (error) {
+      await logout(false)
+      throw error
+    }
   }
 
   async function fetchProfile() {
+    const requestedToken = token.value
     const { data } = await authApi.me()
-    profile.value = data
+    // 切换账号或退出后，旧请求的响应不能覆盖当前用户身份。
+    if (token.value === requestedToken) profile.value = data
     return data
   }
 

@@ -1,6 +1,5 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
-import ElementPlus from 'element-plus'
 import { i18n } from './i18n'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ChatDotRound, ChatLineRound, CircleCheck,
@@ -9,12 +8,14 @@ import {
   Promotion, Reading, Refresh, Search, SwitchButton, Tickets, Unlock, Upload,
   UploadFilled, User, UserFilled, VideoPause
 } from '@element-plus/icons-vue'
-import 'element-plus/dist/index.css'
+// 先加载基础变量和命令式弹层样式，再由 main.css 覆盖品牌与深浅主题变量。
+import 'element-plus/theme-chalk/base.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
-import 'highlight.js/styles/github.css'
+import 'element-plus/es/components/message/style/css'
+import 'element-plus/es/components/message-box/style/css'
 
 import App from './App.vue'
-import router from './router'
+import router, { setupRouterGuards } from './router'
 import './styles/main.css'
 
 const app = createApp(App)
@@ -32,6 +33,6 @@ for (const [key, component] of Object.entries(icons)) {
 
 app.use(createPinia())
 app.use(i18n)
-app.use(ElementPlus)
+setupRouterGuards()
 app.use(router)
 app.mount('#app')
