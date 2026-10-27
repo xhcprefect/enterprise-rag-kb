@@ -167,21 +167,25 @@
       </div>
     </div>
 
-    <table :id="tableId" class="visually-hidden">
-      <caption>{{ title }}</caption>
-      <thead>
-        <tr>
-          <th scope="col">{{ periodLabel }}</th>
-          <th v-for="item in series" :key="`th-${item.key}`" scope="col">{{ item.label }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="(label, index) in labels" :key="`tr-${label}-${index}`">
-          <th scope="row">{{ label }}</th>
-          <td v-for="item in series" :key="`td-${item.key}-${index}`">{{ cellText(item, index) }}</td>
-        </tr>
-      </tbody>
-    </table>
+    <!-- 必须由块级容器裁剪：display:table 会忽略 height:1px，表格整体溢出到视口，
+         把文档撑出多余的滚动条。 -->
+    <div :id="tableId" class="visually-hidden">
+      <table>
+        <caption>{{ title }}</caption>
+        <thead>
+          <tr>
+            <th scope="col">{{ periodLabel }}</th>
+            <th v-for="item in series" :key="`th-${item.key}`" scope="col">{{ item.label }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="(label, index) in labels" :key="`tr-${label}-${index}`">
+            <th scope="row">{{ label }}</th>
+            <td v-for="item in series" :key="`td-${item.key}-${index}`">{{ cellText(item, index) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </figure>
 </template>
 
@@ -692,6 +696,8 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+/* 只用于读屏；必须是块级元素，display:table 会忽略 height:1px 并溢出到初始包含块，
+   把文档撑出第二条滚动条。 */
 .visually-hidden {
   position: absolute !important;
   width: 1px;
