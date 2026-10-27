@@ -16,7 +16,7 @@ from app.db.session import SessionLocal, get_db
 from app.models import CONVERSATION_MODE_CHAT, CONVERSATION_MODE_RAG, ChatTurn, Conversation, KnowledgeBase, Message, User
 from app.schemas.chat import (
     Citation, ChatMode, ChatRequest, ConversationDetail, ConversationRead,
-    DocumentScopeState, DocumentScopeUpdate,
+    DocumentScopeState, DocumentScopeUpdate, RetrievalConfig,
 )
 from app.schemas.common import ApiResponse
 from app.services import chat_turns, document_scopes, followup, rag, usage_tracking
@@ -42,6 +42,13 @@ def _get_kb(db: DBSession, kb_id: uuid.UUID, user: User) -> KnowledgeBase:
     if not user.is_admin and not kb.is_public and kb.owner_id != user.id:
         raise HTTPException(status_code=403, detail="无权访问该知识库")
     return kb
+
+
+@router.get("/retrieval-config", response_model=ApiResponse[RetrievalConfig], summary="检索参数默认值")
+def get_retrieval_config(user: User = Depends(get_current_user)):
+    # 只暴露前端需要的那一个值：滑块的初值必须和服务端的回退值一致，
+    # 否则界面显示的条数与调用方省略 top_k 时的实际检索条数会对不上。
+    return ApiResponse(data=RetrievalConfig(top_k=settings.RETRIEVAL_TOP_K))
 
 
 @router.get("/conversations", response_model=ApiResponse[list[ConversationRead]], summary="我的会话列表")
@@ -158,6 +165,8 @@ def _retrieve_plan(collection, plan, top_k, active_scope, *, reset_scope=False):
 def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     if payload.include_trace and not user.is_admin:
         raise HTTPException(403, "检索评测明细仅管理员可读取")
+    # 调用方未指定时回落到服务端默认；否则 RETRIEVAL_TOP_K 只是摆设。
+    top_k = settings.RETRIEVAL_TOP_K if payload.top_k is None else payload.top_k
     # 续聊始终以会话已存的模式、知识库为准；新建与用户消息由认领事务原子保存。
     if payload.conversation_id:
         conv = _get_conversation(db, payload.conversation_id, user)
@@ -178,7 +187,7 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
 
     reservation = chat_turns.claim_turn(
         db, user_id=user.id, conversation_id=payload.conversation_id, kb_id=kb.id if kb else None,
-        mode=mode, question=payload.question, top_k=payload.top_k, request_id=payload.request_id,
+        mode=mode, question=payload.question, top_k=top_k, request_id=payload.request_id,
         document_ids=payload.document_ids, scope_revision=payload.scope_revision,
         reset_scope=mode == CONVERSATION_MODE_RAG and followup.is_topic_switch(payload.question),
     )
@@ -272,7 +281,7 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                         t = time.perf_counter()
                         with usage_tracking.usage_scope(usage_context.for_operation("query_embedding")):
                             docs, plan, scope_update = _retrieve_plan(
-                                collection, plan, payload.top_k, reservation.document_scope,
+                                collection, plan, top_k, reservation.document_scope,
                                 reset_scope=followup.is_topic_switch(question),
                             )
                         retrieve_ms = (time.perf_counter() - t) * 1000

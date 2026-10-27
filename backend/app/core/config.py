@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     # RAG
     CHUNK_SIZE: int = 800
     CHUNK_OVERLAP: int = 120
-    RETRIEVAL_TOP_K: int = 6
+    RETRIEVAL_TOP_K: int = Field(default=6, ge=1, le=20)
     # 默认不改变现有召回阈值；在固定问题集评测后再按需提高。
     RETRIEVAL_MIN_SIMILARITY: float = Field(default=0.0, ge=0.0, le=1.0)
     # 单份文档最多占几条检索结果：长文档的分块彼此相似，不封顶会挤掉其他资料来源

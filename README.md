@@ -167,7 +167,7 @@ npm run dev
 | `EMBEDDING_MODEL` | 向量模型 | `BAAI/bge-m3` |
 | `LLM_MODEL` | 对话模型 | `deepseek-flash` |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | 文本切分粒度 | 800 / 120 |
-| `RETRIEVAL_TOP_K` | 默认检索条数 | 6 |
+| `RETRIEVAL_TOP_K` | 默认检索条数（问答页滑块初值；调用方未显式指定时生效） | 6 |
 | `RETRIEVAL_MAX_PER_DOC` | 单份文档最多占几条检索结果 | 3 |
 | `MAX_UPLOAD_MB` | 单文件大小上限 | 50 |
 

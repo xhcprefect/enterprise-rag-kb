@@ -14,12 +14,18 @@ class ChatRequest(BaseModel):
     conversation_id: uuid.UUID | None = None
     request_id: uuid.UUID | None = None
     include_trace: bool = False
-    top_k: int = Field(default=6, ge=1, le=20)
+    # 省略时用服务端 RETRIEVAL_TOP_K；显式传入仍以调用方为准（前端滑块）。
+    top_k: int | None = Field(default=None, ge=1, le=20)
     # 仅在新建会话时生效；续聊以会话里已存的模式为准
     mode: ChatMode = "rag"
     # 仅新会话接受草稿范围；已有会话通过带版本校验的 PATCH 更新。
     document_ids: list[uuid.UUID] | None = Field(default=None, max_length=5)
     scope_revision: int | None = Field(default=None, ge=0, strict=True)
+
+
+class RetrievalConfig(BaseModel):
+    # 问答页滑块的初值。与 RETRIEVAL_TOP_K 同源，避免前后端各硬编码一个数字。
+    top_k: int = Field(ge=1, le=20)
 
 
 class DocumentScopeItem(BaseModel):

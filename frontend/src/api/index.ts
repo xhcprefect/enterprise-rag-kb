@@ -307,6 +307,8 @@ export const chatApi = {
     timeout: 5000,
     validateStatus: status => status === 404 || (status >= 200 && status < 300)
   }),
+  /** 检索条数滑块的初值：与后端 RETRIEVAL_TOP_K 同源，避免两处各硬编码一个数字。 */
+  retrievalConfig: () => client.get<{ top_k: number }>('/chat/retrieval-config'),
   /** kbId 与 mode 都可选：普通对话只传 mode，RAG 两个都传。 */
   conversations: (params?: { kbId?: string; mode?: ChatMode }) =>
     client.get<Conversation[]>('/chat/conversations', {

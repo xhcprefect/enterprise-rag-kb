@@ -165,6 +165,7 @@ import { useResponsiveDrawer } from '@/composables/useResponsiveDrawer'
 import { formatNumber } from '@/i18n/format'
 import { getCompletedCitations, type ChatCompletion } from '@/utils/citations'
 import { createChatRequestId } from '@/utils/chatRequest'
+import { resolveTopK } from '@/utils/retrievalTopK'
 import {
   MAX_SCOPE_DOCUMENTS,
   applyScopeUpdate,
@@ -271,6 +272,8 @@ const conversations = ref<Conversation[]>([])
 const currentConversationId = ref<string | null>(null)
 const messages = ref<ChatMessage[]>([])
 const question = ref('')
+/** 滑块初值来自服务端 RETRIEVAL_TOP_K；取不到时为 null，此时退回显式发送滑块值。 */
+const defaultTopK = ref<number | null>(null)
 const topK = ref(6)
 const streaming = ref(false)
 const stopping = ref(false)
@@ -463,6 +466,13 @@ async function scrollToBottom() {
 }
 
 async function loadKbs() {
+  // 先取服务端默认检索条数：滑块显示的必须就是实际会用的条数。
+  // 取不到（老后端）时 defaultTopK 保持 null，发送时退回显式传滑块值的行为。
+  const config = await chatApi.retrievalConfig().then((r) => r.data).catch(() => null)
+  if (config?.top_k) {
+    defaultTopK.value = config.top_k
+    topK.value = config.top_k
+  }
   const { data } = await kbApi.list()
   kbs.value = data
   // 支持从知识库卡片「开始问答」带 ?kb=<id> 跳转过来；找不到则退回第一个
@@ -713,7 +723,8 @@ async function send() {
         question: text,
         request_id: requestId,
         conversation_id: currentConversationId.value,
-        top_k: mode === 'rag' ? topK.value : undefined,
+        // 滑块没动过就不传，让服务端用 RETRIEVAL_TOP_K 决定（见 utils/retrievalTopK.ts）。
+        top_k: resolveTopK({ mode, topK: topK.value, defaultTopK: defaultTopK.value }),
         mode,
         ...scopeOptions
       },
