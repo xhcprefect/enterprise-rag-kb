@@ -86,7 +86,7 @@ test('production JavaScript chunks stay within the default 500 kB warning thresh
 
 test('all business pages remain dynamic entries and login excludes chat, table and upload dependencies', async () => {
   const chunks = javascript(await productionOutput())
-  for (const name of ['AppLayout', 'LoginView', 'ChatView', 'KnowledgeView', 'DocumentsView', 'UsersView', 'AuditView', 'ProfileView']) {
+  for (const name of ['AppLayout', 'LoginView', 'ChatView', 'KnowledgeView', 'DocumentsView', 'UsageView', 'UsersView', 'AuditView', 'ProfileView']) {
     assert.ok(chunks.find(chunk => chunk.name === name)?.isDynamicEntry, `${name} must remain lazy`)
   }
   for (const root of [chunks.find(chunk => chunk.isEntry)!, chunks.find(chunk => chunk.name === 'LoginView')!]) {
@@ -116,7 +116,7 @@ test('chat loads Markdown, code highlighting and its styles only through the cha
 test('on-demand loading retains loading directives and required popup styles but excludes unused UI components', async () => {
   const output = await productionOutput()
   const chunks = javascript(output)
-  for (const page of ['KnowledgeView', 'DocumentsView', 'UsersView', 'AuditView']) {
+  for (const page of ['KnowledgeView', 'DocumentsView', 'UsageView', 'UsersView', 'AuditView']) {
     const root = chunks.find(chunk => chunk.name === page)!
     assert.ok(renderedModules(staticGraph(chunks, root)).some(id => id.includes('/loading/src/directive')), `v-loading is missing from ${page}`)
   }

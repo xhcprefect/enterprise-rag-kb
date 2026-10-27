@@ -8,26 +8,26 @@
       </div>
       <div class="kb-picker">
         <span class="field-label">{{ t('chat.mode.label') }}</span>
-        <el-radio-group v-model="chatMode" size="small" class="mode-switch" :aria-label="t('chat.mode.label')" :disabled="busy" @change="onModeChange">
+        <el-radio-group v-model="chatMode" size="small" class="mode-switch" :aria-label="t('chat.mode.label')" :disabled="controlsLocked" @change="onModeChange">
           <el-radio-button value="rag">{{ t('chat.mode.rag') }}</el-radio-button>
           <el-radio-button value="chat">{{ t('chat.mode.chat') }}</el-radio-button>
         </el-radio-group>
         <label class="field-label" for="chat-knowledge-base">{{ t('chat.kb.label') }}</label>
-        <el-select id="chat-knowledge-base" v-model="kbId" :placeholder="t('chat.kb.placeholder')" class="kb-select" :disabled="chatMode === 'chat' || streaming" @change="onKbChange">
+        <el-select id="chat-knowledge-base" v-model="kbId" :placeholder="t('chat.kb.placeholder')" class="kb-select" :disabled="chatMode === 'chat' || controlsLocked" @change="onKbChange">
           <el-option v-for="kb in kbs" :key="kb.id" :label="kb.name" :value="kb.id">
             <span>{{ kb.name }}</span><span class="kb-count">{{ t('chat.kb.docCount', { count: formatNumber(kb.document_count) }, kb.document_count) }}</span>
           </el-option>
         </el-select>
-        <el-button class="new-chat" :disabled="busy || (chatMode === 'rag' && !kbId)" @click="newConversation"><el-icon><Plus /></el-icon>{{ t('chat.newChat') }}</el-button>
+        <el-button class="new-chat" :disabled="controlsLocked || (chatMode === 'rag' && !kbId)" @click="newConversation"><el-icon><Plus /></el-icon>{{ t('chat.newChat') }}</el-button>
       </div>
 
       <div class="conv-list">
         <div class="conv-title"><span>{{ t('chat.recent.title') }}</span><span class="conv-num">{{ formatNumber(conversations.length) }}</span></div>
         <div v-for="conv in conversations" :key="conv.id" class="conv-item" :class="{ active: conv.id === currentConversationId }">
-          <button class="conv-select" type="button" :disabled="busy" :aria-current="conv.id === currentConversationId ? 'true' : undefined" :title="conv.title" @click="loadConversation(conv.id)">
+          <button class="conv-select" type="button" :disabled="controlsLocked" :aria-current="conv.id === currentConversationId ? 'true' : undefined" :title="conv.title" @click="loadConversation(conv.id)">
             <el-icon class="conv-icon" :size="15"><ChatLineRound /></el-icon><span class="conv-name">{{ conv.title }}</span>
           </button>
-          <button class="conv-del" type="button" :disabled="busy" :aria-label="t('chat.recent.deleteAria', { title: conv.title })" @click="removeConversation(conv.id)"><el-icon :size="14"><Delete /></el-icon></button>
+          <button class="conv-del" type="button" :disabled="controlsLocked" :aria-label="t('chat.recent.deleteAria', { title: conv.title })" @click="removeConversation(conv.id)"><el-icon :size="14"><Delete /></el-icon></button>
         </div>
         <div v-if="!conversations.length" class="conv-empty"><el-icon :size="25"><ChatLineRound /></el-icon><span>{{ t('chat.recent.empty') }}</span><small>{{ t('chat.recent.emptyHint') }}</small></div>
         </div>
@@ -44,6 +44,33 @@
         <div class="chat-meta"><span class="mode-badge"><el-icon><DocumentCopy v-if="chatMode === 'rag'" /><ChatLineRound v-else /></el-icon>{{ chatMode === 'chat' ? t('chat.mode.chat') : t('chat.mode.rag') }}</span><span v-if="messages.length" class="message-count">{{ t('chat.head.messageCount', { count: formatNumber(messages.length) }, messages.length) }}</span></div>
       </header>
 
+      <div v-if="chatMode === 'rag' && kbId" class="scope-bar" role="group" :aria-label="t('chat.scope.label')">
+        <div class="scope-row">
+          <div class="scope-summary">
+            <span class="scope-label"><el-icon><DocumentCopy /></el-icon>{{ t('chat.scope.label') }}</span>
+            <template v-if="documentScope.length">
+              <span v-for="item in documentScope" :key="item.document_id" class="scope-chip">
+                <span class="scope-chip-name" :title="item.filename">{{ item.filename }}</span>
+                <button
+                  class="scope-chip-remove"
+                  type="button"
+                  :disabled="scopeLocked"
+                  :aria-label="t('chat.scope.removeAria', { name: item.filename })"
+                  @click="removeScopeDocument(item.document_id)"
+                ><el-icon :size="11"><CircleClose /></el-icon></button>
+              </span>
+            </template>
+            <span v-else class="scope-all"><el-icon :size="12"><Files /></el-icon>{{ t('chat.scope.all') }}</span>
+          </div>
+          <div class="scope-actions">
+            <span v-if="scopeSaving" class="scope-saving" role="status">{{ t('chat.scope.saving') }}</span>
+            <el-button size="small" :disabled="scopeLocked" :title="scopeLocked ? t('chat.scope.lockedHint') : undefined" @click="openScopeDialog">{{ documentScope.length ? t('chat.scope.change') : t('chat.scope.choose') }}</el-button>
+            <el-button v-if="documentScope.length" size="small" text :disabled="scopeLocked" @click="clearDocumentScope">{{ t('chat.scope.clear') }}</el-button>
+          </div>
+        </div>
+        <el-alert v-if="scopeError" class="scope-alert" :title="scopeError" type="error" :closable="true" show-icon @close="scopeError = ''" />
+      </div>
+
       <div v-if="chatMode === 'rag' && !kbId" class="placeholder">
         <el-empty :description="kbs.length ? t('chat.empty.selectKb') : t('chat.empty.noKb')" />
         <el-button v-if="isNarrow" plain type="primary" @click="toggleSidebar">{{ t('chat.empty.choose') }}</el-button>
@@ -58,6 +85,10 @@
             <h2>{{ t('chat.welcome.title') }}</h2>
             <p v-if="chatMode === 'rag'">{{ t('chat.welcome.ragLead') }}<br />{{ t('chat.welcome.ragKb', { kb: currentKbName }) }}</p>
             <p v-else>{{ t('chat.welcome.chatLead') }}<br />{{ t('chat.welcome.chatSub') }}</p>
+            <p v-if="chatMode === 'rag' && documentScope.length" class="welcome-scope">
+              <el-icon :size="13"><DocumentCopy /></el-icon>
+              {{ t('chat.scope.restrictedHint', { count: formatNumber(documentScope.length) }, documentScope.length) }}
+            </p>
             <div class="suggestions">
               <button v-for="s in activeSuggestions" :key="s.text" class="suggestion" type="button" @click="askSuggestion(s.text)">
                 <span class="suggestion-top"><el-icon><component :is="s.icon" /></el-icon><strong>{{ s.title }}</strong><el-icon class="suggestion-arrow"><ArrowRight /></el-icon></span>
@@ -82,7 +113,10 @@
                     <div class="citation-head"><span class="citation-index">{{ formatNumber(c.source_index ?? (i + 1)) }}</span><span class="citation-name" :title="c.filename || t('chat.citations.untitled')">{{ c.filename || t('chat.citations.untitled') }}</span><span v-if="c.chunk_index !== null" class="citation-meta">{{ t('chat.citations.chunk', { index: formatNumber(c.chunk_index! + 1) }) }}</span><span v-if="c.score !== null" class="citation-score">{{ t('chat.citations.score', { percent: formatNumber(Math.round(c.score! * 100)) }) }}</span></div>
                       <div v-if="sourceLocationLabels(c, t).length" class="citation-location">{{ sourceLocationLabels(c, t).join(' · ') }}</div>
                       <div class="citation-snippet">{{ c.snippet }}</div>
-                      <el-button v-if="c.document_id && c.chunk_index != null" link type="primary" @click="viewSource(c)">{{ t('chat.citations.view') }}</el-button>
+                      <div class="citation-actions">
+                        <el-button v-if="c.document_id && c.chunk_index != null" link type="primary" @click="viewSource(c)">{{ t('chat.citations.view') }}</el-button>
+                        <el-button v-if="chatMode === 'rag' && kbId && c.document_id && !isSoleScopeDocument(c.document_id)" link type="primary" :disabled="scopeLocked" @click="restrictToCitation(c)">{{ t('chat.scope.onlyThis') }}</el-button>
+                      </div>
                     </div>
                 </el-collapse-item></el-collapse>
               </div>
@@ -99,7 +133,7 @@
               <span v-else class="composer-mode"><el-icon><ChatLineRound /></el-icon>{{ t('chat.mode.chat') }}</span>
               <span class="input-hint"><kbd>Enter</kbd> {{ t('chat.composer.hintSend') }} · <kbd>Shift + Enter</kbd> {{ t('chat.composer.hintNewline') }}</span>
               <el-button v-if="busy" class="composer-btn" type="danger" plain :loading="stopping" :disabled="stopping" @click="stopStreaming"><el-icon><VideoPause /></el-icon>{{ stopping ? t('chat.composer.stopping') : t('chat.composer.stop') }}</el-button>
-              <el-button v-else class="composer-btn" type="primary" :disabled="!question.trim()" @click="send">{{ t('chat.composer.send') }}<el-icon class="send-icon"><Promotion /></el-icon></el-button>
+              <el-button v-else class="composer-btn" type="primary" :disabled="!question.trim() || scopeSaving" @click="send">{{ t('chat.composer.send') }}<el-icon class="send-icon"><Promotion /></el-icon></el-button>
               </div>
             </div>
           <p class="composer-disclaimer">{{ chatMode === 'rag' ? t('chat.composer.disclaimerRag') : t('chat.composer.disclaimerChat') }}</p>
@@ -107,6 +141,15 @@
       </template>
     </section>
     <SourcePreviewDrawer v-model="sourceOpen" :kb-id="kbId" :citation="selectedCitation" />
+    <DocumentScopeDialog
+      v-model="scopeDialogOpen"
+      :kb-id="kbId"
+      :selected="documentScope"
+      :max="MAX_SCOPE_DOCUMENTS"
+      :saving="scopeSaving"
+      :error="scopeError"
+      @confirm="applyDocumentScope"
+    />
   </div>
 </template>
 
@@ -122,8 +165,21 @@ import { useResponsiveDrawer } from '@/composables/useResponsiveDrawer'
 import { formatNumber } from '@/i18n/format'
 import { getCompletedCitations, type ChatCompletion } from '@/utils/citations'
 import { createChatRequestId } from '@/utils/chatRequest'
+import {
+  MAX_SCOPE_DOCUMENTS,
+  applyScopeUpdate,
+  buildScopeSendOptions,
+  conversationScope,
+  normalizeDocumentScope,
+  planScopeChange,
+  resolveScopePatchResponse,
+  scopeItemFromDocument,
+  type DocumentScopeItem
+} from '@/utils/documentScope'
+import { createSessionEpoch } from '@/utils/sessionEpoch'
 import { sourceLocationLabels } from '@/utils/sourceLocation'
 import SourcePreviewDrawer from '@/components/SourcePreviewDrawer.vue'
+import DocumentScopeDialog from '@/components/DocumentScopeDialog.vue'
 import {
   chatApi,
   kbApi,
@@ -219,6 +275,15 @@ const topK = ref(6)
 const streaming = ref(false)
 const stopping = ref(false)
 const busy = computed(() => streaming.value || stopping.value)
+/** 当前限定的文档范围；空数组表示整个知识库。无会话时这是待发送的草稿。 */
+const documentScope = ref<DocumentScopeItem[]>([])
+const scopeRevision = ref(0)
+const scopeDialogOpen = ref(false)
+const scopeSaving = ref(false)
+const scopeError = ref('')
+/** 生成回答或保存范围期间，禁止切换依据以及会话/知识库/模式。 */
+const scopeLocked = computed(() => busy.value || scopeSaving.value)
+const controlsLocked = scopeLocked
 const sourceOpen = ref(false)
 const selectedCitation = ref<Citation | null>(null)
 let activeRequestId: string | null = null
@@ -226,6 +291,11 @@ const errorMessage = ref('')
 const scrollRef = ref<HTMLElement>()
 let controller: AbortController | null = null
 let disposed = false
+/**
+ * 会话详情/生成/新建这些动作都会改写消息与范围。谁最后开始谁说了算：
+ * 慢回来的旧详情不能覆盖已经开始的生成。
+ */
+const sessionEpoch = createSessionEpoch()
 
 /**
  * 建议问题存 key 而不是文案：语言切换时由 computed 重新取 t()，
@@ -258,6 +328,112 @@ const currentTitle = computed(() => {
   const first = messages.value.find((m) => m.role === 'user')
   return first?.content.slice(0, 24) || t('chat.newConversation')
 })
+
+function resetDocumentScope() {
+  documentScope.value = []
+  scopeRevision.value = 0
+  scopeDialogOpen.value = false
+  scopeSaving.value = false
+  scopeError.value = ''
+}
+
+function isSoleScopeDocument(documentId: string) {
+  return documentScope.value.length === 1 && documentScope.value[0]?.document_id === documentId
+}
+
+function restrictToCitation(citation: Citation) {
+  if (scopeLocked.value || chatMode.value !== 'rag') return
+  const item = scopeItemFromDocument(citation.document_id, citation.filename, citation.index_version)
+  if (item) void applyDocumentScope([item])
+}
+
+function openScopeDialog() {
+  if (scopeLocked.value || chatMode.value !== 'rag' || !kbId.value) return
+  sessionEpoch.begin()
+  scopeError.value = ''
+  scopeDialogOpen.value = true
+}
+
+function removeScopeDocument(documentId: string) {
+  if (scopeLocked.value) return
+  void applyDocumentScope(documentScope.value.filter((item) => item.document_id !== documentId))
+}
+
+function clearDocumentScope() {
+  if (scopeLocked.value) return
+  void applyDocumentScope([])
+}
+
+/**
+ * 保存范围：
+ * - 无会话：只更新本地草稿，第一次 send 时随 document_ids 提交；指纹相同直接跳过
+ * - 已有会话：即使文档 ID 完全相同也 PATCH。文档可能已经重新索引，本地缓存的
+ *   index_version 是旧的（文档列表也不带最新代次），只有服务端能重新校验并绑定
+ *   到最新代次，所以"用户再选一次同一篇"必须真的发出去。
+ * - 响应不完整：保持原范围并报错，绝不把请求里的 next 当成已生效结果，
+ *   否则清空/扩大范围会在界面上"成功"，服务端却仍是旧范围。
+ * - 失败：当前 UI 范围原样保留，错误在范围条与弹窗内可见
+ */
+async function applyDocumentScope(items: DocumentScopeItem[]) {
+  if (scopeLocked.value) return
+  // 较早发出的会话详情也不能在本次范围确认期间改变会话或依据。
+  sessionEpoch.begin()
+  const next = normalizeDocumentScope(items)
+  const conversationId = currentConversationId.value
+  const action = planScopeChange(documentScope.value, next, !!conversationId)
+
+  if (action === 'skip') {
+    scopeDialogOpen.value = false
+    scopeError.value = ''
+    return
+  }
+
+  if (!conversationId) {
+    documentScope.value = next
+    scopeRevision.value = 0
+    scopeError.value = ''
+    scopeDialogOpen.value = false
+    return
+  }
+
+  const previous = { items: documentScope.value, revision: scopeRevision.value }
+  scopeSaving.value = true
+  scopeError.value = ''
+  try {
+    const { data } = await chatApi.setDocumentScope(
+      conversationId,
+      next.map((item) => item.document_id),
+      scopeRevision.value
+    )
+    // 保存期间会话切换已被禁用；这里仍兜底，避免响应落到别的会话上
+    if (currentConversationId.value !== conversationId) return
+    const resolution = resolveScopePatchResponse(previous, data)
+    if (resolution.status === 'applied') {
+      documentScope.value = resolution.snapshot.items
+      scopeRevision.value = resolution.snapshot.revision
+      scopeDialogOpen.value = false
+      return
+    }
+    // 服务端没给出完整范围，或回的是更旧的版本：一律退回确认前的范围
+    documentScope.value = previous.items
+    scopeRevision.value = previous.revision
+    scopeError.value = resolution.status === 'stale'
+      ? t('chat.scope.conflict')
+      : t('chat.scope.incomplete')
+  } catch (err: any) {
+    if (currentConversationId.value !== conversationId) return
+    documentScope.value = previous.items
+    scopeRevision.value = previous.revision
+    const status = err?.response?.status
+    const serverMessage = typeof err?.response?.data?.message === 'string'
+      ? err.response.data.message.trim()
+      : ''
+    scopeError.value = serverMessage
+      || (status === 409 ? t('chat.scope.conflict') : err?.message || t('chat.scope.saveFailed'))
+  } finally {
+    scopeSaving.value = false
+  }
+}
 
 /** 距底部多少像素内算"贴底"，此时新内容才自动跟随 */
 const STICK_THRESHOLD = 80
@@ -306,8 +482,11 @@ async function loadKbs() {
 }
 
 async function onKbChange() {
-  if (busy.value) return
+  if (controlsLocked.value) return
   sourceOpen.value = false
+  // 切换知识库会清空视图：在途的会话详情不得再把旧内容放回来
+  sessionEpoch.begin()
+  resetDocumentScope()
   currentConversationId.value = null
   messages.value = []
   await loadConversations()
@@ -321,10 +500,12 @@ let appliedMode: ChatMode = 'rag'
 
 async function onModeChange(value: string | number | boolean) {
   const next = value as ChatMode
-  // 流式中途禁止切换（单选框也置灰了，这里是兜底）；重复点同一个不做事
-  if (busy.value || next === appliedMode) return
+  // 流式或范围保存中禁止切换（单选框也置灰了，这里是兜底）；重复点同一个不做事
+  if (controlsLocked.value || next === appliedMode) return
   appliedMode = next
   sourceOpen.value = false
+  sessionEpoch.begin()
+  resetDocumentScope()
   currentConversationId.value = null
   messages.value = []
   errorMessage.value = ''
@@ -347,11 +528,21 @@ async function loadConversations() {
 }
 
 async function loadConversation(id: string) {
-  if (busy.value) return
+  if (controlsLocked.value) return
   sourceOpen.value = false
+  const loadEpoch = sessionEpoch.begin()
   const { data } = await chatApi.conversation(id)
+  // 载入期间用户可能已经发了新问题、新建了会话或点了另一条会话：
+  // 这份详情已经过期，不能覆盖已经开始的生成与新的消息列表。
+  if (disposed || !sessionEpoch.isCurrent(loadEpoch)) return
   closeSidebar()
   currentConversationId.value = data.id
+  // 历史会话以服务端返回的范围为准；旧响应缺失字段时归一化为全库
+  const savedScope = conversationScope(data)
+  documentScope.value = savedScope.items
+  scopeRevision.value = savedScope.revision
+  scopeError.value = ''
+  scopeDialogOpen.value = false
   // 模式与知识库跟着会话走：即便列表是别的筛选条件下拉出来的，也能正确打开
   let switched = false
   if (data.mode && data.mode !== chatMode.value) {
@@ -377,9 +568,12 @@ async function loadConversation(id: string) {
 }
 
 function newConversation() {
-  if (busy.value) return
+  if (controlsLocked.value) return
   closeSidebar()
   sourceOpen.value = false
+  // 新建会话后，之前点开的详情即使慢回来也不能再把旧消息填进来
+  sessionEpoch.begin()
+  resetDocumentScope()
   currentConversationId.value = null
   messages.value = []
   question.value = ''
@@ -387,6 +581,7 @@ function newConversation() {
 }
 
 async function removeConversation(id: string) {
+  if (controlsLocked.value) return
   try {
     await ElMessageBox.confirm(t('chat.deleteConfirm'), t('common.tip'), {
       type: 'warning',
@@ -448,10 +643,19 @@ function askSuggestion(text: string) {
 
 async function send() {
   const text = question.value.trim()
-  // 普通对话不需要知识库，只有 RAG 模式才要求先选库
-  if (!text || busy.value || (chatMode.value === 'rag' && !kbId.value)) return
+  // 普通对话不需要知识库，只有 RAG 模式才要求先选库；范围保存中避免新旧状态交叉
+  if (!text || busy.value || scopeSaving.value || (chatMode.value === 'rag' && !kbId.value)) return
 
   const mode = chatMode.value
+  const hadConversation = !!currentConversationId.value
+  // 这一次生成开始后，在途的会话详情载入全部过期：不能让它把刚推入的问答覆盖掉
+  sessionEpoch.begin()
+  const scopeOptions = buildScopeSendOptions({
+    mode,
+    items: documentScope.value,
+    hasConversation: hadConversation,
+    revision: scopeRevision.value
+  })
   errorMessage.value = ''
   question.value = ''
   messages.value.push({ id: newMessageId(), role: 'user', content: text, status: 'processing' })
@@ -469,6 +673,21 @@ async function send() {
   const signal = myController.signal
   // 最终引用只信任 done，meta 中的旧版检索候选不能当成回答依据。
   let completion: ChatCompletion | undefined
+  /** 这条流最终归属的会话；用于阻止过期响应把范围写到别的会话上。 */
+  let streamConversationId = currentConversationId.value
+  /**
+   * 只有真的收到 document_scope / scope_revision 才更新；
+   * revision 更小的过期流会被 applyScopeUpdate 丢弃。
+   */
+  const syncStreamScope = (data: { document_scope?: unknown; scope_revision?: unknown }) => {
+    if (mode !== 'rag') return
+    if (streamConversationId && currentConversationId.value !== streamConversationId) return
+    const updated = applyScopeUpdate({ items: documentScope.value, revision: scopeRevision.value }, data)
+    if (!updated) return
+    documentScope.value = updated.items
+    scopeRevision.value = updated.revision
+    scopeError.value = ''
+  }
   await scrollToBottom()
 
   // ---- 流式渲染节流 ----
@@ -495,13 +714,16 @@ async function send() {
         request_id: requestId,
         conversation_id: currentConversationId.value,
         top_k: mode === 'rag' ? topK.value : undefined,
-        mode
+        mode,
+        ...scopeOptions
       },
       {
         onMeta(data) {
           if (signal.aborted || disposed || controller !== myController) return
           currentConversationId.value = data.conversation_id
+          streamConversationId = data.conversation_id
           if (data.user_message_id) userMessage.id = data.user_message_id
+          syncStreamScope(data)
         },
         onDelta(token) {
           if (signal.aborted || disposed || controller !== myController) return
@@ -514,6 +736,7 @@ async function send() {
           if (data.message_id) assistant.id = data.message_id
           userMessage.status = 'completed'
           assistant.streaming = false
+          syncStreamScope(data)
         },
         onError(message) {
           completion = undefined
@@ -639,6 +862,25 @@ onBeforeUnmount(() => {
 .mode-badge { display: inline-flex; align-items: center; gap: 6px; padding: 6px 9px; border: 1px solid var(--accent-border); border-radius: 6px; background: var(--brand-tint); color: var(--brand-dark); font-size: 12px; white-space: nowrap; }
 .mode-badge .el-icon { font-size: 12px; }
 .message-count { color: var(--text-3); font-size: 12px; white-space: nowrap; }
+.scope-bar { display: flex; flex-direction: column; flex-shrink: 0; gap: 8px; padding: 10px clamp(15px, 3vw, 29px); border-bottom: 1px solid var(--line); background: var(--surface-soft); }
+.scope-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; min-width: 0; }
+.scope-summary { display: flex; align-items: center; flex-wrap: wrap; flex: 1 1 260px; gap: 6px; min-width: 0; }
+.scope-label { display: inline-flex; align-items: center; flex-shrink: 0; gap: 5px; color: var(--text-3); font-size: 11px; white-space: nowrap; }
+.scope-all { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border: 1px dashed var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--text-2); font-size: 11px; }
+.scope-chip { display: inline-flex; align-items: center; max-width: 240px; border: 1px solid var(--accent-border); border-radius: 6px; background: var(--brand-soft); color: var(--brand-dark); }
+.scope-chip-name { overflow: hidden; max-width: 200px; padding: 3px 0 3px 8px; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.scope-chip-remove { display: grid; place-items: center; flex-shrink: 0; width: 24px; height: 24px; padding: 0; border: 0; border-radius: 0 5px 5px 0; background: transparent; color: var(--brand-dark); cursor: pointer; opacity: .65; }
+.scope-chip-remove:not(:disabled):hover { background: color-mix(in srgb, var(--brand) 16%, transparent); opacity: 1; }
+.scope-chip-remove:disabled { cursor: not-allowed; opacity: .4; }
+.scope-chip-remove:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
+.scope-actions { display: flex; align-items: center; flex-shrink: 0; gap: 6px; margin-left: auto; }
+.scope-actions .el-button { margin-left: 0; font-size: 11px; }
+.scope-saving { color: var(--text-3); font-size: 11px; white-space: nowrap; }
+.scope-alert { width: 100%; }
+.scope-alert :deep(.el-alert__title) { font-size: 12px; line-height: 1.6; }
+.welcome-scope { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px !important; padding: 4px 9px; border: 1px solid var(--accent-border); border-radius: 6px; background: var(--brand-soft); color: var(--brand-dark) !important; font-size: 11px !important; }
+.citation-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; }
+.citation-actions .el-button { margin-left: 0; }
 .placeholder { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 24px; text-align: center; }
 .empty-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; text-decoration: none; }
 .messages { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 29px clamp(22px, 3vw, 55px) 22px; scroll-padding-bottom: 24px; }
@@ -746,6 +988,7 @@ onBeforeUnmount(() => {
   .sidebar-close, .sidebar-toggle { display: grid; }
   .sidebar-head { padding-top: 21px; }
   .chat-head { min-height: 71px; padding: 14px 21px; }
+  .scope-bar { padding-inline: 21px; }
   .chat-heading-icon { display: none; }
   .conv-del { opacity: .75; }
   .chat-title { max-width: none; }
@@ -764,6 +1007,12 @@ onBeforeUnmount(() => {
   .chat-meta { gap: 0; }
   .mode-badge { padding: 5px 7px; font-size: 10px; }
   .mode-badge > .el-icon { display: none; }
+  .scope-bar { padding: 8px 14px; }
+  .scope-summary { flex-basis: 100%; }
+  .scope-chip { max-width: 100%; }
+  .scope-chip-name { max-width: 180px; }
+  .scope-actions { width: 100%; margin-left: 0; justify-content: flex-end; }
+  .welcome-scope { max-width: 100%; font-size: 10px !important; line-height: 1.6; }
   .messages { padding: 18px 15px 12px; }
   .welcome { padding: 12px 0 18px; }
   .welcome-mark { width: 48px; height: 50px; margin-bottom: 17px; border-radius: 15px; }

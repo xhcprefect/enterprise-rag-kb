@@ -17,6 +17,25 @@ class ChatRequest(BaseModel):
     top_k: int = Field(default=6, ge=1, le=20)
     # 仅在新建会话时生效；续聊以会话里已存的模式为准
     mode: ChatMode = "rag"
+    # 仅新会话接受草稿范围；已有会话通过带版本校验的 PATCH 更新。
+    document_ids: list[uuid.UUID] | None = Field(default=None, max_length=5)
+    scope_revision: int | None = Field(default=None, ge=0, strict=True)
+
+
+class DocumentScopeItem(BaseModel):
+    document_id: str
+    filename: str
+    index_version: int = Field(ge=0)
+
+
+class DocumentScopeState(BaseModel):
+    document_scope: list[DocumentScopeItem] = Field(default_factory=list)
+    scope_revision: int = 0
+
+
+class DocumentScopeUpdate(BaseModel):
+    document_ids: list[uuid.UUID] = Field(max_length=5)
+    expected_revision: int | None = Field(default=None, ge=0, strict=True)
 
 
 class Citation(BaseModel):
@@ -55,7 +74,7 @@ class MessageRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class ConversationRead(BaseModel):
+class ConversationRead(DocumentScopeState):
     id: uuid.UUID
     kb_id: uuid.UUID | None = None
     mode: str = "rag"

@@ -9,7 +9,8 @@ from app.models import Document, DocumentChunk, DocumentStatus, KnowledgeBase
 from app.services.source_documents import merge_locations, public_location
 
 
-def keyword_candidates(collection_name: str, question: str, limit: int = 60):
+def keyword_candidates(collection_name: str, question: str, limit: int = 60, *,
+                       document_scope: list[dict] | None = None):
     from app.services.hybrid_search import keyword_terms
 
     terms = keyword_terms(question)
@@ -28,6 +29,9 @@ def keyword_candidates(collection_name: str, question: str, limit: int = 60):
                         Document.status == DocumentStatus.READY.value, Document.cancel_requested.is_(False),
                         DocumentChunk.embedded.is_(True), DocumentChunk.search_text != "", vector.op("@@")(query))
                  .order_by(rank.desc(), Document.id, DocumentChunk.chunk_index).limit(max(1, min(limit, 200))))
+    if document_scope is not None:
+        from app.services.document_scopes import scope_filter
+        statement = statement.where(scope_filter(document_scope))
     with SessionLocal() as db:
         rows = db.execute(statement).all()
     return [(LCDocument(page_content=content, metadata={

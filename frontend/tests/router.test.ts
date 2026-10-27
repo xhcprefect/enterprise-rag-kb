@@ -53,17 +53,17 @@ function createHarness(t: TestContext, options: {
 test('only login and fallback routes are registered before authentication', (t) => {
   const { router } = createHarness(t)
   assert.deepEqual(router.getRoutes().map(route => route.name).sort(), ['login', 'not-found'])
-  for (const name of ['workspace', 'chat', 'knowledge', 'documents', 'profile', 'users', 'audit']) {
+  for (const name of ['workspace', 'chat', 'knowledge', 'documents', 'usage', 'profile', 'users', 'audit']) {
     assert.equal(router.hasRoute(name), false, name)
   }
 })
 
 test('role filtering keeps the source configuration intact and menus match accessible routes', () => {
   const memberRoutes = filterAuthorizedRoutes([workspaceRoute], 'user')[0].children || []
-  assert.deepEqual(memberRoutes.map(route => route.name), ['chat', 'knowledge', 'documents', 'profile'])
-  assert.equal(workspaceRoute.children?.length, 6)
-  assert.deepEqual(getNavigationItems(workspaceRoute, 'user').map(item => item.path), ['/chat', '/knowledge'])
-  assert.deepEqual(getNavigationItems(workspaceRoute, 'admin').map(item => item.path), ['/chat', '/knowledge', '/users', '/audit'])
+  assert.deepEqual(memberRoutes.map(route => route.name), ['chat', 'knowledge', 'documents', 'usage', 'profile'])
+  assert.equal(workspaceRoute.children?.length, 7)
+  assert.deepEqual(getNavigationItems(workspaceRoute, 'user').map(item => item.path), ['/chat', '/knowledge', '/usage'])
+  assert.deepEqual(getNavigationItems(workspaceRoute, 'admin').map(item => item.path), ['/chat', '/knowledge', '/usage', '/users', '/audit'])
   assert.deepEqual(getNavigationItems(workspaceRoute), [])
   assert.equal(memberRoutes.find(route => route.name === 'documents')?.meta?.activeMenu, '/knowledge')
   assert.equal(memberRoutes.find(route => route.name === 'profile')?.meta?.activeMenu, '')
@@ -84,13 +84,14 @@ test('dynamic registration is idempotent, replaces roles, and removes all busine
   assert.equal(access.register('admin'), false)
   assert.equal(router.hasRoute('users'), true)
   assert.equal(router.hasRoute('audit'), true)
-  assert.equal(router.getRoutes().length, 9)
+  assert.equal(router.getRoutes().length, 10)
 
   assert.equal(access.register('user'), true)
   assert.equal(router.hasRoute('users'), false)
   assert.equal(router.hasRoute('audit'), false)
   assert.equal(router.hasRoute('chat'), true)
-  assert.equal(router.getRoutes().length, 7)
+  assert.equal(router.hasRoute('usage'), true)
+  assert.equal(router.getRoutes().length, 8)
   access.reset()
   access.reset()
   assert.deepEqual(router.getRoutes().map(route => route.name).sort(), ['login', 'not-found'])
@@ -133,6 +134,20 @@ test('members cannot open admin URLs, including on the initial navigation', asyn
     assert.equal(router.hasRoute('users'), false)
     assert.equal(router.hasRoute('audit'), false)
   }
+})
+
+test('members can open usage but still cannot open admin-only pages', async (t) => {
+  const { router } = createHarness(t, { token: 'member-token', profile: member })
+  await router.push('/usage?granularity=day')
+  assert.equal(router.currentRoute.value.name, 'usage')
+  assert.equal(router.currentRoute.value.query.granularity, 'day')
+  assert.equal(router.hasRoute('users'), false)
+  assert.equal(router.hasRoute('audit'), false)
+
+  const adminHarness = createHarness(t, { token: 'admin-token', profile: admin })
+  await adminHarness.router.push('/usage')
+  assert.equal(adminHarness.router.currentRoute.value.name, 'usage')
+  assert.equal(adminHarness.router.hasRoute('users'), true)
 })
 
 test('the workspace root resolves to chat after dynamic initialization', async (t) => {

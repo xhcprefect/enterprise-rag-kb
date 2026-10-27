@@ -30,6 +30,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "mode": "VARCHAR(16) NOT NULL DEFAULT 'rag'",
         "active_turn_id": "UUID",
         "lease_expires_at": "TIMESTAMPTZ",
+        "document_scope": "JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "scope_revision": "INTEGER NOT NULL DEFAULT 0",
     },
     "messages": {
         "turn_id": "UUID REFERENCES chat_turns(id) ON DELETE CASCADE",
@@ -106,6 +108,12 @@ def init_db(create_admin: bool = True) -> None:
                     "DROP CONSTRAINT IF EXISTS upload_sessions_document_id_fkey"
                 )
             )
+
+        # 已存在的计量表也补上索引，避免启动补录检查逐条扫描整个账本。
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_model_usage_turn_operation ON model_usage (turn_id, operation)"))
+        # 独立计量表随 create_all 创建；补录仅接受历史中明确返回的实际用量。
+        from app.services.usage_statistics import initialize_usage
+        initialize_usage(conn)
 
     if not create_admin:
         return

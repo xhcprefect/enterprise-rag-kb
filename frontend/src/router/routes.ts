@@ -55,6 +55,12 @@ export const workspaceRoute: RouteRecordRaw = {
       meta: { titleKey: 'nav.documents', activeMenu: '/knowledge' }
     },
     {
+      path: '/usage',
+      name: 'usage',
+      component: () => import('@/views/UsageView.vue'),
+      meta: { titleKey: 'nav.usage', menu: { icon: 'TrendCharts' } }
+    },
+    {
       path: '/users',
       name: 'users',
       component: () => import('@/views/UsersView.vue'),

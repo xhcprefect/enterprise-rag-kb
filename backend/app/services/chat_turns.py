@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import ChatTurn, Conversation, Message
+from app.services import document_scopes
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +36,26 @@ class Reservation:
     replay_latency_ms: int = 0
     replay_trace: dict = field(default_factory=dict)
     assistant_message_id: uuid.UUID | None = None
+    document_scope: list[dict] = field(default_factory=list)
+    scope_revision: int = 0
 
 
 def _now():
     return datetime.now(timezone.utc)
 
 
-def payload_hash(question: str, mode: str, kb_id, top_k: int) -> str:
-    data = json.dumps([question, mode, str(kb_id) if kb_id else None, top_k], ensure_ascii=False, separators=(",", ":"))
+def payload_hash(question: str, mode: str, kb_id, top_k: int, *, document_ids=None,
+                 scope_revision: int | None = None) -> str:
+    values = [question, mode, str(kb_id) if kb_id else None, top_k]
+    # 旧调用保留原摘要；只有显式提供的范围参数参与幂等身份。
+    scope_request = {}
+    if document_ids is not None:
+        scope_request["document_ids"] = sorted(str(value) for value in document_scopes.scope_ids(document_ids))
+    if scope_revision is not None:
+        scope_request["scope_revision"] = scope_revision
+    if scope_request:
+        values.append(scope_request)
+    data = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
@@ -93,10 +106,13 @@ def reclaim_expired(db: Session) -> int:
 
 def claim_turn(db: Session, *, user_id: uuid.UUID, conversation_id: uuid.UUID | None,
                kb_id: uuid.UUID | None, mode: str, question: str, top_k: int,
-               request_id: uuid.UUID | None = None) -> Reservation:
+               request_id: uuid.UUID | None = None, document_ids=None,
+               scope_revision: int | None = None, reset_scope: bool = False) -> Reservation:
     """只在短事务内认领；同键重放不新建会话/消息，也不再次调用模型。"""
+    if mode != "rag" and (document_ids is not None or scope_revision is not None):
+        raise HTTPException(400, "普通对话不支持文档范围")
     key = request_id or uuid.uuid4()
-    digest = payload_hash(question, mode, kb_id, top_k)
+    digest = payload_hash(question, mode, kb_id, top_k, document_ids=document_ids, scope_revision=scope_revision)
     db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _request_lock(user_id, key)})
     previous = db.scalar(select(ChatTurn).where(ChatTurn.user_id == user_id, ChatTurn.request_id == key))
     if previous is not None:
@@ -118,7 +134,7 @@ def claim_turn(db: Session, *, user_id: uuid.UUID, conversation_id: uuid.UUID | 
 
     if conversation_id is None:
         conv = Conversation(id=uuid.uuid4(), user_id=user_id, kb_id=kb_id, mode=mode,
-                            title=question.strip()[:30] or "新会话")
+                            title=question.strip()[:30] or "新会话", document_scope=[], scope_revision=0)
         db.add(conv)
         db.flush()
     else:
@@ -134,6 +150,19 @@ def claim_turn(db: Session, *, user_id: uuid.UUID, conversation_id: uuid.UUID | 
             raise HTTPException(409, "该会话已有回答正在生成，请等待完成或停止后重试")
         _expire_active(db, conv)
 
+    current_scope = getattr(conv, "document_scope", [])
+    current_revision = getattr(conv, "scope_revision", None) or 0
+    if scope_revision is not None and scope_revision != current_revision:
+        raise HTTPException(409, "文档范围已在其他页面改变，请刷新会话后重试")
+    if document_ids is not None:
+        if conversation_id is not None:
+            raise HTTPException(400, "已有会话请先通过范围选择器更新文档范围")
+        current_scope = document_scopes.resolve_scope(db, kb_id, document_ids, lock=True)
+        conv.document_scope = current_scope
+        current_revision = conv.scope_revision = int(bool(current_scope))
+    elif not reset_scope and (current_scope or not isinstance(current_scope, list)):
+        current_scope = document_scopes.validate_scope(db, kb_id, current_scope, lock=True)
+
     identifier, message_id = uuid.uuid4(), uuid.uuid4()
     db.add(ChatTurn(id=identifier, request_id=key, user_id=user_id, conversation_id=conv.id,
                     user_message_id=message_id, payload_hash=digest, status="processing", heartbeat_at=now))
@@ -144,7 +173,32 @@ def claim_turn(db: Session, *, user_id: uuid.UUID, conversation_id: uuid.UUID | 
     conv.lease_expires_at = now + timedelta(seconds=settings.CHAT_LEASE_SECONDS)
     conv.updated_at = now
     db.commit()
-    return Reservation(identifier, key, conv.id, message_id, user_id)
+    return Reservation(identifier, key, conv.id, message_id, user_id,
+                       document_scope=current_scope, scope_revision=current_revision)
+
+
+def set_document_scope(db: Session, conversation_id: uuid.UUID, document_ids,
+                       expected_revision: int | None = None) -> tuple[list[dict], int]:
+    """调用方先检查会话和知识库权限；与认领/完成共用会话行锁。"""
+    conv = db.scalar(select(Conversation).where(Conversation.id == conversation_id)
+                     .with_for_update().execution_options(populate_existing=True))
+    if conv is None:
+        raise HTTPException(404, "会话不存在")
+    if conv.mode != "rag":
+        raise HTTPException(400, "普通对话不支持文档范围")
+    if conv.active_turn_id is not None:
+        if conv.lease_expires_at and conv.lease_expires_at > _now():
+            raise HTTPException(409, "回答正在生成，请停止或等待完成后再调整文档范围")
+        _expire_active(db, conv)
+    revision = conv.scope_revision or 0
+    if expected_revision is not None and revision != expected_revision:
+        raise HTTPException(409, "文档范围已在其他页面改变，请刷新会话后重试")
+    selected = document_scopes.resolve_scope(db, conv.kb_id, document_ids, lock=True)
+    if selected != (conv.document_scope or []):
+        conv.document_scope, conv.scope_revision, conv.updated_at = selected, revision + 1, _now()
+        revision += 1
+    db.commit()
+    return selected, revision
 
 
 def _active_locked(db: Session, reservation: Reservation):
@@ -160,8 +214,17 @@ def _active_locked(db: Session, reservation: Reservation):
 
 
 def complete_turn(db: Session, reservation: Reservation, answer: str, citations: list[dict],
-                  latency_ms: int, trace: dict) -> uuid.UUID:
+                  latency_ms: int, trace: dict, *, scope_update: list[dict] | None = None) -> uuid.UUID:
     conv, turn = _active_locked(db, reservation)
+    if (getattr(conv, "scope_revision", None) or 0) != reservation.scope_revision:
+        raise ChatLeaseLost("文档范围已改变，请刷新会话后重试")
+    selected = reservation.document_scope if scope_update is None else scope_update
+    if selected:
+        # 生成期间发生删除/取消/重建时，禁止将旧代次结果写成成功回答。
+        selected = document_scopes.validate_scope(db, conv.kb_id, selected, lock=True)
+    if scope_update is not None and selected != (getattr(conv, "document_scope", None) or []):
+        conv.document_scope = selected
+        conv.scope_revision = reservation.scope_revision + 1
     identifier = uuid.uuid4()
     db.add(Message(id=identifier, conversation_id=conv.id, turn_id=turn.id,
                    reply_to_id=reservation.user_message_id, status="completed", role="assistant",

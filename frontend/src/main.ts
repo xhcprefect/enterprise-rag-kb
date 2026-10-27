@@ -3,9 +3,9 @@ import { createPinia } from 'pinia'
 import { i18n } from './i18n'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ChatDotRound, ChatLineRound, CircleCheck,
-  CircleCheckFilled, CircleClose, Delete, Document, DocumentCopy, EditPen, Expand,
+  CircleCheckFilled, CircleClose, Coin, DataLine, Delete, Document, DocumentCopy, EditPen, Expand,
   Files, Fold, Folder, InfoFilled, Loading, Lock, MagicStick, MoreFilled, Plus,
-  Promotion, Reading, Refresh, Search, SwitchButton, Tickets, Unlock, Upload,
+  Promotion, Reading, Refresh, Search, Setting, SwitchButton, Tickets, TrendCharts, Unlock, Upload,
   UploadFilled, User, UserFilled, VideoPause
 } from '@element-plus/icons-vue'
 // 先加载基础变量和命令式弹层样式，再由 main.css 覆盖品牌与深浅主题变量。
@@ -22,9 +22,9 @@ const app = createApp(App)
 
 const icons = {
   ArrowDown, ArrowLeft, ArrowRight, ChatDotRound, ChatLineRound, CircleCheck,
-  CircleCheckFilled, CircleClose, Delete, Document, DocumentCopy, EditPen, Expand,
+  CircleCheckFilled, CircleClose, Coin, DataLine, Delete, Document, DocumentCopy, EditPen, Expand,
   Files, Fold, Folder, InfoFilled, Loading, Lock, MagicStick, MoreFilled, Plus,
-  Promotion, Reading, Refresh, Search, SwitchButton, Tickets, Unlock, Upload,
+  Promotion, Reading, Refresh, Search, Setting, SwitchButton, Tickets, TrendCharts, Unlock, Upload,
   UploadFilled, User, UserFilled, VideoPause
 }
 for (const [key, component] of Object.entries(icons)) {

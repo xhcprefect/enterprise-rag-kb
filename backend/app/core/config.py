@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://api.deepseek.com"
     LLM_API_KEY: str = ""
     LLM_TIMEOUT: int = 180              # 长回答 + 思考模型可能较慢，留足余量
-    LLM_STREAM_INCLUDE_USAGE: bool = False  # 仅在服务支持 stream_options 时打开
+    LLM_STREAM_INCLUDE_USAGE: bool = True  # 请求流末尾实际用量；不支持 stream_options 的服务可显式关闭
     # DeepSeek 官方 Chat Completions 的 none 会关闭思考，low/high/max 会开启思考。
     # 默认留空、不发送该字段，兼容不支持 reasoning_effort 的其他服务；别名取决于服务商。
     LLM_REASONING_EFFORT: Literal["", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] = ""

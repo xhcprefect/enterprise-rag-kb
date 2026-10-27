@@ -398,7 +398,7 @@ class DatabaseTests(unittest.TestCase):
         async def consume(response):
             return "".join([frame async for frame in response.body_iterator])
 
-        with patch.object(rag, "retrieve") as search, patch.object(rag, "get_llm") as model:
+        with patch.object(rag, "retrieve", return_value=[]) as search, patch.object(rag, "get_llm") as model:
             model.return_value.stream.return_value = [SimpleNamespace(content="按手册，数据安全分为四级：公开级、内部级、机密级、绝密级[1]。")]
             with SessionLocal() as db:
                 response = chat.chat_stream(ChatRequest(question="星海科技内部管理手册", conversation_id=conversation_id),
@@ -413,7 +413,10 @@ class DatabaseTests(unittest.TestCase):
                 response = chat.chat_stream(ChatRequest(question="再详细一点", conversation_id=conversation_id),
                                             self.request, db, self.admin)
                 self.assertIn("event: done", asyncio.run(consume(response)))
-            search.assert_not_called()
+            self.assertEqual(search.call_count, 2)
+            for call in search.call_args_list:
+                self.assertEqual([item["document_id"] for item in call.kwargs["document_scope"]],
+                                 [str(pairs[1][0].metadata["document_id"])])
             prompt = model.return_value.stream.call_args.args[0][-1].content
             self.assertIn("数据安全分几级", prompt)
             self.assertIn(definitions[1][1], prompt)
@@ -832,7 +835,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute(text("ALTER TABLE users DROP COLUMN token_version"))
             conn.execute(text("ALTER TABLE documents DROP COLUMN index_version, DROP COLUMN lease_id"))
             conn.execute(text("ALTER TABLE upload_sessions DROP COLUMN content_sha256"))
-            conn.execute(text("ALTER TABLE conversations DROP COLUMN mode, DROP COLUMN active_turn_id, DROP COLUMN lease_expires_at"))
+            conn.execute(text("ALTER TABLE conversations DROP COLUMN mode, DROP COLUMN active_turn_id, DROP COLUMN lease_expires_at, DROP COLUMN document_scope, DROP COLUMN scope_revision"))
             conn.execute(text("ALTER TABLE messages DROP COLUMN turn_id, DROP COLUMN reply_to_id, DROP COLUMN status"))
             conn.execute(text("ALTER TABLE document_chunks DROP COLUMN source_metadata, DROP COLUMN search_text"))
             conn.execute(text("DROP TABLE chat_turns"))
@@ -842,6 +845,250 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(db.get(User, self.admin.id).token_version, 0)
             migrated = db.get(Conversation, legacy_id)
             self.assertEqual(migrated.mode, "rag")
+            self.assertEqual(migrated.document_scope, [])
+            self.assertEqual(migrated.scope_revision, 0)
             self.assertEqual({row.content for row in migrated.messages}, {"old question", "old answer"})
             self.assertTrue(all(row.status == "completed" and row.turn_id is None for row in migrated.messages))
             self.assertEqual(db.scalar(select(func.count()).select_from(ChatTurn)), 0)
+
+    def _ready_scope_document(self, filename, contents):
+        identifier = self.add_doc(len(contents))
+        with SessionLocal() as db:
+            db.get(Document, identifier).filename = filename
+            chunks = db.scalars(select(DocumentChunk).where(DocumentChunk.document_id == identifier)
+                                 .order_by(DocumentChunk.chunk_index)).all()
+            for chunk, content in zip(chunks, contents):
+                chunk.content = content
+                chunk.source_metadata = {"section": f"正文章节{chunk.chunk_index}",
+                                         "section_key": f"body-{chunk.chunk_index}"}
+            db.commit()
+        ingest.ingest_document_task(str(identifier))
+        return identifier
+
+    def test_scope_filters_both_channels_before_top_k_even_with_better_other_hits(self):
+        from app.services.retrieval_candidates import keyword_candidates
+        selected = self._ready_scope_document("选定手册.txt", ["内部级数据外发须审批并脱敏。"])
+        other = self._ready_scope_document("其他指南.txt", ["内部级数据外发可以直接公开。" * 10])
+        with SessionLocal() as db:
+            rows = self.store.EmbeddingStore
+            db.execute(update(rows).where(rows.cmetadata["document_id"].astext == str(selected))
+                       .values(embedding=[0.8, 0.6] + [0.0] * 1022))
+            db.commit()
+        scope = [{"document_id": str(selected), "filename": "选定手册.txt", "index_version": 0}]
+        vector = [1.0] + [0.0] * 1023
+        with patch.object(settings, "RETRIEVAL_MIN_SIMILARITY", 0):
+            global_hits = vector_store.search_ready_vectors(self.store, vector, 1)
+            self.assertEqual(global_hits[0][0].metadata["document_id"], str(other))
+            scoped = vector_store.search_ready_vectors(self.store, vector, 1, document_scope=scope)
+            self.assertEqual([doc.metadata["document_id"] for doc, _ in scoped], [str(selected)])
+            self.assertEqual(vector_store.search_ready_vectors(self.store, vector, 1, document_scope=[]), [])
+        keyword = keyword_candidates(self.kb.collection_name, "内部级数据外发", 1, document_scope=scope)
+        self.assertEqual([doc.metadata["document_id"] for doc, _ in keyword], [str(selected)])
+        self.assertEqual(keyword_candidates(self.kb.collection_name, "内部级数据外发", 1, document_scope=[]), [])
+        stale = [{**scope[0], "index_version": 1}]
+        self.assertEqual(vector_store.search_ready_vectors(self.store, vector, 1, document_scope=stale), [])
+        self.assertEqual(keyword_candidates(self.kb.collection_name, "内部级数据外发", 1, document_scope=stale), [])
+
+    def test_draft_scope_and_uncited_answer_survive_reloading_and_later_claims(self):
+        identifier = self._ready_scope_document("限定手册.txt", ["仅限内部使用。"])
+        with SessionLocal() as db:
+            first = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
+                                         mode="rag", question="未规定事项", top_k=6, document_ids=[identifier])
+            self.assertEqual(first.scope_revision, 1)
+            chat_turns.complete_turn(db, first, "根据现有知识库无法回答。", [], 1, {})
+        with SessionLocal() as db:
+            detail = chat.get_conversation(first.conversation_id, db, self.admin).data
+            self.assertEqual(detail.document_scope[0].document_id, str(identifier))
+            self.assertEqual(detail.scope_revision, 1)
+            next_turn = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=first.conversation_id,
+                                             kb_id=self.kb.id, mode="rag", question="内部级能否外发", top_k=6,
+                                             scope_revision=1)
+            self.assertEqual(next_turn.document_scope, first.document_scope)
+            with self.assertRaises(HTTPException) as error:
+                chat_turns.set_document_scope(db, first.conversation_id, [], 1)
+            self.assertEqual(error.exception.status_code, 409)
+            db.rollback()
+            chat_turns.cancel_request(db, next_turn.request_id, self.admin.id)
+            self.assertEqual(chat_turns.set_document_scope(db, first.conversation_id, [], 1), ([], 2))
+        with SessionLocal() as db, self.assertRaises(HTTPException) as error:
+            chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=first.conversation_id,
+                                 kb_id=self.kb.id, mode="rag", question="旧页面提问", top_k=6, scope_revision=1)
+        self.assertEqual(error.exception.status_code, 409)
+
+    def test_replay_reports_current_scope_without_reverting_a_later_switch(self):
+        import asyncio
+        first_doc = self._ready_scope_document("甲手册.txt", ["甲规定"])
+        second_doc = self._ready_scope_document("乙手册.txt", ["乙规定"])
+        key = uuid.uuid4()
+        with SessionLocal() as db:
+            turn = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
+                                        mode="rag", question="原问题", top_k=6, request_id=key, document_ids=[first_doc])
+            chat_turns.complete_turn(db, turn, "原结果", [], 1, {})
+            selected, revision = chat_turns.set_document_scope(db, turn.conversation_id, [second_doc], 1)
+        async def consume(response):
+            return [json.loads(frame.split("data: ", 1)[1]) async for frame in response.body_iterator]
+        with SessionLocal() as db, patch.object(rag, "retrieve") as search:
+            events = asyncio.run(consume(chat.chat_stream(ChatRequest(kb_id=self.kb.id, question="原问题", request_id=key,
+                                                                     document_ids=[first_doc]), self.request, db, self.admin)))
+            self.assertEqual(events[-1]["document_scope"], selected)
+            self.assertEqual(events[-1]["scope_revision"], revision)
+            self.assertTrue(events[-1]["replayed"])
+            self.assertEqual(db.scalar(select(func.count()).select_from(ChatTurn)), 1)
+            self.assertEqual(db.get(Conversation, turn.conversation_id).document_scope, selected)
+        search.assert_not_called()
+
+    def test_invalidated_scope_rejects_next_question_and_can_be_cleared(self):
+        identifier = self._ready_scope_document("可失效手册.txt", ["仅限内部。"])
+        with SessionLocal() as db:
+            first = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
+                                         mode="rag", question="q", top_k=6, document_ids=[identifier])
+            chat_turns.complete_turn(db, first, "answer", [], 1, {})
+        for changes in [dict(status="processing"), dict(cancel_requested=True), dict(index_version=1)]:
+            with SessionLocal() as db:
+                db.execute(update(Document).where(Document.id == identifier).values(**changes))
+                db.commit()
+            with self.subTest(changes=changes), SessionLocal() as db, self.assertRaises(HTTPException):
+                chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=first.conversation_id,
+                                     kb_id=self.kb.id, mode="rag", question="不得扩大范围", top_k=6)
+            with SessionLocal() as db:
+                self.assertEqual(db.scalar(select(func.count()).select_from(Message)), 2)
+                db.execute(update(Document).where(Document.id == identifier)
+                           .values(status="ready", cancel_requested=False, index_version=0))
+                db.commit()
+        with SessionLocal() as db:
+            db.execute(delete(Document).where(Document.id == identifier))
+            db.commit()
+        with SessionLocal() as db, self.assertRaises(HTTPException) as error:
+            chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=first.conversation_id,
+                                 kb_id=self.kb.id, mode="rag", question="deleted", top_k=6)
+        self.assertEqual(error.exception.status_code, 404)
+        with SessionLocal() as db:
+            self.assertEqual(chat_turns.set_document_scope(db, first.conversation_id, [], 1), ([], 2))
+
+    def test_source_reindexed_during_generation_prevents_atomic_answer_and_scope_commit(self):
+        identifier = self._ready_scope_document("代次隔离.txt", ["旧正文"])
+        with SessionLocal() as db:
+            turn = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
+                                        mode="rag", question="q", top_k=6, document_ids=[identifier])
+        with SessionLocal() as db:
+            db.execute(update(Document).where(Document.id == identifier).values(index_version=1))
+            db.commit()
+        with SessionLocal() as db, self.assertRaises(HTTPException) as error:
+            chat_turns.complete_turn(db, turn, "旧代次回答", [], 1, {})
+        self.assertEqual(error.exception.status_code, 409)
+        with SessionLocal() as db:
+            self.assertEqual(db.scalar(select(func.count()).select_from(Message).where(Message.role == "assistant")), 0)
+            self.assertEqual(db.get(ChatTurn, turn.turn_id).status, "processing")
+            chat_turns.cancel_request(db, turn.request_id, self.admin.id)
+
+    def test_cross_connection_scope_updates_require_the_current_revision(self):
+        from app.services.document_scopes import resolve_scope
+        identifier = self._ready_scope_document("甲.txt", ["甲"])
+        other = self._ready_scope_document("乙.txt", ["乙"])
+        with SessionLocal() as db:
+            conv = Conversation(user_id=self.admin.id, kb_id=self.kb.id, mode="rag", scope_revision=1,
+                                document_scope=resolve_scope(db, self.kb.id, [identifier]))
+            db.add(conv)
+            db.commit()
+            conv_id = conv.id
+        barrier = Barrier(2)
+        def change(identifiers):
+            with SessionLocal() as db:
+                barrier.wait(timeout=10)
+                try:
+                    return "ok", chat_turns.set_document_scope(db, conv_id, identifiers, 1)[1]
+                except HTTPException as exc:
+                    return "error", exc.status_code
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(change, [[], [other]]))
+        self.assertCountEqual(results, [("ok", 2), ("error", 409)])
+        with SessionLocal() as db:
+            self.assertEqual(db.get(Conversation, conv_id).scope_revision, 2)
+
+    def test_scope_patch_rejects_foreign_documents_and_revoked_private_kb_access(self):
+        from app.schemas.chat import DocumentScopeUpdate
+        own = self._ready_scope_document("本库.txt", ["本库"])
+        foreign = self._ready_scope_document("外库.txt", ["外库"])
+        with SessionLocal() as db:
+            other_kb = KnowledgeBase(name="scope-private", collection_name="scope_" + uuid.uuid4().hex,
+                                     owner_id=self.admin.id, is_public=False)
+            viewer = User(username="scope_viewer", role="user", password_hash=hash_password("Original123"))
+            db.add_all([other_kb, viewer])
+            db.flush()
+            db.get(Document, foreign).kb_id = other_kb.id
+            conv = Conversation(user_id=self.admin.id, kb_id=self.kb.id, mode="rag")
+            revoked = Conversation(user_id=viewer.id, kb_id=other_kb.id, mode="rag")
+            db.add_all([conv, revoked])
+            db.commit()
+            conv_id, revoked_id, viewer_id = conv.id, revoked.id, viewer.id
+        with SessionLocal() as db, self.assertRaises(HTTPException) as error:
+            chat.set_document_scope(conv_id, DocumentScopeUpdate(document_ids=[foreign]), db, self.admin)
+        self.assertEqual(error.exception.status_code, 404)
+        with SessionLocal() as db, self.assertRaises(HTTPException) as error:
+            chat.set_document_scope(revoked_id, DocumentScopeUpdate(document_ids=[foreign]), db, db.get(User, viewer_id))
+        self.assertEqual(error.exception.status_code, 403)
+        with SessionLocal() as db:
+            self.assertEqual(db.get(Conversation, conv_id).document_scope, [])
+            self.assertEqual(chat.set_document_scope(conv_id, DocumentScopeUpdate(document_ids=[own], expected_revision=0),
+                                                    db, self.admin).data.scope_revision, 1)
+
+    def test_security_multiturn_supplements_uncited_body_within_selected_file_after_reload(self):
+        import asyncio
+        import re
+        from types import SimpleNamespace
+        guide = self._ready_scope_document("数据安全指南.txt", ["指南将数据分为三级：公开、内部、机密。"])
+        manual = self._ready_scope_document("星海科技内部管理手册（2026版）.txt", [
+            "手册将数据分为四级：公开级、内部级、机密级、绝密级。",
+            "内部级数据对外发送前必须获得负责人审批，并先做脱敏处理。禁止未经批准直接外发。",
+        ])
+        async def consume(response):
+            return [json.loads(frame.split("data: ", 1)[1]) async for frame in response.body_iterator]
+        prompts = []
+        def model(messages):
+            current = messages[-1].content
+            prompts.append(current)
+            blocks = re.findall(r"\[([0-9]+)\] 来源：([^\n]+)\n(.*?)(?=\n\n---\n\n|\n\n【本轮追问|\n\n【用户问题】)", current, re.DOTALL)
+            def number(fragment):
+                return next(index for index, _title, text in blocks if fragment in text)
+            question = current.split("【用户问题】\n", 1)[1]
+            if question == "内部级能否外发？":
+                self.assertNotIn("数据安全指南.txt", current)
+                self.assertIn("审批", current)
+                text = f"内部级外发必须审批并脱敏，禁止未经批准直接外发[{number('负责人审批')}]。"
+            elif question == "未规定的太空数据规则？":
+                text = "根据现有知识库无法回答该细节。"
+            elif question == "星海科技内部管理手册":
+                text = f"手册分四级：公开级、内部级、机密级、绝密级[{number('手册将数据')}]。"
+            else:
+                text = f"《数据安全指南》分三级[{number('指南将数据')}]。\n《星海科技内部管理手册（2026版）》分四级[{number('手册将数据')}]。"
+            return [SimpleNamespace(content=text)]
+        conversation_id, revision = None, None
+        with patch.object(rag, "get_llm") as llm:
+            llm.return_value.stream.side_effect = model
+            for question in ["数据安全分几级", "具体点呢", "星海科技内部管理手册", "内部级能否外发？", "未规定的太空数据规则？"]:
+                with self.subTest(question=question), SessionLocal() as db:
+                    payload = ChatRequest(question=question, kb_id=self.kb.id, conversation_id=conversation_id,
+                                          scope_revision=revision)
+                    frames = asyncio.run(consume(chat.chat_stream(payload, self.request, db, self.admin)))
+                    done = frames[-1]
+                    self.assertIn("message_id", done)
+                    conversation_id = uuid.UUID(frames[0]["conversation_id"])
+                    revision = done["scope_revision"]
+                    if question in {"数据安全分几级", "具体点呢"}:
+                        self.assertEqual(done["document_scope"], [])
+                        self.assertEqual({item["document_id"] for item in done["citations"]}, {str(guide), str(manual)})
+                    else:
+                        self.assertEqual([item["document_id"] for item in done["document_scope"]], [str(manual)])
+                        self.assertEqual(revision, 1)
+                    if question == "内部级能否外发？":
+                        self.assertEqual([item["document_id"] for item in done["citations"]], [str(manual)])
+                        self.assertEqual(done["citations"][0]["chunk_index"], 1)
+                    if question == "未规定的太空数据规则？":
+                        self.assertEqual(done["citations"], [])
+                # 模拟刷新：每轮均用新连接读取服务端保存的范围。
+                with SessionLocal() as db:
+                    detail = chat.get_conversation(conversation_id, db, self.admin).data
+                    self.assertEqual(detail.scope_revision, revision)
+                    self.assertEqual([item.document_id for item in detail.document_scope],
+                                     [item["document_id"] for item in done["document_scope"]])
+        self.assertEqual(len(prompts), 5)

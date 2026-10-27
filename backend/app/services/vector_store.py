@@ -207,7 +207,8 @@ def load_ready_citations(collection_name: str, citations: list[dict]) -> list[tu
     return result
 
 
-def search_ready_vectors(store: PGVector, vector: list[float], k: int) -> list[tuple[LCDocument, float]]:
+def search_ready_vectors(store: PGVector, vector: list[float], k: int, *,
+                         document_scope: list[dict] | None = None) -> list[tuple[LCDocument, float]]:
     """在 SQL 中过滤无效文档和旧代次；兼容旧向量缺少 index_version 的情况。"""
     from app.db.session import SessionLocal
 
@@ -229,6 +230,9 @@ def search_ready_vectors(store: PGVector, vector: list[float], k: int) -> list[t
                 func.coalesce(rows.cmetadata["index_version"].astext, "0") == cast(Document.index_version, String),
             )
         )
+        if document_scope is not None:
+            from app.services.document_scopes import scope_filter
+            statement = statement.where(scope_filter(document_scope))
         if settings.RETRIEVAL_MIN_SIMILARITY > 0:
             statement = statement.where(distance <= 1.0 - settings.RETRIEVAL_MIN_SIMILARITY)
         result = db.execute(statement.order_by(distance).limit(k)).all()

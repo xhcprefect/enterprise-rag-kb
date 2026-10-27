@@ -39,7 +39,7 @@ class FollowupApiTests(unittest.TestCase):
         ]
 
     def stream(self, question, *, history=None, mode="rag", docs=None, patches=(), real_answer=False,
-               verified_docs=None, topic_rows=()):
+               verified_docs=None, topic_rows=(), document_scope=None, scope_revision=0):
         conv = SimpleNamespace(id=uuid.uuid4(), kb_id=self.kb.id if mode == "rag" else None, mode=mode)
         db, writer = MagicMock(), MagicMock()
         db.scalars.return_value.all.return_value = list(reversed(self.history if history is None else history))
@@ -50,7 +50,7 @@ class FollowupApiTests(unittest.TestCase):
             return [frame async for frame in response.body_iterator]
 
         with ExitStack() as stack:
-            mock_turns(stack, conv.id, writer)
+            mock_turns(stack, conv.id, writer, document_scope=document_scope, scope_revision=scope_revision)
             for patcher in patches:
                 stack.enter_context(patcher)
             stack.enter_context(patch.object(chat, "_get_conversation", return_value=conv))
@@ -85,7 +85,11 @@ class FollowupApiTests(unittest.TestCase):
             model.return_value.stream.return_value = [SimpleNamespace(content="按手册，数据安全分为四级：公开级、内部级、机密级、绝密级[1]。")]
             result = self.stream("星海科技内部管理手册", history=history, docs=[toc], verified_docs=[manual], real_answer=True)
         rewrite.assert_not_called()
-        result.retrieve.assert_not_called()
+        result.retrieve.assert_called_once()
+        scope = result.retrieve.call_args.kwargs["document_scope"]
+        self.assertEqual([item["document_id"] for item in scope], [manual[0].metadata["document_id"]])
+        self.assertIn("数据安全分几级", result.retrieve.call_args.args[1])
+        self.assertNotIn("限定已引用文件", result.retrieve.call_args.args[1])
         requested = result.load_sources.call_args.args[1]
         self.assertEqual([item["source_index"] for item in requested], [2])
         self.assertEqual(requested[0]["document_id"], manual[0].metadata["document_id"])
@@ -101,12 +105,15 @@ class FollowupApiTests(unittest.TestCase):
         self.assertEqual([item["source_index"] for item in citations], [1])
         self.assertEqual(result.writer.add.call_args.args[0].citations, citations)
 
-    def test_elaboration_has_both_actual_sources_and_no_additional_retrieval(self):
+    def test_elaboration_keeps_both_verified_sources_and_supplements_only_these_documents(self):
         history, guide, manual = self.security_context(clarification=False)
         with patch.object(followup, "complete_short_chat") as rewrite:
             result = self.stream("具体点呢", history=history, verified_docs=[guide, manual])
         rewrite.assert_not_called()
-        result.retrieve.assert_not_called()
+        result.retrieve.assert_called_once()
+        scope = result.retrieve.call_args.kwargs["document_scope"]
+        self.assertEqual({item["document_id"] for item in scope},
+                         {guide[0].metadata["document_id"], manual[0].metadata["document_id"]})
         self.assertEqual([item["source_index"] for item in result.load_sources.call_args.args[1]], [1, 2])
         self.assertEqual(result.audit.call_args.args[-1]["retrieval_status"], "elaboration")
         current = result.answer.call_args.kwargs["prepared"].messages[-1].content
@@ -245,3 +252,85 @@ class FollowupApiTests(unittest.TestCase):
         result.writer.add.assert_not_called()
         self.assertEqual(result.events[-1][0], "error")
         self.assertIn("上下文输入预算", result.events[-1][1]["message"])
+
+    def test_document_choice_returns_a_persistent_identity_scope_in_done(self):
+        history, _, manual = self.security_context()
+        result = self.stream("星海科技内部管理手册", history=history, verified_docs=[manual])
+        done = result.events[-1][1]
+        self.assertEqual(done["scope_revision"], 1)
+        self.assertEqual(done["document_scope"], [{key: manual[0].metadata[key]
+                                                  for key in ("document_id", "filename", "index_version")}])
+
+    def test_new_detailed_question_retrieves_new_body_only_from_persisted_scope(self):
+        history, guide, manual = self.security_context(clarification=False)
+        scope = [{key: manual[0].metadata[key] for key in ("document_id", "filename", "index_version")}]
+        body = source("内部级数据对外发送前必须审批并脱敏。", **{**manual[0].metadata, "chunk_index": 20})
+        result = self.stream("内部级能否外发？", history=history, docs=[guide, body], document_scope=scope, scope_revision=4)
+        result.retrieve.assert_called_once_with(self.kb.collection_name, "内部级能否外发？", 6, document_scope=scope)
+        result.load_sources.assert_not_called()
+        prompt = result.answer.call_args.kwargs["prepared"].messages[-1].content
+        self.assertIn(body[0].page_content, prompt)
+        self.assertNotIn(guide[0].page_content, prompt)
+        self.assertEqual(result.events[-1][1]["document_scope"], scope)
+        self.assertEqual(result.events[-1][1]["scope_revision"], 4)
+
+    def test_answer_without_citations_keeps_scope_and_next_request_does_not_need_old_sources(self):
+        _, _, manual = self.security_context()
+        scope = [{key: manual[0].metadata[key] for key in ("document_id", "filename", "index_version")}]
+        first = self.stream("未规定的规则？", history=[], docs=[], real_answer=True,
+                            document_scope=scope, scope_revision=2)
+        self.assertEqual(first.events[-1][1]["citations"], [])
+        self.assertEqual(first.events[-1][1]["document_scope"], scope)
+        second = self.stream("内部级能否外发？", history=[], docs=[manual], document_scope=scope, scope_revision=2)
+        self.assertEqual(second.retrieve.call_args.kwargs["document_scope"], scope)
+
+    def test_elaboration_cannot_reintroduce_other_previously_cited_document(self):
+        history, guide, manual = self.security_context(clarification=False)
+        scope = [{key: manual[0].metadata[key] for key in ("document_id", "filename", "index_version")}]
+        result = self.stream("具体点呢", history=history, verified_docs=[manual], docs=[guide, manual],
+                             document_scope=scope, scope_revision=1)
+        requested = result.load_sources.call_args.args[1]
+        self.assertEqual([item["document_id"] for item in requested], [manual[0].metadata["document_id"]])
+        prompt = result.answer.call_args.kwargs["prepared"].messages[-1].content
+        self.assertIn(manual[0].page_content, prompt)
+        self.assertNotIn(guide[0].page_content, prompt)
+        self.assertEqual(result.events[-1][1]["document_scope"], scope)
+
+    def test_cleared_scope_is_not_recreated_by_a_generic_elaboration(self):
+        history, guide, manual = self.security_context(clarification=False)
+        result = self.stream("具体点呢", history=history, verified_docs=[guide, manual], scope_revision=5)
+        self.assertEqual(result.events[-1][1]["document_scope"], [])
+        self.assertEqual(result.events[-1][1]["scope_revision"], 5)
+
+    def test_explicit_reference_outside_scope_asks_to_switch_without_loading_it(self):
+        history, guide, manual = self.security_context(clarification=False)
+        scope = [{key: manual[0].metadata[key] for key in ("document_id", "filename", "index_version")}]
+        result = self.stream("解释刚才来源1", history=history, document_scope=scope, scope_revision=1)
+        result.retrieve.assert_not_called()
+        result.load_sources.assert_not_called()
+        result.answer.assert_not_called()
+        self.assertIn("不在当前文档范围", result.writer.add.call_args.args[0].content)
+        self.assertEqual(result.events[-1][1]["document_scope"], scope)
+
+    def test_explicit_topic_switch_clears_scope_only_with_successful_completion(self):
+        _, _, manual = self.security_context()
+        scope = [{key: manual[0].metadata[key] for key in ("document_id", "filename", "index_version")}]
+        completed = MagicMock(return_value=uuid.uuid4())
+        result = self.stream("换个话题，年假有几天？", docs=[], history=[], document_scope=scope, scope_revision=3,
+                             patches=[patch.object(chat_turns, "complete_turn", completed)])
+        result.retrieve.assert_called_once_with(self.kb.collection_name, "换个话题，年假有几天？", 6)
+        self.assertEqual(completed.call_args.kwargs["scope_update"], [])
+        self.assertEqual(result.events[0][1]["document_scope"], scope)
+        self.assertEqual(result.events[-1][1]["document_scope"], [])
+        self.assertEqual(result.events[-1][1]["scope_revision"], 4)
+
+    def test_invalidated_during_generation_reports_reselection_instead_of_success(self):
+        from fastapi import HTTPException
+        _, _, manual = self.security_context()
+        scope = [{key: manual[0].metadata[key] for key in ("document_id", "filename", "index_version")}]
+        result = self.stream("内部级能否外发？", docs=[manual], document_scope=scope, scope_revision=2,
+                             patches=[patch.object(chat_turns, "complete_turn", side_effect=HTTPException(409, "范围内文档已重新索引，请重新选择"))])
+        self.assertEqual(result.events[-1][0], "error")
+        self.assertIn("请重新选择", result.events[-1][1]["message"])
+        self.assertNotIn("done", [event for event, _ in result.events])
+        result.writer.add.assert_not_called()

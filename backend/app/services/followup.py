@@ -18,6 +18,7 @@ _REWRITE_PROMPT = """你只负责补全检索问题，不回答问题。下面�
 用户已换话题或问题本身独立时，直接返回原问题，不强行沿用旧主题。
 上一条助手在澄清时，当前的文件名、对象、年份或选项可能是对澄清的答复；把它与澄清前的原问题合并，不能只检索答复词。
 用户仅要求“具体点、详细说明”时，沿用已经明确的主题；历史列出不同文件的口径时可分别展开，不必再次要求用户二选一。
+若 document_scope 非空，它表示用户当前已选定的文件范围；沿用该范围理解追问，不因历史还出现其他文件而再次要求选文件。文件名仅是定位标签，不能据此添加答案事实。
 无法唯一确定指代时，要求澄清；历史助手回答不是已核实事实，不得据其臆造检索条件。
 只输出一个 JSON 对象，不输出 Markdown 或解释：
 能检索：{"action":"search","query":"完整的独立检索问题"}
@@ -242,8 +243,12 @@ def _source_followup(question: str, turns: list[tuple[dict, dict]]) -> Retrieval
     return RetrievalPlan(query, "document_followup" if chosen else "elaboration", citations=citations, topic=topic)
 
 
-def plan_retrieval(question: str, history: list[dict]) -> RetrievalPlan:
-    if _TOPIC_SWITCH.search(question.strip()):
+def is_topic_switch(question: str) -> bool:
+    return bool(_TOPIC_SWITCH.search(question.strip()))
+
+
+def plan_retrieval(question: str, history: list[dict], *, document_scope: list[dict] | None = None) -> RetrievalPlan:
+    if is_topic_switch(question):
         return RetrievalPlan(question)
     turns = complete_turns(history)
     reference = _reference_plan(question, turns)
@@ -258,19 +263,33 @@ def plan_retrieval(question: str, history: list[dict]) -> RetrievalPlan:
     if not turns:
         return RetrievalPlan(question, "clarify", "请补充您指的是哪个主题、对象或上一条问题，以便检索对应的知识库资料。")
 
-    # 历史（包括拒答）只提供对话主题；提示词明确限制助手旧回复不能成为新事实依据。
-    recent = trim_history(history, max_turns=settings.RETRIEVAL_REWRITE_HISTORY_TURNS,
-                          max_chars=settings.RETRIEVAL_REWRITE_HISTORY_CHARS,
-                          max_tokens=min(12000, settings.LLM_CONTEXT_WINDOW_TOKENS // 2))
-    dialogue = []
-    for item in recent:
-        content = item.get("content") or ""
-        if item["role"] == "assistant":
-            content = re.sub(r"\[([1-9][0-9]{0,3})\]", r"〔历史来源\1〕", content)
-        dialogue.append({"role": item["role"], "content": content})
-    messages = [SystemMessage(content=_REWRITE_PROMPT), HumanMessage(content=json.dumps(
-        {"history": dialogue, "question": question, "answer_to_clarification": clarification_reply}, ensure_ascii=False))]
-    if estimate_message_tokens(messages) + settings.RETRIEVAL_REWRITE_MAX_TOKENS + settings.CONTEXT_TOKEN_SAFETY_MARGIN > settings.LLM_CONTEXT_WINDOW_TOKENS:
+    # 历史、范围名称和 JSON 包装都计入预算；先扣固定部分，再裁剪完整轮次。
+    def rewrite_messages(recent):
+        dialogue = []
+        for item in recent:
+            content = item.get("content") or ""
+            if item["role"] == "assistant":
+                content = re.sub(r"\[([1-9][0-9]{0,3})\]", r"〔历史来源\1〕", content)
+            dialogue.append({"role": item["role"], "content": content})
+        return [SystemMessage(content=_REWRITE_PROMPT), HumanMessage(content=json.dumps(
+            {"history": dialogue, "question": question, "answer_to_clarification": clarification_reply,
+             "document_scope": document_scope or []}, ensure_ascii=False))]
+
+    input_budget = settings.LLM_CONTEXT_WINDOW_TOKENS - settings.RETRIEVAL_REWRITE_MAX_TOKENS - settings.CONTEXT_TOKEN_SAFETY_MARGIN
+    remaining = input_budget - estimate_message_tokens(rewrite_messages([]))
+    history_budget = min(12000, settings.LLM_CONTEXT_WINDOW_TOKENS // 2, remaining - 128)
+    for _ in range(4):
+        recent = trim_history(history, max_turns=settings.RETRIEVAL_REWRITE_HISTORY_TURNS,
+                              max_chars=settings.RETRIEVAL_REWRITE_HISTORY_CHARS, max_tokens=max(0, history_budget))
+        if not recent:
+            return RetrievalPlan(question, "fallback")
+        messages = rewrite_messages(recent)
+        overflow = estimate_message_tokens(messages) - input_budget
+        if overflow <= 0:
+            break
+        # JSON 转义和历史来源标记会增加字节数，按实际装配后的开销再收窄。
+        history_budget -= overflow + 64
+    else:
         return RetrievalPlan(question, "fallback")
     try:
         response = complete_short_chat(messages, timeout=settings.RETRIEVAL_REWRITE_TIMEOUT,

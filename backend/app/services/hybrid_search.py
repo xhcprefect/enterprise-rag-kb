@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import unicodedata
+from urllib.parse import urlparse
 
 import httpx
 from langchain_core.documents import Document
@@ -93,32 +94,43 @@ def fuse_results(vector_pairs, keyword_pairs, limit=200):
 
 
 async def _rerank(query, pairs, base_url, api_key, model, timeout, max_chars):
+    from app.services.usage_tracking import ModelCall
+
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     payload = {"model": model, "query": query, "documents": [doc.page_content[:max_chars] for doc, _ in pairs],
                "top_n": len(pairs), "return_documents": False}
-    async with asyncio.timeout(timeout):
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(2, timeout))) as client:
-            response = await client.post(base_url.rstrip("/") + "/rerank", headers=headers, json=payload)
-            response.raise_for_status()
-            results = response.json().get("results")
-    if not isinstance(results, list) or not results:
-        raise ValueError("invalid rerank results")
-    selected, seen = [], set()
-    for item in results:
-        if not isinstance(item, dict):
-            raise ValueError("invalid rerank item")
-        index, score = item.get("index"), item.get("relevance_score")
-        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(pairs) or index in seen:
-            raise ValueError("invalid rerank index")
-        if not isinstance(score, (int, float)) or isinstance(score, bool) or not math.isfinite(score):
-            raise ValueError("invalid rerank score")
-        seen.add(index)
-        doc, distance = pairs[index]
-        selected.append((Document(page_content=doc.page_content, metadata={**copy.deepcopy(doc.metadata), "rerank_score": float(score)}), distance))
-    selected.extend(pair for index, pair in enumerate(pairs) if index not in seen)
-    return selected
+    call = ModelCall("rerank", (urlparse(base_url).hostname or "rerank").lower(), model)
+    try:
+        async with asyncio.timeout(timeout):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(2, timeout))) as client:
+                response = await client.post(base_url.rstrip("/") + "/rerank", headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                call.observe(data.get("usage"))
+                results = data.get("results")
+        if not isinstance(results, list) or not results:
+            raise ValueError("invalid rerank results")
+        selected, seen = [], set()
+        for item in results:
+            if not isinstance(item, dict):
+                raise ValueError("invalid rerank item")
+            index, score = item.get("index"), item.get("relevance_score")
+            if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(pairs) or index in seen:
+                raise ValueError("invalid rerank index")
+            if not isinstance(score, (int, float)) or isinstance(score, bool) or not math.isfinite(score):
+                raise ValueError("invalid rerank score")
+            seen.add(index)
+            doc, distance = pairs[index]
+            selected.append((Document(page_content=doc.page_content, metadata={**copy.deepcopy(doc.metadata), "rerank_score": float(score)}), distance))
+        selected.extend(pair for index, pair in enumerate(pairs) if index not in seen)
+    except BaseException:
+        call.finish("failed")
+        raise
+    else:
+        call.finish()
+        return selected
 
 
 def rerank_results(query, pairs, *, base_url, api_key, model, timeout=3, max_chars=2000):

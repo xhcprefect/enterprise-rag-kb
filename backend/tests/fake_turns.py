@@ -12,7 +12,7 @@ def keepalive(_reservation):
     yield lambda: None
 
 
-def mock_turns(stack, conversation_id, writer):
+def mock_turns(stack, conversation_id, writer, *, document_scope=None, scope_revision=0):
     writer.__enter__.return_value = writer
 
     def claim(db, **kwargs):
@@ -20,9 +20,10 @@ def mock_turns(stack, conversation_id, writer):
         db.add(Message(id=message_id, conversation_id=conversation_id, role="user", content=kwargs["question"],
                        turn_id=turn_id, status="processing"))
         return chat_turns.Reservation(turn_id, kwargs.get("request_id") or uuid.uuid4(), conversation_id,
-                                      message_id, kwargs["user_id"])
+                                      message_id, kwargs["user_id"], document_scope=document_scope or [],
+                                      scope_revision=scope_revision)
 
-    def complete(db, reservation, answer, citations, latency, trace):
+    def complete(db, reservation, answer, citations, latency, trace, **_options):
         identifier = uuid.uuid4()
         db.add(Message(id=identifier, conversation_id=conversation_id, role="assistant", content=answer,
                        turn_id=reservation.turn_id, reply_to_id=reservation.user_message_id,

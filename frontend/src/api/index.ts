@@ -3,6 +3,9 @@ import { consumeEventStream, StreamProtocolError } from '@/utils/stream'
 import { i18n } from '@/i18n'
 import type { ChatCompletion } from '@/utils/citations'
 import { createChatRequestId } from '@/utils/chatRequest'
+import { buildScopePatchBody, type DocumentScopeItem } from '@/utils/documentScope'
+
+export type { DocumentScopeItem } from '@/utils/documentScope'
 
 // ---------- 类型 ----------
 export interface User {
@@ -87,10 +90,31 @@ export interface Conversation {
   title: string
   created_at: string
   updated_at: string
+  /** 当前限定的文档范围；空数组表示整个知识库。旧响应可能缺失。 */
+  document_scope?: DocumentScopeItem[]
+  /** 范围版本号，用于 PATCH 与流式响应的并发保护；旧响应缺失时按 0。 */
+  scope_revision?: number
 }
 
 export interface ConversationDetail extends Conversation {
   messages: MessageItem[]
+}
+
+/** PATCH /chat/conversations/{id}/scope 的 data。 */
+export interface ChatScopeResponse {
+  document_scope: DocumentScopeItem[]
+  scope_revision: number
+}
+
+/** SSE meta 事件；document_scope/scope_revision 为可选的新字段。 */
+export interface ChatStreamMeta {
+  conversation_id: string
+  request_id?: string
+  user_message_id?: string
+  citations: Citation[]
+  mode?: ChatMode
+  document_scope?: DocumentScopeItem[]
+  scope_revision?: number
 }
 
 export interface PageResult<T> {
@@ -289,6 +313,15 @@ export const chatApi = {
       params: { kb_id: params?.kbId, mode: params?.mode }
     }),
   conversation: (id: string) => client.get<ConversationDetail>(`/chat/conversations/${id}`),
+  /**
+   * 更新会话限定的文档范围。空数组表示恢复整个知识库。
+   * expectedRevision 来自当前会话快照；服务端忙碌或版本冲突返回 409。
+   */
+  setDocumentScope: (id: string, documentIds: string[], expectedRevision?: number) =>
+    client.patch<ChatScopeResponse>(
+      `/chat/conversations/${id}/scope`,
+      buildScopePatchBody(documentIds, expectedRevision)
+    ),
   removeConversation: (id: string) => client.delete(`/chat/conversations/${id}`)
 }
 
@@ -305,9 +338,13 @@ export async function streamChat(
     top_k?: number
     /** 只在新建会话时生效，续聊以会话已存的模式为准 */
     mode?: ChatMode
+    /** 新会话创建时携带的草稿范围；已有会话改用 PATCH scope */
+    document_ids?: string[]
+    /** 已有会话发送时的范围版本快照，用于并发保护 */
+    scope_revision?: number
   },
   handlers: {
-    onMeta?: (data: { conversation_id: string; request_id?: string; user_message_id?: string; citations: Citation[]; mode?: ChatMode }) => void
+    onMeta?: (data: ChatStreamMeta) => void
     onDelta?: (text: string) => void
     onDone?: (data: ChatCompletion) => void
     onError?: (message: string) => void

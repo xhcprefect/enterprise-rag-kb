@@ -19,6 +19,7 @@ from app.db.session import SessionLocal
 from app.models import Document, DocumentChunk, DocumentStatus, KnowledgeBase
 from app.services.structured_documents import iter_structured_chunks
 from app.services.hybrid_search import build_search_text
+from app.services.usage_tracking import ModelCall, UsageContext, usage_scope
 from app.services.vector_store import delete_document_vectors, get_vector_store, persist_vectors
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class IngestJob:
     stored_path: str
     version: int
     lease_id: uuid.UUID
+    user_id: uuid.UUID | None = None
 
 
 def _now() -> datetime:
@@ -129,7 +131,7 @@ def _claim(db: Session, document_id: uuid.UUID, lease_id: uuid.UUID | None) -> I
         raise IngestLeaseLost
     doc.error_message = None
     doc.heartbeat_at = _now()
-    job = IngestJob(doc.id, doc.kb_id, doc.filename, doc.stored_path, doc.index_version, doc.lease_id)
+    job = IngestJob(doc.id, doc.kb_id, doc.filename, doc.stored_path, doc.index_version, doc.lease_id, getattr(doc, "uploaded_by", None))
     db.commit()
     return job
 
@@ -179,7 +181,19 @@ def _embed_pending(db: Session, job: IngestJob, store, total: int, done: int) ->
                 row.search_text = build_search_text(row.content, {**(row.source_metadata or {}), "filename": job.filename})
         db.commit()  # 网络期间不持有文档行锁，也不占用数据库连接。
 
-        vectors = store.embeddings.embed_documents(contents)
+        context = UsageContext(user_id=job.user_id, kb_id=job.kb_id, document_id=job.document_id,
+                               operation="document_embedding")
+        with usage_scope(context):
+            local_call = ModelCall("embedding", "ollama", settings.EMBEDDING_MODEL) if settings.EMBEDDING_PROVIDER != "cloud" else None
+            try:
+                vectors = store.embeddings.embed_documents(contents)
+            except BaseException:
+                if local_call:
+                    local_call.finish("failed")
+                raise
+            else:
+                if local_call:
+                    local_call.finish()
         payload = [LCDocument(page_content=content, metadata={
             **location,
             "document_id": str(job.document_id), "kb_id": str(job.kb_id),

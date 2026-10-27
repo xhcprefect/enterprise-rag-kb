@@ -37,6 +37,9 @@ class Conversation(Base, TimestampMixin):
         String(16), default=CONVERSATION_MODE_RAG, nullable=False
     )
     title: Mapped[str] = mapped_column(String(200), default="新会话", nullable=False)
+    # 空列表表示全知识库；非空范围绑定文档身份和索引代次，不能凭文件名复活。
+    document_scope: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]", nullable=False)
+    scope_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     # 数据库租约令牌（不加循环外键）；所有生成写回必须再次匹配令牌。
     active_turn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

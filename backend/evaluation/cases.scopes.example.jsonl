@@ -1,0 +1,4 @@
+{"id":"scope-choose-count","turns":["合成数据安全资料中，数据分几级？","具体点呢","合成内部管理手册"],"expected_outcome":"answer","expected_sources":[{"filename":"合成内部管理手册.md"}],"required_phrases":["四级","公开级","内部级","机密级","绝密级"],"forbidden_phrases":["请先选择","分为三级"]}
+{"id":"scope-new-body","turns":["合成数据安全资料中，数据分几级？","具体点呢","合成内部管理手册","内部级能否外发？"],"expected_outcome":"answer","expected_sources":[{"filename":"合成内部管理手册.md"}],"required_phrases":["审批","脱敏"],"forbidden_phrases":["口头确认","可以直接公开"]}
+{"id":"scope-missing-detail","turns":["合成数据安全资料中，数据分几级？","合成内部管理手册","手册规定的审批系统网址是什么？"],"expected_outcome":"refuse","expect_no_citations":true}
+{"id":"scope-topic-switch","turns":["合成数据安全资料中，数据分几级？","合成内部管理手册","换个话题，合成错误手册中 ERR_AUTH_401 怎么处理？"],"expected_outcome":"answer","expected_sources":[{"filename":"合成错误手册.md"}],"required_phrases":["重新登录"],"forbidden_phrases":["内部级","口头确认"]}

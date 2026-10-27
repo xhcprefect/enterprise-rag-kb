@@ -15,6 +15,7 @@ from app.services.context_window import (
 )
 from app.services.source_documents import LOCATION_FIELDS, public_location
 from app.services.vector_store import get_vector_store, search_ready_vectors
+from app.services.usage_tracking import ModelCall, UsageContext, iterate_with_context
 
 logger = logging.getLogger(__name__)
 
@@ -135,20 +136,40 @@ def finalize_citations(answer: str, candidates: list[dict]) -> list[dict]:
     return citations
 
 
-def retrieve(collection_name: str, question: str, top_k: int) -> list[tuple[LCDocument, float]]:
-    """合并向量和关键词候选，可选重排，再限制来源并补同结构相邻原文。"""
+def retrieve(collection_name: str, question: str, top_k: int, *,
+             document_scope: list[dict] | None = None) -> list[tuple[LCDocument, float]]:
+    """合并两路候选；文档范围在两路 SQL 排名和截断前生效。"""
+    from app.services import document_scopes
     from app.services.hybrid_search import fuse_results, rerank_results
     from app.services.retrieval_candidates import expand_neighbors, keyword_candidates
+
+    if document_scope is not None:
+        document_scopes.scope_pairs(document_scope)  # 非法身份不能进入关键词降级路径。
+        if not document_scope:
+            return []
+    scope_options = {"document_scope": document_scope} if document_scope is not None else {}
+
+    def in_scope(pairs):
+        return pairs if document_scope is None else [pair for pair in pairs if document_scopes.contains(document_scope, pair[0].metadata)]
 
     limit = max(1, settings.RETRIEVAL_MAX_PER_DOC)
     vector_error = None
     pairs = []
     try:
         store = get_vector_store(collection_name)
-        vector = store.embeddings.embed_query(question)  # 扩大候选池时复用同一查询向量。
+        local_call = ModelCall("embedding", "ollama", settings.EMBEDDING_MODEL) if settings.EMBEDDING_PROVIDER != "cloud" else None
+        try:
+            vector = store.embeddings.embed_query(question)  # 扩大候选池时复用同一查询向量。
+        except BaseException:
+            if local_call:
+                local_call.finish("failed")
+            raise
+        else:
+            if local_call:
+                local_call.finish()  # Ollama embeddings 未返回 token，明确保留未知。
         size = max(top_k * 10, 40)
         while True:
-            fetched = search_ready_vectors(store, vector, size)
+            fetched = in_scope(search_ready_vectors(store, vector, size, **scope_options))
             if not fetched:
                 break
             pairs = fetched
@@ -163,7 +184,7 @@ def retrieve(collection_name: str, question: str, top_k: int) -> list[tuple[LCDo
 
     if settings.HYBRID_RETRIEVAL_ENABLED:
         try:
-            keywords = keyword_candidates(collection_name, question, settings.KEYWORD_CANDIDATES)
+            keywords = in_scope(keyword_candidates(collection_name, question, settings.KEYWORD_CANDIDATES, **scope_options))
         except Exception as exc:
             if vector_error:
                 raise vector_error from exc
@@ -188,7 +209,35 @@ def retrieve(collection_name: str, question: str, top_k: int) -> list[tuple[LCDo
             seen.add(id(pair[0]))
     order = {id(doc): position for position, (doc, _) in enumerate(pairs)}
     picked.sort(key=lambda pair: order[id(pair[0])])
-    return expand_neighbors(collection_name, picked, settings.RETRIEVAL_NEIGHBOR_CHUNKS)
+    return in_scope(expand_neighbors(collection_name, picked, settings.RETRIEVAL_NEIGHBOR_CHUNKS))
+
+
+def supplement_sources(collection_name: str, query: str, anchors: list[tuple[LCDocument, float]],
+                       top_k: int, document_scope: list[dict]) -> list[tuple[LCDocument, float]]:
+    """重新检索所选文件，保留已核验锚点，并补充未覆盖的新原文而非旧答案。"""
+    from app.services.document_scopes import contains
+
+    fresh = retrieve(collection_name, query, top_k, document_scope=document_scope)
+    result, covered = [], set()
+    # 给新证据保留空间；旧片段数不随历史累积，上下文总量仍受 prepare_answer 限制。
+    anchor_limit = min(5, max(1, top_k // 2))
+    for doc, score in [*anchors[:anchor_limit], *fresh, *anchors[anchor_limit:]]:
+        meta = doc.metadata
+        if not contains(document_scope, meta):
+            continue
+        index = meta.get("chunk_index")
+        start, end = meta.get("chunk_start", index), meta.get("chunk_end", index)
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in (index, start, end)) or not 0 <= start <= index <= end or end - start > 4:
+            continue
+        identity = str(meta.get("document_id")), meta.get("index_version", 0)
+        keys = {(*identity, number) for number in range(start, end + 1)}
+        if keys <= covered:
+            continue
+        result.append((doc, score))
+        covered.update(keys)
+        if len(result) >= max(top_k, anchor_limit + 1):
+            break
+    return result
 
 
 def _pick_with_doc_cap(
@@ -370,6 +419,7 @@ def filter_reasoning(parts: Iterable[str]) -> Iterator[str]:
 def answer_stream(
     question: str, pairs: list[tuple[LCDocument, float]], history: list[dict], mode: str = "rag",
     *, prepared: PreparedAnswer | None = None, metrics: dict | None = None,
+    usage_context: UsageContext | None = None,
 ) -> Iterator[str]:
     if prepared is None and (mode == "chat" or pairs):
         prepared = prepare_answer(question, pairs, history, mode)
@@ -379,13 +429,37 @@ def answer_stream(
     llm = get_llm()
     messages = prepared.messages
     def parts():
-        for chunk in llm.stream(messages):
-            usage = getattr(chunk, "usage_metadata", None)
-            if metrics is not None and isinstance(usage, dict):
-                for key in ("input_tokens", "output_tokens"):
-                    value = usage.get(key)
-                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                        metrics[key] = max(metrics.get(key, 0), value)
-            if isinstance(chunk.content, str):
-                yield chunk.content
-    yield from filter_reasoning(parts())
+        local_call = ModelCall("chat", "ollama", settings.LLM_MODEL, context=usage_context) if settings.LLM_PROVIDER != "cloud" else None
+        iterator = None
+        try:
+            iterator = iterate_with_context(llm.stream(messages), usage_context)
+            for chunk in iterator:
+                usage = getattr(chunk, "usage_metadata", None)
+                if local_call:
+                    local_call.observe(usage)
+                if metrics is not None and isinstance(usage, dict):
+                    for key in ("input_tokens", "output_tokens"):
+                        value = usage.get(key)
+                        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                            metrics[key] = max(metrics.get(key, 0), value)
+                if isinstance(chunk.content, str):
+                    yield chunk.content
+        except GeneratorExit:
+            if local_call:
+                local_call.finish("cancelled")
+            raise
+        except BaseException:
+            if local_call:
+                local_call.finish("failed")
+            raise
+        else:
+            if local_call:
+                local_call.finish()
+        finally:
+            if iterator is not None:
+                iterator.close()
+    source = parts()
+    try:
+        yield from filter_reasoning(source)
+    finally:
+        source.close()

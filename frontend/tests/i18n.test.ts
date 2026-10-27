@@ -21,7 +21,7 @@ test('Chinese and English catalogs cover the same pages and have identical messa
   const zh = flatten(messages['zh-CN'])
   const en = flatten(messages['en-US'])
   assert.deepEqual(Object.keys(zh).sort(), Object.keys(en).sort())
-  for (const namespace of ['common', 'nav', 'preferences', 'layout', 'errors', 'login', 'chat', 'knowledge', 'documents', 'users', 'audit', 'profile']) {
+  for (const namespace of ['common', 'nav', 'preferences', 'layout', 'errors', 'login', 'chat', 'knowledge', 'documents', 'usage', 'users', 'audit', 'profile']) {
     assert.ok(Object.keys(zh).some(key => key.startsWith(`${namespace}.`)), `Missing ${namespace} messages`)
   }
   for (const [key, value] of [...Object.entries(zh), ...Object.entries(en)]) assert.ok(value.trim(), `Empty translation: ${key}`)

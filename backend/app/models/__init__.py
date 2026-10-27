@@ -10,6 +10,7 @@ from app.models.conversation import (
 from app.models.document import Document, DocumentChunk, DocumentStatus, KnowledgeBase
 from app.models.upload import UploadSession, UploadStatus
 from app.models.user import User, UserRole
+from app.models.usage import ModelPrice, ModelUsage, UsageTrackingState
 
 __all__ = [
     "AuditLog",
@@ -27,4 +28,7 @@ __all__ = [
     "UploadStatus",
     "User",
     "UserRole",
+    "ModelPrice",
+    "ModelUsage",
+    "UsageTrackingState",
 ]

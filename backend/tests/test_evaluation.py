@@ -27,6 +27,18 @@ class EvaluationTests(unittest.TestCase):
         self.assertNotIn("提前3天", json.dumps(report, ensure_ascii=False))
         self.assertIn("不是语义事实正确率", report["notes"][0])
 
+    def test_scope_release_cases_are_valid_and_reference_shipped_synthetic_documents(self):
+        root = Path(__file__).parents[1] / "evaluation"
+        cases = ev.validate_cases(ev.read_jsonl(root / "cases.scopes.example.jsonl"))
+        self.assertEqual(len(cases), 4)
+        self.assertTrue(all(3 <= len(case["turns"]) <= 4 for case in cases))
+        for case in cases:
+            for source in case.get("expected_sources", []):
+                self.assertTrue((root / "documents" / source["filename"]).is_file())
+        self.assertEqual(cases[1]["turns"][-1], "内部级能否外发？")
+        self.assertIn("口头确认", cases[1]["forbidden_phrases"])
+        self.assertTrue(cases[2]["expect_no_citations"])
+
     def test_required_forbidden_outcome_and_source_assertions_fail_independently(self):
         case = {"id": "x", "expected_outcome": "answer", "required_phrases": ["must"], "forbidden_phrases": ["bad"],
                 "expected_sources": [{"filename": "right.txt"}]}

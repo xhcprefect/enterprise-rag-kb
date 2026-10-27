@@ -14,9 +14,12 @@ from app.api.deps import admit_chat, get_current_user, write_audit
 from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.models import CONVERSATION_MODE_CHAT, CONVERSATION_MODE_RAG, ChatTurn, Conversation, KnowledgeBase, Message, User
-from app.schemas.chat import Citation, ChatMode, ChatRequest, ConversationDetail, ConversationRead
+from app.schemas.chat import (
+    Citation, ChatMode, ChatRequest, ConversationDetail, ConversationRead,
+    DocumentScopeState, DocumentScopeUpdate,
+)
 from app.schemas.common import ApiResponse
-from app.services import chat_turns, followup, rag
+from app.services import chat_turns, document_scopes, followup, rag, usage_tracking
 from app.services.cloud_models import CloudModelError
 from app.services.context_window import ContextBudgetError
 from app.services.vector_store import load_ready_citations
@@ -26,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_conversation(db: DBSession, conversation_id: uuid.UUID, user: User) -> Conversation:
-    conv = db.get(Conversation, conversation_id)
+    conv = db.get(Conversation, conversation_id, populate_existing=True)
     if conv is None or (conv.user_id != user.id and not user.is_admin):
         raise HTTPException(status_code=404, detail="会话不存在")
     return conv
@@ -63,6 +66,18 @@ def get_conversation(conversation_id: uuid.UUID, db: DBSession = Depends(get_db)
                      if detail.mode == CONVERSATION_MODE_RAG and message.role == "assistant" and message.status == "completed" else [])
         message.citations = [Citation.model_validate(citation) for citation in citations] or None
     return ApiResponse(data=detail)
+
+
+@router.patch("/conversations/{conversation_id}/scope", response_model=ApiResponse[DocumentScopeState], summary="调整会话文档范围")
+def set_document_scope(conversation_id: uuid.UUID, payload: DocumentScopeUpdate,
+                       db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
+    conv = _get_conversation(db, conversation_id, user)
+    if conv.mode != CONVERSATION_MODE_RAG or conv.kb_id is None:
+        raise HTTPException(400, "普通对话不支持文档范围")
+    _get_kb(db, conv.kb_id, user)
+    selected, revision = chat_turns.set_document_scope(db, conversation_id, payload.document_ids,
+                                                     payload.expected_revision)
+    return ApiResponse(data=DocumentScopeState(document_scope=selected, scope_revision=revision))
 
 
 @router.delete("/conversations/{conversation_id}", response_model=ApiResponse[None], summary="删除会话")
@@ -106,6 +121,39 @@ def _source_identities(pairs):
             for citation in rag.to_citations(pairs)]
 
 
+def _retrieve_plan(collection, plan, top_k, active_scope, *, reset_scope=False):
+    """历史来源只提供已核验锚点；新增证据始终从当前文档范围重新检索。"""
+    selected = None if reset_scope else active_scope or None
+    scope_update = [] if reset_scope else None
+    if plan.status in {"reference", "document_followup", "elaboration"}:
+        requested = plan.citations
+        if selected and plan.status == "reference" and any(not document_scopes.contains(selected, item) for item in requested):
+            return [], followup.RetrievalPlan(plan.query, "clarify", "该历史来源不在当前文档范围内，请先切换或取消范围后再核验。", topic=plan.topic), None
+        if selected and plan.status == "elaboration":
+            requested = [item for item in requested if document_scopes.contains(selected, item)]
+            names = "、".join("《" + item["filename"] + "》" for item in selected)
+            plan = followup.RetrievalPlan(
+                f"围绕原问题和后续要求：\n{plan.topic}\n请仅在当前限定文件中继续展开：{names}。",
+                plan.status, citations=requested, topic=plan.topic,
+            )
+        anchors = load_ready_citations(collection, requested) if requested else []
+        if len(anchors) != len(requested):
+            return [], followup.RetrievalPlan(plan.query, "clarify", "您指定的历史来源已不可用、被更新或无法核验，请重新选择文档或确认来源。", topic=plan.topic), None
+        if plan.status == "reference":
+            return anchors, plan, scope_update
+        if plan.status == "document_followup":
+            selected = scope_update = document_scopes.from_verified_pairs(anchors)
+        elif selected is None:
+            selected = document_scopes.from_verified_pairs(anchors)
+        docs = rag.supplement_sources(collection, plan.topic or plan.query, anchors, top_k, selected)
+    else:
+        options = {"document_scope": selected} if selected is not None else {}
+        docs = rag.retrieve(collection, plan.query, top_k, **options)
+    if selected is not None:
+        docs = [pair for pair in docs if document_scopes.contains(selected, pair[0].metadata)]
+    return docs, plan, scope_update
+
+
 @router.post("/stream", dependencies=[Depends(admit_chat)], summary="流式问答（SSE）")
 def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     if payload.include_trace and not user.is_admin:
@@ -131,22 +179,28 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
     reservation = chat_turns.claim_turn(
         db, user_id=user.id, conversation_id=payload.conversation_id, kb_id=kb.id if kb else None,
         mode=mode, question=payload.question, top_k=payload.top_k, request_id=payload.request_id,
+        document_ids=payload.document_ids, scope_revision=payload.scope_revision,
+        reset_scope=mode == CONVERSATION_MODE_RAG and followup.is_topic_switch(payload.question),
     )
     conv_id = str(reservation.conversation_id)
+    scope_state = {"document_scope": reservation.document_scope, "scope_revision": reservation.scope_revision}
     meta = {"conversation_id": conv_id, "request_id": str(reservation.request_id),
-            "user_message_id": str(reservation.user_message_id), "citations": [], "mode": mode}
+            "user_message_id": str(reservation.user_message_id), "citations": [], "mode": mode, **scope_state}
     if reservation.replay_answer is not None:
         # 新建请求的重放也要重新检查当前会话权限，不能借历史管理员身份读取他人会话。
         replay_conv = _get_conversation(db, reservation.conversation_id, user)
         if replay_conv.mode != mode or replay_conv.kb_id != (kb.id if kb else None):
             raise HTTPException(409, "原会话配置已改变，请刷新后重试")
+        scope_state = {"document_scope": getattr(replay_conv, "document_scope", []) or [],
+                       "scope_revision": getattr(replay_conv, "scope_revision", 0) or 0}
+        meta.update(scope_state)
         db.commit()
         def replay():
             citations = rag.finalize_citations(reservation.replay_answer, reservation.replay_citations) if mode == "rag" else []
             yield _sse("meta", {**meta, "replayed": True})
             yield _sse("delta", {"content": reservation.replay_answer})
             done = {"latency_ms": reservation.replay_latency_ms, "citations": citations,
-                    "message_id": str(reservation.assistant_message_id), "replayed": True}
+                    "message_id": str(reservation.assistant_message_id), "replayed": True, **scope_state}
             if payload.include_trace:
                 done["trace"] = reservation.replay_trace
             yield _sse("done", done)
@@ -190,6 +244,8 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
     kb_name = kb.name if kb else "普通对话"
     user_id, username = user.id, user.username
     question = payload.question
+    usage_context = usage_tracking.UsageContext(user_id=user_id, kb_id=kb.id if kb else None,
+                                               conversation_id=reservation.conversation_id, turn_id=reservation.turn_id)
     scope = f"kb={collection}" if collection else f"mode={mode}"
 
     def event_stream() -> Iterator[str]:
@@ -200,23 +256,25 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         plan = followup.RetrievalPlan(question)
         prepared = None
         usage = {}
+        scope_update = None
         try:
             with chat_turns.keepalive(reservation) as ensure_active:
                 yield _sse("meta", meta)
                 if mode == CONVERSATION_MODE_RAG:
                     t = time.perf_counter()
-                    plan = followup.plan_retrieval(question, history)
+                    plan_options = ({"document_scope": reservation.document_scope}
+                                    if reservation.document_scope and not followup.is_topic_switch(question) else {})
+                    with usage_tracking.usage_scope(usage_context.for_operation("rewrite")):
+                        plan = followup.plan_retrieval(question, history, **plan_options)
                     rewrite_ms = (time.perf_counter() - t) * 1000
                     ensure_active()
                     if not plan.clarification:
                         t = time.perf_counter()
-                        if plan.status in {"reference", "document_followup", "elaboration"}:
-                            docs = load_ready_citations(collection, plan.citations)
-                            if len(docs) != len(plan.citations):
-                                docs = []
-                                plan = followup.RetrievalPlan(question, "clarify", "您指定的历史来源已不可用、被更新或无法核验，请重新选择文档或确认来源。")
-                        else:
-                            docs = rag.retrieve(collection, plan.query, payload.top_k)
+                        with usage_tracking.usage_scope(usage_context.for_operation("query_embedding")):
+                            docs, plan, scope_update = _retrieve_plan(
+                                collection, plan, payload.top_k, reservation.document_scope,
+                                reset_scope=followup.is_topic_switch(question),
+                            )
                         retrieve_ms = (time.perf_counter() - t) * 1000
                 candidate_sources = _source_identities(docs)
                 if not plan.clarification and (mode == CONVERSATION_MODE_CHAT or docs):
@@ -225,11 +283,16 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                 candidates = rag.to_citations(docs)
                 t_llm = time.perf_counter()
                 tokens = iter([plan.clarification]) if plan.clarification else rag.answer_stream(
-                    question, docs, history, mode=mode, prepared=prepared, metrics=usage)
-                for token in tokens:
-                    ensure_active()
-                    answer_parts.append(token)
-                    yield _sse("delta", {"content": token})
+                    question, docs, history, mode=mode, prepared=prepared, metrics=usage, usage_context=usage_context)
+                try:
+                    for token in tokens:
+                        ensure_active()
+                        answer_parts.append(token)
+                        yield _sse("delta", {"content": token})
+                finally:
+                    close = getattr(tokens, "close", None)
+                    if close:
+                        close()
                 answer = "".join(answer_parts).strip()
                 if not answer:
                     raise CloudModelError("模型未返回有效内容，请重试")
@@ -244,7 +307,9 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                          "input_budget": prepared.input_budget if prepared else 0, "usage": usage or None,
                          "usage_scope": "generation_only"}
                 with SessionLocal() as session:
-                    message_id = chat_turns.complete_turn(session, reservation, answer, citations, latency, trace)
+                    completion_options = {"scope_update": scope_update} if scope_update is not None else {}
+                    message_id = chat_turns.complete_turn(session, reservation, answer, citations, latency, trace,
+                                                          **completion_options)
                     cleaned = True
                     detail = {"mode": mode, "conversation_id": conv_id, "request_id": str(reservation.request_id),
                               "retrieval_status": plan.status, "context_tokens_estimate": trace["input_tokens_estimate"]}
@@ -258,7 +323,10 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                 logger.info("问答完成: %s user=%s request=%s 补全=%.0fms 检索=%.0fms 生成=%.0fms 总计=%dms 引用=%d 上下文=%d/%d",
                             scope, username, reservation.request_id, rewrite_ms, retrieve_ms, generation_ms, latency,
                             len(citations), trace["input_tokens_estimate"], trace["input_budget"])
-                done = {"latency_ms": latency, "citations": citations, "message_id": str(message_id)}
+                final_scope = reservation.document_scope if scope_update is None else scope_update
+                revision = reservation.scope_revision + int(final_scope != reservation.document_scope)
+                done = {"latency_ms": latency, "citations": citations, "message_id": str(message_id),
+                        "document_scope": final_scope, "scope_revision": revision}
                 if payload.include_trace:
                     done["trace"] = trace
                 yield _sse("done", done)
@@ -271,7 +339,9 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                             scope, username, reservation.request_id)
             else:
                 logger.exception("问答失败: %s user=%s request=%s", scope, username, reservation.request_id)
-            message = str(exc) if isinstance(exc, (CloudModelError, ContextBudgetError, chat_turns.ChatLeaseLost)) else "问答处理失败，请稍后重试"
+            message = (str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                       if isinstance(exc, (CloudModelError, ContextBudgetError, chat_turns.ChatLeaseLost))
+                       else "问答处理失败，请稍后重试")
             for key in (settings.LLM_API_KEY, settings.EMBEDDING_API_KEY, settings.RERANK_API_KEY):
                 if key:
                     message = message.replace(key, "[已隐藏]")

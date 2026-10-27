@@ -26,6 +26,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.messages import AIMessageChunk, BaseMessage
 
 from app.core.config import settings
+from app.services.usage_tracking import ModelCall
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,8 @@ def _shared_client(endpoint: _Endpoint) -> httpx.Client:
     return _clients[key]
 
 
-def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool = False):
+def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool = False,
+          *, usage_call: ModelCall | None = None):
     """带指数退避的 POST。
 
     ``stream=False`` 返回 ``httpx.Response``；``stream=True`` 返回
@@ -88,6 +90,8 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
     last_error = ""
 
     for attempt in range(3):
+        if attempt and usage_call:
+            usage_call.retry()
         client = None
         try:
             if stream:
@@ -100,6 +104,8 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
                 if response.status_code in _RETRY_STATUS and attempt < 2:
                     response.close()
                     client.close()
+                    if usage_call:
+                        usage_call.finish("failed")
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 if response.status_code >= 400:
@@ -114,6 +120,8 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
             response = _shared_client(endpoint).post(url, headers=headers, json=payload)
             if response.status_code in _RETRY_STATUS and attempt < 2:
                 last_error = _format_error(endpoint.label, response.status_code, response.text)
+                if usage_call:
+                    usage_call.finish("failed")
                 time.sleep(1.5 * (attempt + 1))
                 continue
             if response.status_code >= 400:
@@ -131,6 +139,8 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
             last_error = f"网络错误：{exc}"
 
         if attempt < 2:
+            if usage_call:
+                usage_call.finish("failed")
             time.sleep(1.5 * (attempt + 1))
 
     raise CloudModelError(f"调用 {endpoint.label} 失败：{last_error}")
@@ -212,20 +222,29 @@ class OpenAICompatibleEmbeddings(Embeddings):
                 t if t.strip() else " "  # 空串会被部分服务直接拒绝
                 for t in texts[start : start + self.batch_size]
             ]
-            response = _post(
-                self.endpoint,
-                "/embeddings",
-                {"model": self.model, "input": batch, "encoding_format": "float"},
-            )
-            data = response.json()
-            items = data.get("data") or []
-            if len(items) != len(batch):
-                raise CloudModelError(
-                    f"向量条数不匹配：请求 {len(batch)} 条，返回 {len(items)} 条"
+            call = ModelCall("embedding", self.endpoint.label, self.model)
+            try:
+                options = {"usage_call": call} if call.enabled else {}
+                response = _post(
+                    self.endpoint,
+                    "/embeddings",
+                    {"model": self.model, "input": batch, "encoding_format": "float"}, **options,
                 )
-            # 接口保证 data 与 input 同序，但仍按 index 排序，避免实现差异导致错位
-            items.sort(key=lambda item: item.get("index", 0))
-            vectors.extend(item["embedding"] for item in items)
+                data = response.json()
+                call.observe(data.get("usage"))
+                items = data.get("data") or []
+                if len(items) != len(batch):
+                    raise CloudModelError(
+                        f"向量条数不匹配：请求 {len(batch)} 条，返回 {len(items)} 条"
+                    )
+                # 接口保证 data 与 input 同序，但仍按 index 排序，避免实现差异导致错位。
+                items.sort(key=lambda item: item.get("index", 0))
+                vectors.extend(item["embedding"] for item in items)
+            except BaseException:
+                call.finish("failed")
+                raise
+            else:
+                call.finish()
 
         return vectors
 
@@ -263,20 +282,33 @@ class OpenAICompatibleChat:
         return payload
 
     def invoke(self, messages: list[BaseMessage]) -> AIMessageChunk:
-        response = _post(self.endpoint, "/chat/completions", self._payload(messages, False))
-        data = response.json()
+        call = ModelCall("chat", self.endpoint.label, self.model)
         try:
-            content = data["choices"][0]["message"].get("content") or ""
-        except (KeyError, IndexError) as exc:
-            raise CloudModelError(f"对话返回结构异常：{data}") from exc
-        return AIMessageChunk(content=content)
+            options = {"usage_call": call} if call.enabled else {}
+            response = _post(self.endpoint, "/chat/completions", self._payload(messages, False), **options)
+            data = response.json()
+            call.observe(data.get("usage"))
+            try:
+                content = data["choices"][0]["message"].get("content") or ""
+            except (KeyError, IndexError, TypeError) as exc:
+                raise CloudModelError("对话返回结构异常") from exc
+            result = AIMessageChunk(content=content)
+        except BaseException:
+            call.finish("failed")
+            raise
+        else:
+            call.finish()
+            return result
 
     def stream(self, messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
-        client, response = _post(
-            self.endpoint, "/chat/completions", self._payload(messages, True), stream=True
-        )
+        call = ModelCall("chat", self.endpoint.label, self.model)
+        client = response = None
         terminal = False
         try:
+            options = {"usage_call": call} if call.enabled else {}
+            client, response = _post(
+                self.endpoint, "/chat/completions", self._payload(messages, True), stream=True, **options,
+            )
             for line in response.iter_lines():
                 if not line or not line.startswith("data:"):
                     continue
@@ -290,16 +322,14 @@ class OpenAICompatibleChat:
                     raise CloudModelError("模型服务返回了无效的流式数据") from exc
                 if not isinstance(event, dict) or event.get("error"):
                     raise CloudModelError("模型服务在生成过程中返回错误，请稍后重试")
-                usage = event.get("usage")
-                if isinstance(usage, dict):
-                    incoming, outgoing = usage.get("prompt_tokens"), usage.get("completion_tokens")
-                    if (isinstance(incoming, int) and not isinstance(incoming, bool) and incoming >= 0
-                            and isinstance(outgoing, int) and not isinstance(outgoing, bool) and outgoing >= 0):
-                        yield AIMessageChunk(content="", usage_metadata={"input_tokens": incoming, "output_tokens": outgoing,
-                                                                      "total_tokens": incoming + outgoing})
+                call.observe(event.get("usage"))
+                incoming, outgoing = call.usage["input_tokens"], call.usage["output_tokens"]
+                if isinstance(event.get("usage"), dict) and incoming is not None and outgoing is not None:
+                    yield AIMessageChunk(content="", usage_metadata={"input_tokens": incoming, "output_tokens": outgoing,
+                                                                   "total_tokens": incoming + outgoing})
                 choices = event.get("choices") or []
                 if not choices:
-                    continue  # usage 等独立统计帧可以没有 choices。
+                    continue
                 choice = choices[0]
                 if choice.get("finish_reason") is not None:
                     terminal = True
@@ -311,9 +341,19 @@ class OpenAICompatibleChat:
                     yield AIMessageChunk(content=text)
             if not terminal:
                 raise CloudModelError("模型响应提前中断，请重试")
+        except GeneratorExit:
+            call.finish("cancelled")
+            raise
+        except BaseException:
+            call.finish("failed")
+            raise
+        else:
+            call.finish()
         finally:
-            response.close()
-            client.close()
+            if response is not None:
+                response.close()
+            if client is not None:
+                client.close()
 
 
 def _to_openai_message(message: BaseMessage) -> dict[str, str]:
@@ -349,50 +389,86 @@ async def _complete_short_chat(messages: list[BaseMessage], timeout: float, max_
             "options": {"temperature": 0, "num_predict": max_tokens,
                         "num_ctx": settings.LLM_CONTEXT_WINDOW_TOKENS},
         }
-    async with asyncio.timeout(timeout):
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(2.0, timeout))) as client:
-            async with client.stream("POST", url, headers=headers, json=payload) as response:
-                response.raise_for_status()
-                if settings.LLM_PROVIDER == "cloud" and "text/event-stream" in response.headers.get("content-type", ""):
-                    # 同一请求/总截止时间内消费到终止帧；兼容网关包裹的 message 帧。
-                    parts, size, terminal = [], 0, False
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        value = line[5:].strip()
-                        if value == "[DONE]":
-                            terminal = True
-                            break
-                        event = json.loads(value)
-                        if not isinstance(event, dict) or event.get("error"):
-                            raise CloudModelError("追问补全服务返回错误")
-                        choices = event.get("choices") or []
-                        if not choices:
-                            continue
-                        choice = choices[0]
-                        text = (choice.get("delta") or choice.get("message") or {}).get("content")
-                        if text is not None:
-                            if not isinstance(text, str):
-                                raise CloudModelError("追问补全返回结构异常")
-                            parts.append(text)
-                            size += len(text)
-                            if size > min(32768, max(2000, max_tokens * 16)):
-                                raise CloudModelError("追问补全响应超过长度限制")
-                        if choice.get("finish_reason"):
-                            if choice["finish_reason"] == "content_filter":
-                                raise CloudModelError("追问补全服务拒绝生成")
-                            terminal = True
-                            break
-                    if not terminal:
-                        raise CloudModelError("追问补全流提前中断")
-                    content = "".join(parts)
-                else:
-                    await response.aread()
-                    data = response.json()
-                    content = data["choices"][0]["message"]["content"] if settings.LLM_PROVIDER == "cloud" else data["message"]["content"]
-                if not isinstance(content, str):
-                    raise CloudModelError("追问补全返回结构异常")
-                return content
+    call = ModelCall("chat", endpoint.label if settings.LLM_PROVIDER == "cloud" else "ollama", settings.LLM_MODEL)
+    try:
+        async with asyncio.timeout(timeout) as deadline:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(2.0, timeout))) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    if settings.LLM_PROVIDER == "cloud" and "text/event-stream" in response.headers.get("content-type", ""):
+                        parts, size, terminal = [], 0, False
+                        want_usage = call.enabled and settings.LLM_STREAM_INCLUDE_USAGE
+                        lines = response.aiter_lines().__aiter__()
+                        while True:
+                            try:
+                                # 终止帧后的 usage 通常紧随其后；不为计量无限等待网关关闭。
+                                # 计量等待不应耗尽原本已完成补全的总截止时间；为关闭响应保留余量。
+                                if terminal and want_usage:
+                                    remaining = deadline.when() - asyncio.get_running_loop().time()
+                                    if remaining <= 0.01:
+                                        break
+                                    line = await asyncio.wait_for(anext(lines), min(0.25, remaining / 2))
+                                else:
+                                    line = await anext(lines)
+                            except StopAsyncIteration:
+                                break
+                            except TimeoutError:
+                                if terminal:
+                                    break
+                                raise
+                            if not line.startswith("data:"):
+                                continue
+                            value = line[5:].strip()
+                            if value == "[DONE]":
+                                terminal = True
+                                break
+                            event = json.loads(value)
+                            if not isinstance(event, dict) or event.get("error"):
+                                raise CloudModelError("追问补全服务返回错误")
+                            call.observe(event.get("usage"))
+                            if terminal and call.usage["input_tokens"] is not None and call.usage["output_tokens"] is not None:
+                                break
+                            choices = event.get("choices") or []
+                            if not choices:
+                                continue
+                            choice = choices[0]
+                            text = (choice.get("delta") or choice.get("message") or {}).get("content")
+                            if text is not None:
+                                if not isinstance(text, str):
+                                    raise CloudModelError("追问补全返回结构异常")
+                                parts.append(text)
+                                size += len(text)
+                                if size > min(32768, max(2000, max_tokens * 16)):
+                                    raise CloudModelError("追问补全响应超过长度限制")
+                            if choice.get("finish_reason"):
+                                if choice["finish_reason"] == "content_filter":
+                                    raise CloudModelError("追问补全服务拒绝生成")
+                                terminal = True
+                                if not want_usage or call.usage["input_tokens"] is not None and call.usage["output_tokens"] is not None:
+                                    break
+                        if not terminal:
+                            raise CloudModelError("追问补全流提前中断")
+                        content = "".join(parts)
+                    else:
+                        await response.aread()
+                        data = response.json()
+                        if settings.LLM_PROVIDER == "cloud":
+                            call.observe(data.get("usage"))
+                            content = data["choices"][0]["message"]["content"]
+                        else:
+                            call.observe({"input_tokens": data.get("prompt_eval_count"), "output_tokens": data.get("eval_count")})
+                            content = data["message"]["content"]
+                    if not isinstance(content, str):
+                        raise CloudModelError("追问补全返回结构异常")
+    except asyncio.CancelledError:
+        call.finish("cancelled")
+        raise
+    except BaseException:
+        call.finish("failed")
+        raise
+    else:
+        call.finish()
+        return content
 
 
 def complete_short_chat(messages: list[BaseMessage], *, timeout: float, max_tokens: int) -> str:

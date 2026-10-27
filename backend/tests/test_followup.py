@@ -240,6 +240,30 @@ class FollowupTests(unittest.TestCase):
         payload = json.loads(messages[1].content)
         self.assertLessEqual(sum(len(item["content"]) for item in payload["history"]), settings.RETRIEVAL_REWRITE_HISTORY_CHARS + 100)
 
+    def test_rewrite_receives_current_scope_so_old_files_do_not_force_another_choice(self):
+        scope = [{key: security_history()[1]["citations"][1][key]
+                  for key in ("document_id", "filename", "index_version")}]
+        with patch.object(followup, "complete_short_chat", return_value='{"action":"search","query":"手册中内部级外发审批的要求"}') as model:
+            plan = followup.plan_retrieval("那审批要求呢？", security_history(clarification=False), document_scope=scope)
+        self.assertEqual(plan.status, "rewritten")
+        payload = json.loads(model.call_args.args[0][1].content)
+        self.assertEqual(payload["document_scope"], scope)
+        self.assertIn("已选定的文件范围", model.call_args.args[0][0].content)
+
+    def test_long_scope_names_and_json_escaping_share_the_rewrite_input_budget(self):
+        scope = [{"document_id": f"00000000-0000-0000-0000-{index:012d}",
+                  "filename": "长文件名" * 70 + f"-{index}.pdf", "index_version": 1} for index in range(1, 6)]
+        dialogue = [{"role": "user", "content": '规则\\\\"' * 1000},
+                    {"role": "assistant", "content": '历史说明[3]\\\\"' * 1000}]
+        with patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 12000), \
+             patch.object(followup, "complete_short_chat", return_value='{"action":"search","query":"审批要求"}') as model:
+            plan = followup.plan_retrieval("那审批要求呢？", dialogue, document_scope=scope)
+        self.assertEqual(plan.status, "rewritten")
+        messages = model.call_args.args[0]
+        self.assertEqual(json.loads(messages[1].content)["document_scope"], scope)
+        self.assertLessEqual(estimate_message_tokens(messages) + settings.RETRIEVAL_REWRITE_MAX_TOKENS
+                             + settings.CONTEXT_TOKEN_SAFETY_MARGIN, 12000)
+
     def test_current_question_too_large_for_rewrite_falls_back_without_calling_model(self):
         with patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 1024), patch.object(followup, "complete_short_chat") as model:
             plan = followup.plan_retrieval("那" + "很长的问题" * 2000, history())
