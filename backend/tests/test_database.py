@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from tests._env import TEST_URL
+from tests.fake_turns import async_factory, async_items
 
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials
@@ -350,7 +351,7 @@ class DatabaseTests(unittest.TestCase):
             db.commit()
             async def consume(response):
                 return "".join([frame async for frame in response.body_iterator])
-            with patch.object(settings, "HISTORY_MAX_TURNS", 1), patch.object(rag, "answer_stream", return_value=iter(["answer"])) as answer:
+            with patch.object(settings, "HISTORY_MAX_TURNS", 1), patch.object(rag, "answer_astream", side_effect=async_items(["answer"])) as answer:
                 response = chat.chat_stream(ChatRequest(mode="chat", question="follow-up", conversation_id=conv.id), self.request, db, self.admin)
                 output = asyncio.run(consume(response))
                 self.assertIn("event: done", output)
@@ -398,8 +399,8 @@ class DatabaseTests(unittest.TestCase):
         async def consume(response):
             return "".join([frame async for frame in response.body_iterator])
 
-        with patch.object(rag, "retrieve", return_value=[]) as search, patch.object(rag, "get_llm") as model:
-            model.return_value.stream.return_value = [SimpleNamespace(content="按手册，数据安全分为四级：公开级、内部级、机密级、绝密级[1]。")]
+        with patch.object(rag, "retrieve", return_value=[]) as search, patch.object(rag, "get_stream_chat") as model:
+            model.return_value.astream.side_effect = async_items([SimpleNamespace(content="按手册，数据安全分为四级：公开级、内部级、机密级、绝密级[1]。")])
             with SessionLocal() as db:
                 response = chat.chat_stream(ChatRequest(question="星海科技内部管理手册", conversation_id=conversation_id),
                                             self.request, db, self.admin)
@@ -417,7 +418,7 @@ class DatabaseTests(unittest.TestCase):
             for call in search.call_args_list:
                 self.assertEqual([item["document_id"] for item in call.kwargs["document_scope"]],
                                  [str(pairs[1][0].metadata["document_id"])])
-            prompt = model.return_value.stream.call_args.args[0][-1].content
+            prompt = model.return_value.astream.call_args.args[0][-1].content
             self.assertIn("数据安全分几级", prompt)
             self.assertIn(definitions[1][1], prompt)
             self.assertNotIn(definitions[0][1], prompt)
@@ -467,7 +468,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200, result.text)
         did = result.json()["data"]["document"]["id"]
         self.assertEqual(client.get(f"{base}/documents/{did}", headers=headers).status_code, 200)
-        with patch.object(rag, "answer_stream", return_value=iter(["answer"])):
+        with patch.object(rag, "answer_astream", side_effect=async_items(["answer"])):
             result = client.post("/api/v1/chat/stream", headers=headers, json={"question": "hello", "mode": "chat"})
         self.assertEqual(result.status_code, 200, result.text)
         self.assertIn("event: done", result.text)
@@ -484,7 +485,7 @@ class DatabaseTests(unittest.TestCase):
             return [frame async for frame in response.body_iterator]
         for answer, expected in [("根据现有知识库无法回答。", []), ("法律规定见[3]。", [3])]:
             with self.subTest(answer=answer), SessionLocal() as db:
-                with patch.object(rag, "retrieve", return_value=docs), patch.object(rag, "answer_stream", return_value=iter([answer])):
+                with patch.object(rag, "retrieve", return_value=docs), patch.object(rag, "answer_astream", side_effect=async_items([answer])):
                     response = chat.chat_stream(ChatRequest(question="测试引用", kb_id=self.kb.id), self.request, db, self.admin)
                     frames = asyncio.run(consume(response))
                 meta = json.loads(frames[0].split("data: ", 1)[1])
@@ -620,7 +621,7 @@ class DatabaseTests(unittest.TestCase):
         headers = {"Authorization": "Bearer " + create_access_token(str(self.admin.id), "admin")}
         key = uuid.uuid4()
         payload = {"request_id": str(key), "question": "hello once", "mode": "chat"}
-        with patch.object(rag, "answer_stream", side_effect=lambda *args, **kwargs: iter(["saved", " answer"])) as model:
+        with patch.object(rag, "answer_astream", side_effect=async_items(["saved", " answer"])) as model:
             original = client.post("/api/v1/chat/stream", headers=headers, json=payload)
             replay = client.post("/api/v1/chat/stream", headers=headers, json=payload)
             self.assertEqual(original.status_code, 200, original.text)
@@ -707,11 +708,11 @@ class DatabaseTests(unittest.TestCase):
         import asyncio
         async def consume(response):
             return "".join([frame async for frame in response.body_iterator])
-        def broken(*_args, **_kwargs):
+        async def broken(*_args, **_kwargs):
             yield "partial answer"
             raise RuntimeError("simulated provider failure")
         with SessionLocal() as db:
-            with patch.object(rag, "answer_stream", side_effect=broken), patch.object(chat.logger, "exception"):
+            with patch.object(rag, "answer_astream", side_effect=broken), patch.object(chat.logger, "exception"):
                 output = asyncio.run(consume(chat.chat_stream(ChatRequest(mode="chat", question="failed question"),
                                                               self.request, db, self.admin)))
             self.assertIn("event: error", output)
@@ -720,7 +721,7 @@ class DatabaseTests(unittest.TestCase):
             self.assertIsNone(conv.active_turn_id)
             failed = db.scalar(select(Message))
             self.assertEqual(failed.status, "failed")
-            with patch.object(rag, "answer_stream", return_value=iter(["successful answer"])) as model:
+            with patch.object(rag, "answer_astream", side_effect=async_items(["successful answer"])) as model:
                 result = asyncio.run(consume(chat.chat_stream(ChatRequest(mode="chat", question="next question",
                                                                           conversation_id=conv.id),
                                                               self.request, db, self.admin)))
@@ -739,7 +740,7 @@ class DatabaseTests(unittest.TestCase):
         client = TestClient(main.app)
         headers = {"Authorization": "Bearer " + create_access_token(str(viewer.id), "user")}
         with patch.object(main.logger, "warning"), patch("app.core.request_log.logger.warning"), \
-             patch.object(rag, "answer_stream") as model:
+             patch.object(rag, "answer_astream") as model:
             result = client.post("/api/v1/chat/stream", headers=headers,
                                  json={"mode": "chat", "question": "hello", "include_trace": True})
         self.assertEqual(result.status_code, 403, result.text)
@@ -1063,8 +1064,8 @@ class DatabaseTests(unittest.TestCase):
                 text = f"《数据安全指南》分三级[{number('指南将数据')}]。\n《星海科技内部管理手册（2026版）》分四级[{number('手册将数据')}]。"
             return [SimpleNamespace(content=text)]
         conversation_id, revision = None, None
-        with patch.object(rag, "get_llm") as llm:
-            llm.return_value.stream.side_effect = model
+        with patch.object(rag, "get_stream_chat") as llm:
+            llm.return_value.astream.side_effect = async_factory(lambda messages, **_: model(messages))
             for question in ["数据安全分几级", "具体点呢", "星海科技内部管理手册", "内部级能否外发？", "未规定的太空数据规则？"]:
                 with self.subTest(question=question), SessionLocal() as db:
                     payload = ChatRequest(question=question, kb_id=self.kb.id, conversation_id=conversation_id,

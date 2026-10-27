@@ -1,5 +1,6 @@
 import client from './client'
-import { consumeEventStream, StreamProtocolError } from '@/utils/stream'
+import { consumeEventStream, createStreamGuard, StreamProtocolError, type StreamLimits, type StreamPhase } from '@/utils/stream'
+import type { ChatRequestState } from '@/utils/requestRecovery'
 import { i18n } from '@/i18n'
 import type { ChatCompletion } from '@/utils/citations'
 import { createChatRequestId } from '@/utils/chatRequest'
@@ -77,6 +78,8 @@ export interface MessageItem {
   citations: Citation[] | null
   latency_ms: number
   created_at: string
+  truncated?: boolean
+  finish_reason?: string | null
 }
 
 /** 会话模式：按会话固定，续聊时由后端以会话已存的值为准。 */
@@ -113,6 +116,7 @@ export interface ChatStreamMeta {
   user_message_id?: string
   citations: Citation[]
   mode?: ChatMode
+  stream_limits?: StreamLimits
   document_scope?: DocumentScopeItem[]
   scope_revision?: number
 }
@@ -302,6 +306,10 @@ export const docApi = {
 
 // ---------- 问答 ----------
 export const chatApi = {
+  requestState: (requestId: string, signal?: AbortSignal) => client.get<ChatRequestState>(`/chat/requests/${requestId}`, {
+    signal, timeout: 3000,
+    validateStatus: status => [200, 403, 404, 410].includes(status)
+  }),
   cancelRequest: (requestId: string) => client.post(`/chat/requests/${requestId}/cancel`, undefined, {
     // 停止可能早于服务端认领，404 交给断连清理兜底，无需重复弹错。
     timeout: 5000,
@@ -349,55 +357,80 @@ export async function streamChat(
     onMeta?: (data: ChatStreamMeta) => void
     onDelta?: (text: string) => void
     onDone?: (data: ChatCompletion) => void
+    onStatus?: (phase: StreamPhase) => void
     onError?: (message: string) => void
   },
   signal?: AbortSignal
 ): Promise<void> {
   const token = localStorage.getItem('rag_token')
-  let response: Response
+  // Starts before fetch: stalled response headers are covered by the same deadlines.
+  const guard = createStreamGuard(signal)
   try {
-    response = await fetch('/api/v1/chat/stream', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
-      },
-      body: JSON.stringify({ ...payload, request_id: payload.request_id ?? createChatRequestId() }),
-      signal
-    })
-  } catch (error) {
-    if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error
-    throw new Error(i18n.global.t('errors.network'))
-  }
-
-  if (response.status === 401) {
-    localStorage.removeItem('rag_token')
-    location.href = '/login'
-    return
-  }
-  if (!response.ok || !response.body) {
-    // 失败时后端返回统一结构 {code, success:false, message}，优先取 message
-    const text = await response.text()
-    let message = ''
+    let response: Response
     try {
-      const body = JSON.parse(text)
-      message = typeof body?.message === 'string' ? body.message : ''
-    } catch {
-      /* 非 JSON（网关错误页等）时退回原文 */
+      response = await fetch('/api/v1/chat/stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({ ...payload, request_id: payload.request_id ?? createChatRequestId() }),
+        signal: guard.signal
+      })
+    } catch (error) {
+      if (guard.signal.aborted) throw guard.signal.reason
+      if (error instanceof Error && error.name === 'AbortError') throw error
+      throw new Error(i18n.global.t('errors.network'))
     }
-    handlers.onError?.(message || text || i18n.global.t('errors.http', { status: response.status }))
-    return
-  }
-
-  try {
+    if (response.status === 401) {
+      localStorage.removeItem('rag_token')
+      location.href = '/login'
+      return
+    }
+    if (!response.ok || !response.body) {
+      // Bound even a proxy HTML error body instead of accumulating it without limit.
+      const reader = response.body?.getReader()
+      let text = ''
+      if (reader) {
+        const decoder = new TextDecoder()
+        let bytes = 0
+        try {
+          while (bytes < 4096) {
+            guard.check()
+            const { done, value } = await reader.read()
+            if (done) break
+            const part = value.subarray(0, 4096 - bytes)
+            bytes += part.length
+            text += decoder.decode(part, { stream: true })
+          }
+          text += decoder.decode()
+        } finally {
+          void reader.cancel().catch(() => undefined)
+          reader.releaseLock()
+        }
+      }
+      let message = ''
+      try {
+        const body = JSON.parse(text)
+        message = typeof body?.message === 'string' ? body.message : ''
+      } catch { /* Non-JSON proxy failures use a bounded fallback. */ }
+      handlers.onError?.(message || i18n.global.t('errors.http', { status: response.status }))
+      return
+    }
+    if (!response.headers.get('content-type')?.includes('text/event-stream')) throw new StreamProtocolError('invalidStream')
     await consumeEventStream(response.body, (event, data) => {
       if (event === 'meta') handlers.onMeta?.(data)
-      else if (event === 'delta') handlers.onDelta?.(data.content ?? '')
+      else if (event === 'status') handlers.onStatus?.(data.phase)
+      else if (event === 'delta') handlers.onDelta?.(data.content)
       else if (event === 'done') handlers.onDone?.(data)
-      else if (event === 'error') handlers.onError?.(data.message ?? i18n.global.t('errors.unknown'))
-    }, signal)
+      else if (event === 'error') handlers.onError?.(data.message)
+    }, signal, { guard })
   } catch (error) {
-    if (error instanceof StreamProtocolError) throw new Error(i18n.global.t(`errors.${error.code}`))
-    throw error
+    if (signal?.aborted) throw signal.reason
+    const cause = guard.signal.aborted ? guard.signal.reason : error
+    if (cause instanceof StreamProtocolError) throw new Error(i18n.global.t(`errors.${cause.code}`))
+    throw cause
+  } finally {
+    guard.dispose()
   }
 }

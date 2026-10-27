@@ -317,15 +317,21 @@ class UsageDatabaseTests(unittest.TestCase):
         self.price()
         headers = {"Authorization": "Bearer " + create_access_token(str(self.member.id), "user")}
         payload = {"question": "synthetic once", "mode": "chat", "request_id": str(uuid.uuid4())}
-        client_mock, response = MagicMock(), MagicMock()
-        response.iter_lines.return_value = [
-            'data: {"choices":[{"delta":{"content":"synthetic answer"}}]}',
-            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
-            'data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":100}}', 'data: [DONE]']
+        client_class = httpx.AsyncClient
+        def handle(request):
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=(
+                'data: {"choices":[{"delta":{"content":"synthetic answer"}}]}\n\n'
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                'data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":100}}\n\n'
+                'data: [DONE]\n\n'))
+        transport = MagicMock(side_effect=handle)
+        def create(**kwargs):
+            return client_class(transport=httpx.MockTransport(transport), **kwargs)
         model = cloud_models.OpenAICompatibleChat(cloud_models._Endpoint("https://usage.test", "test-only", 1), "test-chat", 0)
         with TestClient(app) as client, patch.object(settings, "LLM_PROVIDER", "cloud"), \
-             patch.object(rag, "get_llm", return_value=model), \
-             patch.object(cloud_models, "_post", return_value=(client_mock, response)) as transport:
+             patch.object(settings, "LLM_STREAM_INCLUDE_USAGE", True), \
+             patch.object(rag, "get_stream_chat", return_value=model), \
+             patch.object(cloud_models.httpx, "AsyncClient", side_effect=create):
             first = client.post("/api/v1/chat/stream", headers=headers, json=payload)
             replay = client.post("/api/v1/chat/stream", headers=headers, json=payload)
             self.assertEqual(first.status_code, 200, first.text)

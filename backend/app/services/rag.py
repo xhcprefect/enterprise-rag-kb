@@ -1,7 +1,9 @@
 """检索 + 生成。"""
 import logging
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator
+
+import anyio
 from dataclasses import dataclass
 
 from langchain_core.documents import Document as LCDocument
@@ -9,7 +11,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_ollama import ChatOllama
 
 from app.core.config import settings
-from app.services.cloud_models import get_cloud_chat
+from app.services.cloud_models import get_cloud_chat, get_stream_chat
 from app.services.context_window import (
     ContextBudgetError, complete_turns, estimate_message_tokens, trim_history, truncate_text,
 )
@@ -387,33 +389,44 @@ def get_llm():
     )
 
 
-def filter_reasoning(parts: Iterable[str]) -> Iterator[str]:
-    """保留可能的标签前缀；标签可在任意字符处被上游分片。"""
-    openings = ("<think>", "<thinking>")
-    closings = ("</think>", "</thinking>")
-    buffer = ""
-    hidden = False
-    for part in parts:
-        buffer += part
-        while buffer:
-            tags = closings if hidden else openings
-            matches = [(buffer.find(tag), tag) for tag in tags if tag in buffer]
+class ReasoningFilter:
+    """同步和异步链路共用有界标签状态，不保留被隐藏的思考正文。"""
+    def __init__(self):
+        self.buffer = ""
+        self.hidden = False
+
+    def feed(self, part: str) -> Iterator[str]:
+        self.buffer += part
+        while self.buffer:
+            tags = ("</think>", "</thinking>") if self.hidden else ("<think>", "<thinking>")
+            matches = [(self.buffer.find(tag), tag) for tag in tags if tag in self.buffer]
             if matches:
                 offset, tag = min(matches)
-                if not hidden and offset:
-                    yield buffer[:offset]
-                buffer = buffer[offset + len(tag):]
-                hidden = not hidden
+                if not self.hidden and offset:
+                    yield self.buffer[:offset]
+                self.buffer = self.buffer[offset + len(tag):]
+                self.hidden = not self.hidden
                 continue
             keep = max((length for tag in tags for length in range(1, len(tag))
-                        if buffer.endswith(tag[:length])), default=0)
-            content = buffer[:-keep] if keep else buffer
-            if not hidden and content:
+                        if self.buffer.endswith(tag[:length])), default=0)
+            content = self.buffer[:-keep] if keep else self.buffer
+            if not self.hidden and content:
                 yield content
-            buffer = buffer[-keep:] if keep else ""
+            self.buffer = self.buffer[-keep:] if keep else ""
             break
-    if buffer and not hidden:
-        yield buffer
+
+    def finish(self) -> str:
+        return self.buffer if not self.hidden else ""
+
+
+def filter_reasoning(parts: Iterable[str]) -> Iterator[str]:
+    """保留可能的标签前缀；标签可在任意字符处被上游分片。"""
+    filtered = ReasoningFilter()
+    for part in parts:
+        yield from filtered.feed(part)
+    tail = filtered.finish()
+    if tail:
+        yield tail
 
 
 def answer_stream(
@@ -463,3 +476,45 @@ def answer_stream(
         yield from filter_reasoning(source)
     finally:
         source.close()
+
+
+async def answer_astream(
+    question: str, pairs: list[tuple[LCDocument, float]], history: list[dict], mode: str = "rag",
+    *, prepared: PreparedAnswer | None = None, metrics: dict | None = None,
+    usage_context: UsageContext | None = None,
+) -> AsyncIterator[str]:
+    """主问答原生异步流；等待模型不占工作线程，关闭会逐层传播到 HTTP 响应。"""
+    if prepared is None and (mode == "chat" or pairs):
+        prepared = await anyio.to_thread.run_sync(lambda: prepare_answer(question, pairs, history, mode))
+    if prepared is None or (mode != "chat" and not prepared.pairs):
+        yield "根据现有知识库无法回答该问题，请补充相关资料或调整问题。"
+        return
+    source = get_stream_chat().astream(prepared.messages, usage_context=usage_context)
+    filtered = ReasoningFilter()
+    size = 0
+    try:
+        async for chunk in source:
+            usage = getattr(chunk, "usage_metadata", None)
+            if metrics is not None and isinstance(usage, dict):
+                for key in ("input_tokens", "output_tokens"):
+                    value = usage.get(key)
+                    if type(value) is int and value >= 0:
+                        metrics[key] = max(metrics.get(key, 0), value)
+            metadata = getattr(chunk, "response_metadata", None)
+            if metrics is not None and isinstance(metadata, dict) and isinstance(metadata.get("finish_reason"), str):
+                metrics["finish_reason"] = metadata["finish_reason"]
+            if not isinstance(chunk.content, str):
+                from app.services.stream_control import StreamFault
+                raise StreamFault("invalid_stream", "模型返回的正文格式异常")
+            size += len(chunk.content)
+            if size > settings.CHAT_STREAM_MAX_ANSWER_CHARS:
+                from app.services.stream_control import StreamFault
+                raise StreamFault("stream_limit", "模型回答超过允许的长度，请缩小问题范围")
+            for text in filtered.feed(chunk.content):
+                yield text
+        tail = filtered.finish()
+        if tail:
+            yield tail
+    finally:
+        with anyio.CancelScope(shield=True):
+            await source.aclose()

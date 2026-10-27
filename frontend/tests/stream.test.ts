@@ -34,5 +34,5 @@ test('SSE invalid JSON fails instead of disappearing silently', async () => {
 })
 
 test('SSE propagates consumer exceptions', async () => {
-  await assert.rejects(consumeEventStream(stream(['event: done\ndata: {}\n\n']), () => { throw new Error('consumer') }), /consumer/)
+  await assert.rejects(consumeEventStream(stream(['event: done\ndata: {"latency_ms":1}\n\n']), () => { throw new Error('consumer') }), /consumer/)
 })

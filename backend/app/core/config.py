@@ -23,12 +23,21 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     API_V1_PREFIX: str = "/api/v1"
 
-    # 线程池槽位上限（anyio 默认 40）。
-    # 问答接口是 "同步生成器 + StreamingResponse"，Starlette 每吐一个 token 都要
-    # 借一个线程执行 next()，整段流式期间该线程一直被占着等云端返回。
-    # 40 个并发提问就把池占满，之后连 /health、登录都要排队——表现为"整个站点变卡"。
-    # 实测 40→200 后 150 路并发流仍不拖慢普通请求（见 DEPLOY.md「并发能力」）。
+    # 同步 ORM、检索、上传使用的线程池；主问答的模型读取已原生异步化。
+    # 此值不是模型并发上限，也不是当前版本已经压测验证的吞吐量。
     THREAD_POOL_SIZE: int = 200
+
+    # 流式生命周期：首字/正文停顿/总时长互相独立，心跳不续正文截止时间。
+    CHAT_STREAM_HEARTBEAT_SECONDS: float = Field(default=10.0, gt=0, le=60)
+    CHAT_STREAM_FIRST_TOKEN_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=600)
+    CHAT_STREAM_IDLE_TIMEOUT_SECONDS: float = Field(default=45.0, gt=0, le=600)
+    CHAT_STREAM_TOTAL_TIMEOUT_SECONDS: float = Field(default=300.0, gt=0, le=3600)
+    CHAT_STREAM_SEND_TIMEOUT_SECONDS: float = Field(default=15.0, gt=0, le=120)
+    CHAT_STREAM_CANCEL_POLL_SECONDS: float = Field(default=1.0, gt=0, le=10)
+    CHAT_STREAM_MAX_FRAME_BYTES: int = Field(default=65536, ge=1024, le=1048576)
+    CHAT_STREAM_MAX_ANSWER_CHARS: int = Field(default=131072, ge=1024, le=1048576)
+    LLM_STREAM_USAGE_GRACE_SECONDS: float = Field(default=0.5, ge=0, le=5)
+    LLM_ASYNC_MAX_CONNECTIONS: int = Field(default=64, ge=1, le=1024)
 
     # 数据库
     DATABASE_URL: str = "postgresql+psycopg://postgres:123456@localhost:9999/ragdb"

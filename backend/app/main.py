@@ -21,7 +21,7 @@ from app.core.request_log import RequestLoggingMiddleware
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.models import Document, DocumentStatus
-from app.services import chat_turns
+from app.services import chat_turns, cloud_models
 
 setup_logging("app")
 logger = logging.getLogger(__name__)
@@ -30,9 +30,8 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 必须在事件循环里改：默认线程池是按循环绑定的，在模块导入期设置改不到它。
-    # 为什么是 200 而不是默认的 40：问答走 "同步生成器 → StreamingResponse"，
-    # 每个 token 都要借线程执行 next()，整段流式期间线程被占着等云端返回。
-    # 40 个并发提问即占满，此后所有同步路由（含 /health）排队，表现为整站变卡。
+    # 线程用于同步 ORM、检索与上传；主问答等待模型已走共享异步 HTTP 连接池。
+    # 线程额度仍保留现有值，不能将线程数当作模型并发或已验证的吞吐量。
     anyio.to_thread.current_default_thread_limiter().total_tokens = settings.THREAD_POOL_SIZE
     init_db()
     with SessionLocal() as db:
@@ -58,8 +57,11 @@ async def lifespan(app: FastAPI):
         settings.EMBEDDING_MODEL, settings.EMBEDDING_PROVIDER,
         settings.THREAD_POOL_SIZE,
     )
-    yield
-    logger.info("服务已关闭")
+    try:
+        yield
+    finally:
+        await cloud_models.close_async_clients()
+        logger.info("服务已关闭")
 
 
 def _worker_state() -> str:

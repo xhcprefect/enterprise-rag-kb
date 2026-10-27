@@ -22,7 +22,10 @@ export default {
     },
     errors: {
       request: '请求失败', unknown: '未知错误', network: '网络连接失败，请检查网络后重试', timeout: '请求超时，请稍后重试', invalidStream: '流式响应格式异常，请重试',
-      streamInterrupted: '回答连接提前中断，请重试', http: '请求失败（{status}）'
+      streamInterrupted: '回答连接提前中断，请检查原请求结果',
+      firstTokenTimeout: '等待回答正文超时，请检查请求结果', idleTimeout: '回答正文长时间未更新，连接已结束',
+      totalTimeout: '本轮回答超过总处理时限', streamLimit: '回答或流式事件超过允许的大小',
+      http: '请求失败（{status}）'
     }
   },
   'en-US': {
@@ -48,7 +51,10 @@ export default {
     },
     errors: {
       request: 'Request failed', unknown: 'Unknown error', network: 'Unable to connect. Check your network and try again.', timeout: 'The request timed out. Please try again.', invalidStream: 'Invalid response stream. Please try again.',
-      streamInterrupted: 'The response connection ended early. Please try again.', http: 'Request failed ({status})'
+      streamInterrupted: 'The connection ended early. Check the original request result.',
+      firstTokenTimeout: 'Timed out waiting for answer content. Check the request result.', idleTimeout: 'Answer content stopped updating. The connection was closed.',
+      totalTimeout: 'The answer exceeded the overall time limit.', streamLimit: 'The answer or stream event exceeded the size limit.',
+      http: 'Request failed ({status})'
     }
   }
 }

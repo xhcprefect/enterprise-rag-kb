@@ -100,12 +100,13 @@
           <div v-for="msg in messages" :key="msg.id" class="message" :class="msg.role">
             <el-avatar :size="32" :class="msg.role === 'user' ? 'user-avatar' : 'ai-avatar'"><el-icon v-if="msg.role === 'user'"><User /></el-icon><el-icon v-else><MagicStick /></el-icon></el-avatar>
             <div class="bubble-wrap">
-              <div class="message-author">{{ msg.role === 'user' ? t('chat.author.you') : t('chat.author.assistant') }}<span v-if="msg.streaming" class="generating-label">{{ t('chat.generating') }}</span><span v-else-if="msg.status && msg.status !== 'completed'" class="generating-label">{{ requestStatusLabel(msg.status) }}</span></div>
+              <div class="message-author">{{ msg.role === 'user' ? t('chat.author.you') : t('chat.author.assistant') }}<span v-if="msg.streaming" class="generating-label">{{ t(`chat.phases.${msg.phase || 'generating'}`) }}</span><span v-else-if="msg.status && msg.status !== 'completed'" class="generating-label">{{ requestStatusLabel(msg.status) }}</span></div>
               <div class="bubble">
-                <div v-if="msg.role === 'assistant' && msg.streaming && !msg.content" class="thinking" role="status"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="thinking-text">{{ chatMode === 'rag' ? t('chat.thinking.rag') : t('chat.thinking.chat') }}</span></div>
+                <div v-if="msg.role === 'assistant' && msg.streaming && !msg.content" class="thinking" role="status"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="thinking-text">{{ t(`chat.phases.${msg.phase || 'generating'}`) }}</span></div>
                 <div v-else-if="msg.role === 'assistant'" class="markdown-body" :class="{ streaming: msg.streaming }" v-html="renderMarkdown(msg.content, !!msg.streaming)"></div>
                 <div v-else class="plain-text">{{ msg.content }}</div>
               </div>
+              <el-alert v-if="msg.truncated" class="truncated-tip" :title="t('chat.truncated')" type="warning" :closable="false" show-icon />
               <div v-if="msg.citations?.length" class="citations">
                 <el-collapse><el-collapse-item>
                   <template #title><span class="citation-title"><el-icon><DocumentCopy /></el-icon>{{ t('chat.citations.title') }}<span class="citation-count">{{ formatNumber(msg.citations.length) }}</span></span></template>
@@ -123,6 +124,7 @@
             </div>
           </div>
           <div v-if="errorMessage" class="error-tip"><el-alert :title="errorMessage" type="error" :closable="false" show-icon /></div>
+          <div v-if="recoveryTarget && !busy" class="recovery-actions"><el-button size="small" @click="checkRequestResult">{{ t('chat.recovery.check') }}</el-button><span>{{ t('chat.recovery.noResubmit') }}</span></div>
         </div>
 
         <div class="composer">
@@ -178,6 +180,9 @@ import {
   type DocumentScopeItem
 } from '@/utils/documentScope'
 import { createSessionEpoch } from '@/utils/sessionEpoch'
+import { recoverRequest, recoveredCompletion, type ChatRequestState } from '@/utils/requestRecovery'
+import { createStreamingMarkdown } from '@/utils/streamingMarkdown'
+import type { StreamPhase } from '@/utils/stream'
 import { sourceLocationLabels } from '@/utils/sourceLocation'
 import SourcePreviewDrawer from '@/components/SourcePreviewDrawer.vue'
 import DocumentScopeDialog from '@/components/DocumentScopeDialog.vue'
@@ -198,6 +203,8 @@ interface ChatMessage {
   content: string
   citations?: Citation[]
   streaming?: boolean
+  phase?: StreamPhase
+  truncated?: boolean
   status?: 'processing' | 'completed' | 'failed' | 'cancelled'
 }
 
@@ -248,18 +255,26 @@ const mdPlain: MarkdownIt = new MarkdownIt({
  * 那一条会真正解析，其余全部命中。
  */
 const renderCache = new Map<string, string>()
+const streamingMarkdown = createStreamingMarkdown(text => mdPlain.render(text || ''))
+let renderCacheChars = 0
 
 function renderMarkdown(text: string, streaming = false) {
-  // 流式中的内容每帧都在变，缓存不可能命中，只会把 Map 撑大，所以不进缓存
-  if (streaming) return mdPlain.render(text || '')
+  if (streaming) return streamingMarkdown.render(text || '')
 
   const cached = renderCache.get(text)
   if (cached !== undefined) return cached
 
   const html = md.render(text || '')
-  // 只有收口的消息才进缓存，正常会话远远到不了这个量级；真超了整体清空重算一次
-  if (renderCache.size > 500) renderCache.clear()
-  renderCache.set(text, html)
+  // Bound both count and retained text/HTML size; long answers must not grow history caches indefinitely.
+  const cost = text.length + html.length
+  if (renderCache.size >= 100 || renderCacheChars + cost > 2 * 1024 * 1024) {
+    renderCache.clear()
+    renderCacheChars = 0
+  }
+  if (cost <= 2 * 1024 * 1024) {
+    renderCache.set(text, html)
+    renderCacheChars += cost
+  }
   return html
 }
 
@@ -299,6 +314,19 @@ let disposed = false
  * 慢回来的旧详情不能覆盖已经开始的生成。
  */
 const sessionEpoch = createSessionEpoch()
+interface RecoveryTarget {
+  requestId: string
+  conversationId: string | null
+  epoch: number
+  assistant: ChatMessage
+  userMessage: ChatMessage
+}
+const recoveryTarget = ref<RecoveryTarget | null>(null)
+
+function clearRecovery() {
+  recoveryTarget.value = null
+  streamingMarkdown.clear()
+}
 
 /**
  * 建议问题存 key 而不是文案：语言切换时由 computed 重新取 t()，
@@ -333,6 +361,7 @@ const currentTitle = computed(() => {
 })
 
 function resetDocumentScope() {
+  clearRecovery()
   documentScope.value = []
   scopeRevision.value = 0
   scopeDialogOpen.value = false
@@ -353,6 +382,7 @@ function restrictToCitation(citation: Citation) {
 function openScopeDialog() {
   if (scopeLocked.value || chatMode.value !== 'rag' || !kbId.value) return
   sessionEpoch.begin()
+  clearRecovery()
   scopeError.value = ''
   scopeDialogOpen.value = true
 }
@@ -381,6 +411,7 @@ async function applyDocumentScope(items: DocumentScopeItem[]) {
   if (scopeLocked.value) return
   // 较早发出的会话详情也不能在本次范围确认期间改变会话或依据。
   sessionEpoch.begin()
+  clearRecovery()
   const next = normalizeDocumentScope(items)
   const conversationId = currentConversationId.value
   const action = planScopeChange(documentScope.value, next, !!conversationId)
@@ -545,6 +576,7 @@ async function loadConversation(id: string) {
   if (controlsLocked.value) return
   sourceOpen.value = false
   const loadEpoch = sessionEpoch.begin()
+  clearRecovery()
   const { data } = await chatApi.conversation(id)
   // 载入期间用户可能已经发了新问题、新建了会话或点了另一条会话：
   // 这份详情已经过期，不能覆盖已经开始的生成与新的消息列表。
@@ -573,6 +605,7 @@ async function loadConversation(id: string) {
     role: m.role,
     status: m.status,
     content: m.content,
+    truncated: m.truncated || m.finish_reason === 'length',
     citations: m.citations || undefined
   }))
   await scrollToBottom()
@@ -622,15 +655,83 @@ function requestStatusLabel(status: string) {
   return t('chat.requestStatus.failed')
 }
 
+async function readOriginalRequest(target: RecoveryTarget, signal: AbortSignal) {
+  return recoverRequest(target.requestId, async (id, readSignal) => {
+    const response = await chatApi.requestState(id, readSignal)
+    return response.status === 200 ? response.data : null
+  }, { signal, conversationId: target.conversationId })
+}
+
+function restoreCompletedRequest(target: RecoveryTarget, state: ChatRequestState) {
+  if (disposed || !sessionEpoch.isCurrent(target.epoch) || state.status !== 'completed' || !state.message) return
+  const completion = recoveredCompletion(state)
+  currentConversationId.value = state.conversation_id
+  target.userMessage.id = state.user_message_id
+  target.userMessage.status = 'completed'
+  target.assistant.id = state.message.id
+  target.assistant.content = state.message.content
+  target.assistant.status = 'completed'
+  target.assistant.streaming = false
+  target.assistant.truncated = state.truncated || state.finish_reason === 'length'
+  target.assistant.citations = getCompletedCitations(completion, true, false)
+  if (chatMode.value === 'rag') {
+    const updated = applyScopeUpdate({ items: documentScope.value, revision: scopeRevision.value }, state)
+    if (updated) { documentScope.value = updated.items; scopeRevision.value = updated.revision }
+  }
+  recoveryTarget.value = null
+  errorMessage.value = ''
+}
+
+async function checkRequestResult() {
+  const target = recoveryTarget.value
+  if (!target || busy.value || disposed || !sessionEpoch.isCurrent(target.epoch)) return
+  const myController = new AbortController()
+  controller = myController
+  activeRequestId = target.requestId
+  streaming.value = true
+  target.assistant.streaming = true
+  target.assistant.phase = 'recovering'
+  try {
+    const state = await readOriginalRequest(target, myController.signal)
+    if (disposed || myController.signal.aborted || controller !== myController || !sessionEpoch.isCurrent(target.epoch)) return
+    if (state?.status === 'completed') restoreCompletedRequest(target, state)
+    else if (state?.status === 'processing') {
+      target.assistant.status = 'processing'
+      errorMessage.value = t('chat.recovery.processing')
+    } else {
+      const status = state?.status === 'cancelled' ? 'cancelled' : 'failed'
+      target.userMessage.status = target.assistant.status = status
+      errorMessage.value = state?.error_message || t(state ? `chat.recovery.${status}` : 'chat.recovery.unavailable')
+      recoveryTarget.value = null
+    }
+  } catch {
+    if (!myController.signal.aborted && controller === myController && !disposed) errorMessage.value = t('chat.recovery.failedCheck')
+  } finally {
+    target.assistant.streaming = false
+    if (controller === myController) {
+      controller = null
+      activeRequestId = null
+      streaming.value = false
+    }
+    if (!disposed) await loadConversations()
+  }
+}
+
 async function stopStreaming() {
   if (stopping.value) return
   const requestId = activeRequestId
+  recoveryTarget.value = null
   stopping.value = true
   controller?.abort()
   controller = null
   activeRequestId = null
   const last = messages.value[messages.value.length - 1]
-  if (last?.streaming) last.streaming = false
+  if (last?.streaming) {
+    last.streaming = false
+    last.status = 'cancelled'
+    const previous = messages.value[messages.value.length - 2]
+    if (previous?.role === 'user') previous.status = 'cancelled'
+  }
   try {
     if (requestId) await chatApi.cancelRequest(requestId)
   } catch {
@@ -663,7 +764,8 @@ async function send() {
   const mode = chatMode.value
   const hadConversation = !!currentConversationId.value
   // 这一次生成开始后，在途的会话详情载入全部过期：不能让它把刚推入的问答覆盖掉
-  sessionEpoch.begin()
+  const sendEpoch = sessionEpoch.begin()
+  clearRecovery()
   const scopeOptions = buildScopeSendOptions({
     mode,
     items: documentScope.value,
@@ -677,7 +779,7 @@ async function send() {
   const requestId = createChatRequestId()
   activeRequestId = requestId
 
-  messages.value.push({ id: newMessageId(), role: 'assistant', content: '', streaming: true })
+  messages.value.push({ id: newMessageId(), role: 'assistant', content: '', streaming: true, phase: mode === 'rag' ? 'retrieving' : 'generating' })
   // 必须经由数组代理拿到响应式对象：push 进去的普通对象再改属性不会触发视图更新
   const assistant = messages.value[messages.value.length - 1]
   streaming.value = true
@@ -687,6 +789,7 @@ async function send() {
   const signal = myController.signal
   // 最终引用只信任 done，meta 中的旧版检索候选不能当成回答依据。
   let completion: ChatCompletion | undefined
+  let recoveryStatus: ChatRequestState['status'] | undefined
   /** 这条流最终归属的会话；用于阻止过期响应把范围写到别的会话上。 */
   let streamConversationId = currentConversationId.value
   /**
@@ -740,6 +843,10 @@ async function send() {
           if (data.user_message_id) userMessage.id = data.user_message_id
           syncStreamScope(data)
         },
+        onStatus(phase) {
+          if (signal.aborted || disposed || controller !== myController) return
+          assistant.phase = phase
+        },
         onDelta(token) {
           if (signal.aborted || disposed || controller !== myController) return
           pending += token
@@ -748,6 +855,7 @@ async function send() {
         onDone(data) {
           if (signal.aborted || disposed || controller !== myController) return
           completion = data
+          assistant.truncated = data.truncated || data.finish_reason === 'length'
           if (data.message_id) assistant.id = data.message_id
           userMessage.status = 'completed'
           assistant.streaming = false
@@ -764,9 +872,35 @@ async function send() {
     )
   } catch (err: any) {
     completion = undefined
-    assistant.streaming = false
-    if (controller === myController && !disposed && err?.name !== 'AbortError') {
+    if (controller === myController && !disposed && !signal.aborted && err?.name !== 'AbortError') {
+      if (rafId) { cancelAnimationFrame(rafId); rafId = 0 }
+      flush()
+      assistant.phase = 'recovering'
+      const target: RecoveryTarget = { requestId, conversationId: streamConversationId, epoch: sendEpoch, assistant, userMessage }
       errorMessage.value = err?.message || t('errors.request')
+      try {
+        // Query only the original request; never resubmit an interrupted generation.
+        const state = await readOriginalRequest(target, signal)
+        if (!signal.aborted && !disposed && controller === myController && sessionEpoch.isCurrent(sendEpoch)) {
+          if (state?.status === 'completed') {
+            restoreCompletedRequest(target, state)
+            completion = recoveredCompletion(state)
+            recoveryStatus = 'completed'
+          } else if (state?.status === 'processing') {
+            recoveryStatus = 'processing'
+            recoveryTarget.value = target
+            errorMessage.value = t('chat.recovery.processing')
+          } else {
+            recoveryStatus = state?.status === 'cancelled' ? 'cancelled' : 'failed'
+            errorMessage.value = state?.error_message || t(state ? `chat.recovery.${recoveryStatus}` : 'chat.recovery.unavailable')
+          }
+        }
+      } catch {
+        if (!signal.aborted && !disposed && controller === myController && sessionEpoch.isCurrent(sendEpoch)) {
+          recoveryTarget.value = target
+          errorMessage.value = t('chat.recovery.failedCheck')
+        }
+      }
     }
   } finally {
     // 收尾必须把缓冲冲干净，否则最后几个字符会丢
@@ -777,7 +911,8 @@ async function send() {
     flush()
 
     const aborted = signal.aborted
-    userMessage.status = completion ? 'completed' : aborted ? 'cancelled' : 'failed'
+    userMessage.status = completion ? 'completed' : aborted ? 'cancelled' : recoveryStatus ?? 'failed'
+    assistant.status = userMessage.status
     assistant.streaming = false
     // 只收拾自己的状态：用户点停止后可能在这次 finally 之前又发了新请求，
     // 那时 streaming / controller 已经属于新请求，不能被这条旧流重置。
@@ -795,7 +930,9 @@ async function send() {
     if (!assistant.content) {
       assistant.content = aborted
         ? t('chat.emptyReply.stopped')
-        : mode === 'rag'
+        : recoveryStatus === 'processing'
+          ? t('chat.recovery.processing')
+          : mode === 'rag'
           ? t('chat.emptyReply.rag')
           : t('chat.emptyReply.chat')
     }
@@ -973,6 +1110,8 @@ onBeforeUnmount(() => {
 .citation-score { margin-left: auto; padding: 1px 6px; border-radius: 4px; background: var(--surface-soft); color: var(--text-3); }
 .citation-location { margin: 6px 0; color: var(--text-3); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .citation-snippet { display: -webkit-box; overflow: hidden; -webkit-line-clamp: 3; -webkit-box-orient: vertical; color: var(--text-2); font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.truncated-tip { margin-top: 10px; }
+.recovery-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; max-width: 950px; margin: 0 auto 14px; color: var(--text-3); font-size: 12px; }
 .error-tip { max-width: 950px; margin: 0 auto 14px; }
 .composer { flex-shrink: 0; padding: 8px clamp(22px, 3vw, 55px) 14px; background: var(--surface); }
 .composer-box { max-width: 950px; margin: 0 auto; padding: 12px 15px 10px; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow-sm); transition: border-color .18s, box-shadow .18s; }

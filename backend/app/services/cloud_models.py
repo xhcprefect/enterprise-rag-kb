@@ -300,6 +300,18 @@ class OpenAICompatibleChat:
             call.finish()
             return result
 
+    async def astream(self, messages: list[BaseMessage], *, usage_context=None):
+        """主问答使用原生异步实现；同步 stream 保留给离线评测与旧调用方。"""
+        from app.services.async_models import openai_stream
+        source = openai_stream(self, messages, usage_context=usage_context)
+        try:
+            async for chunk in source:
+                yield chunk
+        finally:
+            import anyio
+            with anyio.CancelScope(shield=True):
+                await source.aclose()
+
     def stream(self, messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
         call = ModelCall("chat", self.endpoint.label, self.model)
         client = response = None
@@ -482,6 +494,18 @@ def get_cloud_embeddings() -> OpenAICompatibleEmbeddings:
         model=settings.EMBEDDING_MODEL,
         batch_size=settings.EMBEDDING_BATCH_SIZE,
     )
+
+
+def get_stream_chat():
+    if settings.LLM_PROVIDER == "cloud":
+        return get_cloud_chat()
+    from app.services.async_models import AsyncOllamaChat
+    return AsyncOllamaChat()
+
+
+async def close_async_clients() -> None:
+    from app.services.async_models import close_async_clients as close
+    await close()
 
 
 def get_cloud_chat() -> OpenAICompatibleChat:

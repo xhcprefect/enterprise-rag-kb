@@ -98,6 +98,15 @@ export default {
         assistant: 'AI 助手'
       },
       generating: '生成中',
+      phases: { retrieving: '检索中', generating: '生成中', saving: '保存中', recovering: '正在检查原请求结果' },
+      truncated: '回答达到模型输出长度上限，以上内容可能不完整。系统不会自动追加调用。',
+      recovery: {
+        check: '检查请求结果', noResubmit: '只读取原请求，不会重复生成或追加模型调用。',
+        processing: '原请求仍在处理中，请稍后检查结果，避免重复提问。',
+        cancelled: '原请求已停止，尚未保存完整回答。', failed: '原请求未完成，尚未保存完整回答。',
+        unavailable: '原请求结果不可用、会话已删除或访问权限已改变。',
+        failedCheck: '暂时无法确认原请求结果。网络恢复后可再次检查，系统不会自动重新生成。'
+      },
       thinking: {
         rag: '正在检索并生成回答…',
         chat: '正在生成回答…'
@@ -241,6 +250,15 @@ export default {
         assistant: 'AI assistant'
       },
       generating: 'Generating',
+      phases: { retrieving: 'Searching', generating: 'Generating', saving: 'Saving', recovering: 'Checking the original request' },
+      truncated: 'The answer reached the model output limit and may be incomplete. No additional model call was made automatically.',
+      recovery: {
+        check: 'Check request result', noResubmit: 'Reads the original result only; it does not generate another answer.',
+        processing: 'The original request is still processing. Check again later rather than submitting it again.',
+        cancelled: 'The original request was stopped before a complete answer was saved.', failed: 'The original request did not complete or save a complete answer.',
+        unavailable: 'The result is unavailable, the conversation was deleted, or access has changed.',
+        failedCheck: 'The original result could not be confirmed. Check again when the connection recovers; generation will not restart automatically.'
+      },
       thinking: {
         rag: 'Searching and generating an answer…',
         chat: 'Generating an answer…'

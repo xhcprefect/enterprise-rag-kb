@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import SessionLocal
-from app.models import ChatTurn, Conversation, Message
+from app.models import ChatTurn, Conversation, KnowledgeBase, Message, User
 from app.services import document_scopes
 
 logger = logging.getLogger(__name__)
@@ -237,7 +237,8 @@ def complete_turn(db: Session, reservation: Reservation, answer: str, citations:
     return identifier
 
 
-def _terminate(db: Session, turn_id: uuid.UUID, conversation_id: uuid.UUID, status: str) -> bool:
+def _terminate(db: Session, turn_id: uuid.UUID, conversation_id: uuid.UUID, status: str, *,
+               error_code: str | None = None, error_message: str | None = None) -> bool:
     conv = db.scalar(select(Conversation).where(Conversation.id == conversation_id)
                      .with_for_update().execution_options(populate_existing=True))
     if conv is None or conv.active_turn_id != turn_id:
@@ -247,16 +248,20 @@ def _terminate(db: Session, turn_id: uuid.UUID, conversation_id: uuid.UUID, stat
     if turn is None or turn.status != "processing":
         return False
     turn.status = status
+    if error_code:
+        turn.trace = {"error_code": error_code, "error_message": (error_message or "请求已结束")[:500]}
     db.execute(update(Message).where(Message.turn_id == turn_id, Message.status == "processing").values(status=status))
     conv.active_turn_id, conv.lease_expires_at, conv.updated_at = None, None, _now()
     return True
 
 
-def end_turn(reservation: Reservation, status: str = "cancelled") -> None:
+def end_turn(reservation: Reservation, status: str = "cancelled", *,
+             error_code: str | None = None, error_message: str | None = None) -> None:
     """完成后的清理是空操作；断连、异常和旧工作线程都不能覆盖更新的认领。"""
     try:
         with SessionLocal() as db:
-            _terminate(db, reservation.turn_id, reservation.conversation_id, status)
+            _terminate(db, reservation.turn_id, reservation.conversation_id, status,
+                       error_code=error_code, error_message=error_message)
             db.commit()
     except Exception as exc:
         logger.warning("问答状态清理失败，将由租约到期恢复: %s", type(exc).__name__)
@@ -279,6 +284,64 @@ def cancel_request(db: Session, request_id: uuid.UUID, user_id: uuid.UUID) -> bo
     changed = _terminate(db, turn.id, turn.conversation_id, "cancelled")
     db.commit()
     return changed
+
+
+def expire_request(db: Session, turn: ChatTurn) -> None:
+    """读取请求状态时回收崩溃遗留的 processing，不影响同会话的新租约。"""
+    if turn.status != "processing" or turn.conversation_id is None:
+        return
+    conv = db.scalar(select(Conversation).where(Conversation.id == turn.conversation_id)
+                     .with_for_update().execution_options(populate_existing=True))
+    if conv is None:
+        return
+    if conv.active_turn_id == turn.id and conv.lease_expires_at and conv.lease_expires_at > _now():
+        db.commit()
+        return
+    active = conv.active_turn_id == turn.id
+    current = db.scalar(select(ChatTurn).where(ChatTurn.id == turn.id)
+                        .with_for_update().execution_options(populate_existing=True))
+    if current is not None and current.status == "processing":
+        current.status = "failed"
+        current.trace = {"error_code": "lease_lost", "error_message": "处理租约已失效，请使用新请求重试"}
+        db.execute(update(Message).where(Message.turn_id == turn.id, Message.status == "processing")
+                   .values(status="failed"))
+        if active:
+            conv.active_turn_id, conv.lease_expires_at = None, None
+    db.commit()
+
+
+def check_lease(reservation: Reservation, renew: bool = False) -> bool:
+    """短事务检查/续期；跨进程取消以数据库为准，不为每路问答创建常驻线程。"""
+    with SessionLocal() as db:
+        now = _now()
+        valid = db.scalar(select(ChatTurn.id).join(
+            Conversation, Conversation.id == ChatTurn.conversation_id,
+        ).join(User, User.id == ChatTurn.user_id).outerjoin(
+            KnowledgeBase, KnowledgeBase.id == Conversation.kb_id,
+        ).where(
+            Conversation.id == reservation.conversation_id,
+            Conversation.active_turn_id == reservation.turn_id,
+            Conversation.lease_expires_at > now,
+            ChatTurn.id == reservation.turn_id, ChatTurn.status == "processing",
+            User.id == reservation.user_id, User.is_active.is_(True),
+            or_(Conversation.mode == "chat", User.role == "admin",
+                KnowledgeBase.is_public.is_(True), KnowledgeBase.owner_id == reservation.user_id),
+        ))
+        if valid is None:
+            return False
+        if renew:
+            updated = db.execute(update(Conversation).where(
+                Conversation.id == reservation.conversation_id,
+                Conversation.active_turn_id == reservation.turn_id,
+                Conversation.lease_expires_at > now,
+            ).values(lease_expires_at=now + timedelta(seconds=settings.CHAT_LEASE_SECONDS)))
+            turn = db.execute(update(ChatTurn).where(
+                ChatTurn.id == reservation.turn_id, ChatTurn.status == "processing",
+            ).values(heartbeat_at=now))
+            if not updated.rowcount or not turn.rowcount:
+                return False  # context manager rolls back a partial renewal
+            db.commit()
+        return True
 
 
 @contextmanager

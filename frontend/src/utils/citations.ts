@@ -6,6 +6,9 @@ export interface ChatCompletion {
   latency_ms: number
   message_id?: string
   replayed?: boolean
+  truncated?: boolean
+  finish_reason?: string | null
+  first_token_ms?: number | null
   citations?: Citation[]
   /** 自动选择/换话题后后端实际生效的范围；仅在有该字段时更新 UI。 */
   document_scope?: DocumentScopeItem[]

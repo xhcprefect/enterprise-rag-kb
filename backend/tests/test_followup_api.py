@@ -7,7 +7,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from tests.fake_turns import mock_turns
+from tests.fake_turns import async_items, mock_turns
 from tests.test_followup import security_history
 
 from fastapi import Request
@@ -57,7 +57,7 @@ class FollowupApiTests(unittest.TestCase):
             stack.enter_context(patch.object(chat, "_get_kb", return_value=self.kb))
             retrieve = stack.enter_context(patch.object(rag, "retrieve", return_value=[source()] if docs is None else docs))
             load_sources = stack.enter_context(patch.object(chat, "load_ready_citations", return_value=[self.previous_source] if verified_docs is None else verified_docs))
-            answer = None if real_answer else stack.enter_context(patch.object(rag, "answer_stream", return_value=iter(["本轮说明[1]。"])))
+            answer = None if real_answer else stack.enter_context(patch.object(rag, "answer_astream", side_effect=async_items(["本轮说明[1]。"])))
             stack.enter_context(patch.object(chat, "SessionLocal", return_value=writer))
             audit = stack.enter_context(patch.object(chat, "write_audit"))
             stack.enter_context(patch.object(chat.logger, "exception"))
@@ -81,8 +81,8 @@ class FollowupApiTests(unittest.TestCase):
     def test_screenshot_document_choice_reuses_verified_body_not_a_new_table_of_contents_hit(self):
         history, guide, manual = self.security_context()
         toc = source("目录：考勤与休假、薪酬与报销。", document_id=manual[0].metadata["document_id"], chunk_index=0)
-        with patch.object(followup, "complete_short_chat") as rewrite, patch.object(rag, "get_llm") as model:
-            model.return_value.stream.return_value = [SimpleNamespace(content="按手册，数据安全分为四级：公开级、内部级、机密级、绝密级[1]。")]
+        with patch.object(followup, "complete_short_chat") as rewrite, patch.object(rag, "get_stream_chat") as model:
+            model.return_value.astream.side_effect = async_items([SimpleNamespace(content="按手册，数据安全分为四级：公开级、内部级、机密级、绝密级[1]。")])
             result = self.stream("星海科技内部管理手册", history=history, docs=[toc], verified_docs=[manual], real_answer=True)
         rewrite.assert_not_called()
         result.retrieve.assert_called_once()
@@ -93,7 +93,7 @@ class FollowupApiTests(unittest.TestCase):
         requested = result.load_sources.call_args.args[1]
         self.assertEqual([item["source_index"] for item in requested], [2])
         self.assertEqual(requested[0]["document_id"], manual[0].metadata["document_id"])
-        current = model.return_value.stream.call_args.args[0][-1].content
+        current = model.return_value.astream.call_args.args[0][-1].content
         self.assertIn("数据安全分几级", current)
         self.assertIn(manual[0].page_content, current)
         self.assertNotIn(guide[0].page_content, current)
@@ -231,15 +231,15 @@ class FollowupApiTests(unittest.TestCase):
     def test_documents_excluded_by_budget_cannot_become_final_citations(self):
         docs = [source("资料" * 10000, filename=f"law-{index}.txt") for index in range(6)]
         with patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 4096), patch.object(settings, "LLM_MAX_OUTPUT_TOKENS", 128), \
-             patch.object(settings, "CONTEXT_TOKEN_SAFETY_MARGIN", 64), patch.object(rag, "get_llm") as model:
-            model.return_value.stream.return_value = [SimpleNamespace(content="内容见[6]。")]
+             patch.object(settings, "CONTEXT_TOKEN_SAFETY_MARGIN", 64), patch.object(rag, "get_stream_chat") as model:
+            model.return_value.astream.side_effect = async_items([SimpleNamespace(content="内容见[6]。")])
             result = self.stream("盗窃罪如何量刑？", docs=docs, history=[], real_answer=True)
         self.assertEqual(result.events[-1][0], "done")
         self.assertEqual(result.events[-1][1]["citations"], [])
         self.assertIsNone(result.writer.add.call_args.args[0].citations)
 
     def test_empty_retrieval_refuses_without_calling_generation(self):
-        with patch.object(rag, "get_llm") as model:
+        with patch.object(rag, "get_stream_chat") as model:
             result = self.stream("盗窃罪如何量刑？", docs=[], history=[], real_answer=True)
         model.assert_not_called()
         self.assertEqual(result.events[-1][0], "done")

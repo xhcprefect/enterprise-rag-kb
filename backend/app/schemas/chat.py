@@ -76,6 +76,9 @@ class MessageRead(BaseModel):
     citations: list[Citation] | None = None
     latency_ms: int
     created_at: datetime
+    # 来源为该轮 trace，不新增消息正文列；旧消息按未截断解释。
+    truncated: bool = False
+    finish_reason: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -93,3 +96,16 @@ class ConversationRead(DocumentScopeState):
 
 class ConversationDetail(ConversationRead):
     messages: list[MessageRead] = []
+
+
+class ChatRequestState(DocumentScopeState):
+    """只返回请求本人在当前权限下可读取的结果，不返回诊断或部分生成正文。"""
+    request_id: uuid.UUID
+    conversation_id: uuid.UUID
+    user_message_id: uuid.UUID
+    status: Literal["processing", "completed", "failed", "cancelled"]
+    message: MessageRead | None = None
+    truncated: bool = False
+    finish_reason: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None

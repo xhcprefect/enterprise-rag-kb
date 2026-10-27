@@ -73,12 +73,12 @@ test('partial or failed streams cannot turn retrieval candidates into citations'
   let completion: ChatCompletion | undefined
   const onEvent = (name: string, data: any) => { if (name === 'done') completion = data }
   await assert.rejects(consumeEventStream(stream([
-    event('meta', { citations: [citation] }),
+    event('meta', { conversation_id: 'conv', citations: [citation] }),
     event('delta', { content: '部分回答[3]' })
   ]), onEvent), /提前中断/)
   assert.equal(getCompletedCitations(completion, true, false), undefined)
   await consumeEventStream(stream([
-    event('meta', { citations: [citation] }),
+    event('meta', { conversation_id: 'conv', citations: [citation] }),
     event('error', { message: 'failed' })
   ]), onEvent)
   assert.equal(getCompletedCitations(completion, true, false), undefined)
