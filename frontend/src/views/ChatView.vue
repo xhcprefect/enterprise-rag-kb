@@ -466,14 +466,18 @@ async function scrollToBottom() {
 }
 
 async function loadKbs() {
-  // 先取服务端默认检索条数：滑块显示的必须就是实际会用的条数。
+  // 滑块初值必须与服务端默认一致，否则显示的条数和实际检索条数会对不上。
   // 取不到（老后端）时 defaultTopK 保持 null，发送时退回显式传滑块值的行为。
-  const config = await chatApi.retrievalConfig().then((r) => r.data).catch(() => null)
+  // 与知识库列表并行：两者互不依赖，串起来等于多一次首屏往返。
+  const [config, kbList] = await Promise.all([
+    chatApi.retrievalConfig().then((r) => r.data).catch(() => null),
+    kbApi.list()
+  ])
   if (config?.top_k) {
     defaultTopK.value = config.top_k
     topK.value = config.top_k
   }
-  const { data } = await kbApi.list()
+  const data = kbList.data
   kbs.value = data
   // 支持从知识库卡片「开始问答」带 ?kb=<id> 跳转过来；找不到则退回第一个
   const wanted = typeof route.query.kb === 'string' ? route.query.kb : ''
