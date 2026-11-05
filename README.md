@@ -26,7 +26,9 @@
 - **智能问答**：SSE 流式输出、Markdown 渲染、引用溯源（显示来源文档与原文片段）
 - **双模式对话**：同一页面可切换「知识库问答」（检索 + 引用）与「普通对话」（不检索、直接生成），
   模式按会话固定，两种会话历史分开；知识库为空时自动进入普通对话
-- **会话管理**：多轮对话上下文、历史会话切换与删除
+- **会话管理**：多轮对话上下文、历史会话切换与删除、并发租约与断流结果恢复
+- **普通对话摘要**：可选后台压缩完整历史轮次，查看覆盖水位、摘要来源与重置状态
+- **本地项目索引**：授权目录手动同步、不可变快照、内容搜索、固定快照问答与历史引用预览
 - **用量与费用**：实际 Token 与人民币预估费用总览、按小时/天/月趋势、日期/模型/调用类型筛选；管理员全站统计与模型单价设置，普通用户仅查看本人
 - **用户管理**：管理员可创建/编辑/禁用/删除用户、重置密码
 - **批量导入用户**：上传 Excel / CSV 批量建号，每人生成随机初始密码；
@@ -42,7 +44,7 @@
 enterprise-rag-kb/
 ├── backend/
 │   ├── app/
-│   │   ├── api/v1/        # 路由：auth / users / knowledge / chat / audit
+│   │   ├── api/v1/        # 认证、用户、知识库、项目、聊天、审计、运维接口
 │   │   ├── core/          # 配置、安全（JWT、bcrypt）
 │   │   ├── db/            # 会话、建表初始化
 │   │   ├── models/        # SQLAlchemy 模型
@@ -51,10 +53,11 @@ enterprise-rag-kb/
 │   │   └── main.py
 │   ├── scripts/           # 运维脚本（向量索引迁移）
 │   ├── storage/uploads/   # 上传文件存放（开发环境）
+│   ├── storage/projects/  # 项目内容寻址 blob（开发环境）
 │   ├── requirements.txt   # 开发依赖（宽松下限）
 │   ├── requirements.lock  # 生产依赖锁定，供镜像构建
 │   ├── Dockerfile
-│   ├── worker.py          # 独立入库 worker
+│   ├── worker.py          # ingest / summary / project 独立角色入口
 │   └── run.py
 ├── frontend/
 │   ├── src/
@@ -67,9 +70,9 @@ enterprise-rag-kb/
 │   └── nginx.conf         # 生产 Nginx 配置
 ├── deploy/
 │   ├── init.sh            # 首次部署检查
-│   ├── backup.sh          # 备份（数据库 + 上传文件）
+│   ├── backup.sh          # 备份（数据库 + 上传文件 + 项目 blob）
 │   └── restore.sh         # 恢复
-├── docker-compose.yml     # db / api / worker / web 编排
+├── docker-compose.yml     # db / api / worker / web；summary、project 可选 profile
 ├── DEPLOY.md              # 生产部署手册
 ├── start-backend.bat
 └── start-frontend.bat
@@ -109,6 +112,28 @@ npm run dev
 ```
 
 访问 <http://localhost:5173>。
+
+### 独立后台任务
+
+API 和前端启动后，还需在 `backend` 目录的独立终端启动入库 worker；启用摘要或项目功能时，再各自启动对应角色：
+
+```bash
+python worker.py --role ingest
+python worker.py --role summary
+python worker.py --role project
+```
+
+上面三条命令分别占用一个进程。`ingest` 是默认角色；没有相应 worker 时，文档入库、摘要或项目同步会一直排队。Compose 默认启动入库角色；摘要和项目角色按需启用：
+
+```bash
+docker compose --profile summary --profile project up -d
+```
+
+普通对话摘要默认关闭。在 `backend/.env` 设置 `CHAT_MEMORY_ENABLED=true` 后启用；默认累计 8 个完整轮次或历史预算达到 75% 时触发，保留最近 4 轮。摘要只辅助历史上下文，原始消息仍保留，不提供跨会话记忆。生成、重置和旧任务收尾使用版本与租约校验，重置后迟到任务不能重新发布旧摘要。
+
+项目索引默认没有授权根。管理员先配置 `PROJECT_ALLOWED_ROOTS`（例如 `{"source":"/srv/projects"}`），再在「项目索引」登记 `root_key` 与相对目录并手动同步。Compose 中 API 与项目 worker 必须把源目录只读挂载到相同路径，并共用 `PROJECT_STORAGE_DIR` 持久存储；示例见编排文件注释。项目库通过同步更新，不能走普通文档上传接口。
+
+项目问答首次发送时选择 ready 快照；后续同步不会改变已有会话的绑定。显式切换通过 `scope_revision` 检查并发冲突；旧引用始终读取当时的快照和文件版本。读取引用及模型等待结束后均重新检查源状态、访问权和快照状态。
 
 ### 主题与界面语言
 
@@ -261,9 +286,9 @@ npm run dev
 - **完整轮次裁剪**：两种模式共用 `HISTORY_MAX_TURNS=10` 和 `HISTORY_MAX_CHARS=8000`，一轮优先按已完成消息的 `reply_to_id` 关联识别，旧消息兼容相邻、非空的 user + assistant 配对。优先保留最近完整轮次，舍弃孤立、失败或未回答的消息；最新一轮过长时，问题与回答成对截短，不只留下助手回复。RAG 先为历史预留至多三分之一的剩余额度，再装入资料，剩余空间回收给历史。设置历史轮数或字符上限为 0 可禁用生成阶段的历史消息（追问补全有独立的历史字符上限；轮数为 0 时不读取历史）。原始当前问题不会静默截断，超预算时返回可读错误。
 - **历史引用隔离与核验**：历史回复中的来源编号改为独立标记，并明确声明不是本轮证据，代码和链接保持原样。本轮只能引用实际装入提示词的资料。对于“解释刚才第 3 条来源”，从最近完整回答的最终引用中定位，重新读取当前知识库内仍就绪、未取消、索引代次一致的原文，再分配本轮编号；不会用旧片段或无关检索结果替代。来源已删除、被重建、编号不存在或轮次不明确时请求澄清。旧引用缺少 `index_version` 时仅接受第 0 代且原文前缀匹配的资料。引用代次本身保存在既有 JSON 字段；本次会话与分块的表结构迁移见下文。
 
-本轮先补齐追问、预算和引用边界，长期会话摘要与跨会话记忆暂未引入。调整上述参数后重启 API；Compose 部署时配置写在 `backend/.env`，而不是根目录的 Compose 变量文件。
+普通对话可按上文启用后台摘要；知识库问答继续使用完整轮次裁剪与来源核验。调整上述参数后重启 API 及相关 worker；Compose 部署时应用配置写在 `backend/.env`，根目录的环境文件用于编排变量。
 
-回归测试：在 `backend` 目录运行 `python -m unittest discover -s tests -t .`，追问、上下文预算、超时回退和 SSE 契约使用模拟模型/内存传输验证。真实 PostgreSQL/pgvector 测试默认跳过；如需运行，显式设置 `TEST_DATABASE_URL`，指向数据库名以 `_test` 结尾、可清空的专用测试库。测试会清理该库的数据，请与业务库完全隔离。
+回归测试：在 `backend` 目录运行 `python -m unittest discover -s tests -t .`。真实 PostgreSQL/pgvector 用例只使用回环地址、库名以 `_test` 结尾的可清空专用库。设置 `TEST_DATABASE_URL` 和带 `owned-test:`、`disposable-test:` 或 `ci-disposable:` 前缀的 `TEST_DATABASE_OWNER`，再运行 `python -m tests._memory_project_test_gate --prepare-owner` 写入库归属 comment。已有其他 owner 时拒绝覆盖；两项均缺失时跳过，部分配置或归属不符时硬失败。测试会清理专用库的数据。
 
 ### 会话文档范围
 
@@ -293,7 +318,28 @@ npm run dev
 1. 先备份，停止旧 API / worker，再统一部署 API、worker、web，避免旧代码绕过新租约或写入旧分块格式。
 2. `init_db` 启动时幂等创建 `chat_turns`，补充会话租约、消息关联/状态、分块 `source_metadata` / `search_text` 及去重索引。保留历史数据，旧消息关联为空时走兼容逻辑；无需清空业务库。旧分块默认没有结构位置和关键词文本，不自动从分块序号推测页码；按需重新索引后补齐。会话删除后的请求去重记录保留，但含问题与来源的诊断被清除。本次有表结构迁移，不能只更新前端。
 3. 启动新版 API 完成迁移后，可在 `backend` 执行 `python -m scripts.migrate_keyword_index --dry-run` 检查，再运行 `python -m scripts.migrate_keyword_index` 并发建立关键词 GIN 索引；脚本不改源文档或分块正文。旧就绪文档仍能向量检索，按需重新索引以补齐关键词及结构信息；重新索引期间该文档暂不参与检索。
-4. 在 `backend` 运行 `python -m unittest discover -s tests -t .`，在 `frontend` 运行 `npm test` 和 `npm run build`。真实数据库测试仅在显式设置 `TEST_DATABASE_URL`、数据库名以 `_test` 结尾时运行，测试会清理该专用库的数据。
+4. 在 `backend` 运行 `python -m unittest discover -s tests -t .`，在 `frontend` 运行 `npm test` 和 `npm run build`。真实数据库回归需先按上文核验专用库 URL 与 owner；测试会清理该专用库的数据。
+
+### 真实浏览器与维护回归
+
+浏览器用例使用真实 API、PostgreSQL、三个独立 worker 与前端生产构建，只有模型由回环确定性替身提供。先安装锁定依赖、Playwright Chromium，并显式准备 `pgvector/pgvector:pg18` 测试镜像；harness 不会自动拉取镜像。在独立终端运行：
+
+```bash
+python -I backend/scripts/e2e_env.py up --out /tmp/ragkb-browser-run --owner local-browser --keep
+```
+
+输出目录必须在仓库外且不存在或为空。等待目录出现 `READY` 后，在另一终端运行（Windows 换为本机绝对临时路径）：
+
+```bash
+export RAG_E2E_MANIFEST=/tmp/ragkb-browser-run/manifest.json
+npm --prefix frontend run typecheck:e2e
+npm --prefix frontend run test:e2e
+python -I backend/scripts/e2e_env.py down --out /tmp/ragkb-browser-run
+```
+
+每轮测试独占数据库、端口、合成项目与上传目录；API 和模型替身必须通过 owner/nonce 校验。`down` 只清理已核实归属的进程和容器，`--keep` 保留诊断目录。用例覆盖项目登记/同步/搜索、固定快照与并发切换、旧引用预览、摘要发布/重置、断流恢复锁以及合并阶段取消上传后的队列推进。替身输出只验证系统链路，不代表真实模型质量。
+
+CI 分别运行后端、前端、浏览器和维护检查。维护回归包括 `deploy/tests/test-maintenance.sh`、`test-remote-backup.sh`、`test-drill-guard.sh` 和 `test-monitoring.sh`；前三者使用合成数据与命令替身，监控检查使用独占 Prometheus 测试容器与合成令牌，验证权限、规则、启动和关闭热重载。它们不恢复业务数据或上传远端备份。
 
 固定问题集、离线回放、显式真实服务评测、模型连通性检查和费用估算边界见 [评测说明](backend/evaluation/README.md)。`include_trace=true` 仅管理员可用；普通问答不公开检索诊断。短追问补全与主问答一样通过 SSE 请求云端，兼容返回完整 JSON 的服务，避免某些网关在非流式模式只返回用量而丢失正文。
 
@@ -302,7 +348,7 @@ npm run dev
 入口：登录后侧栏「用量与费用」。页面上方显示调用、实际输入/输出 Token 和人民币预估费用，下方显示 Token 与费用时间趋势，并提供模型/调用类型明细。
 
 - **权限与区间**：管理员默认查看全站，可切换「仅本人」并管理模型单价；普通用户只能查看本人，接口同样限制。日期按 `Asia/Shanghai` 自然日计算，起止日均包含；支持快捷和自定义区间，最长 366 天，小时粒度最多 31 天，另有天/月粒度。刷新可查看新发生的用量。
-- **计量对象**：一次模型调用尝试计一次，不等于用户提问次数。包含回答生成、追问改写、检索向量化、文档入库向量化和可选重排；向量批次和自动重试分别计数。请求重放不重新调用模型，也不新增记录。文档向量化归属上传者，检索/改写/生成/重排归属提问者。
+- **计量对象**：一次模型调用尝试计一次，不等于用户提问次数。包含回答生成、追问改写、检索向量化、文档入库向量化、可选重排、会话摘要压缩与项目源码/文档向量化；向量批次和自动重试分别计数。请求重放不重新调用模型，也不新增记录。摘要归属触发压缩的会话（提问者），项目向量化归属发起同步的管理员；文档向量化归属上传者，检索/改写/生成/重排归属提问者。
 - **实际 Token**：仅采纳上游返回的有效用量，兼容 OpenAI / DeepSeek / LangChain 常见字段。输出 Token 已包含的思考 Token 不再重复相加，缓存输入是总输入的子集。上下文预算的字节估算不作为用量。部分或全部缺失会显示覆盖不足/未知；Ollama 向量接口仅返回向量、没有 Token 数时同样保持未知。
 - **费用估算**：管理员按服务商、模型、类型配置人民币/百万 Token 的输入、输出和可选缓存输入单价，最多 6 位小数。输入/输出同时留空为未配置，明确免费需填 `0`；向量/重排输出单价为 `0`。缓存价留空按普通输入价处理；配置不同缓存价而上游未报告缓存量时，费用保持未知，不猜命中率。
 - **价格快照**：每次调用在开始时保存价格版本，历史金额不会随改价变化。并发改价使用版本校验，过期页面返回 409 并需刷新。汇总费用仅合计可计价调用，并同时报告计价覆盖率；完全未知用 `null` 表示，不显示成零元，趋势中的未知费用也不补零连接。
@@ -391,6 +437,48 @@ npm run dev
 没有引入 `openai` / `langchain-openai` 依赖。失败策略：429 与 5xx 自动退避重试 3 次，
 401/402/422 直接抛出带中文说明的错误。连接按 base_url 复用，批量向量化时省掉反复握手。
 
+## 普通对话摘要压缩（记忆）
+
+长对话默认只要塞得进上下文就不压缩，仅在显式开启后才对旧轮次做结构化摘要，让空出的
+预算回到最新的几轮。**这是有损压缩**：被压缩的旧轮次不再作为完整上下文参与回答，
+只保留生成的结构化记忆。开启方式与行为如下：
+
+- **开关**：`CHAT_MEMORY_ENABLED=true` 后重启后端与 worker。默认 `false`，即完全回到
+  现有窗口裁剪（过长的旧轮次整体丢弃），与升级前行为一致。
+- **触发**：历史轮次达到阈值才压缩。触发的两个条件——轮数
+  （`MEMORY_TRIGGER_TURNS`，默认 8 轮）与历史 token 占比
+  （`MEMORY_TRIGGER_RATIO`，默认 0.75）——**任一满足即触发**；触发后
+  `MEMORY_HISTORY_TOKEN_BUDGET`（默认 8000）控制参与语义折叠的历史预算。
+- **保留**：最近 `MEMORY_KEEP_RECENT_TURNS`（默认 4 轮）不参与折叠、保持原样，但仍受整体
+  硬输入预算约束——预算不足时仍会被裁剪，不保证无条件完整；摘要文本上限为
+  `MEMORY_SUMMARY_MAX_TOKENS`（默认 1200）。
+- **状态与重置**：只有后台摘要成功发布后，会话状态的已覆盖轮次序号才会前移，界面据此显示
+  「已覆盖至第 N 轮 / 仍有历史待整理 / 已就绪可查看」等状态；可查看结构化摘要与前缀来源
+  范围，并可对单条会话发起重置（带版本号，过期返回 409 需刷新，绝不覆盖较新的状态）。
+- **异步与代次**：压缩由独立 worker 异步领取（见下），前端轮询该会话的状态；切换会话
+  或长任务结束都会重新拉取，避免迟到响应覆盖到别的会话。
+- **失败重试**：压缩失败会保留调用与重试上限（`MEMORY_MAX_ATTEMPTS`），并暴露可查看的
+  失败原因；仍保留原窗口裁剪作为兜底，不会因摘要失败丢失提问入口。
+
+## 项目源码管理（独立内容检索 / 项目问答）
+
+在普通文档知识库之外，系统还支持把**本地项目源码/文档**作为一个独立内容源检索，并可在
+对话中把项目纳入 RAG 用项目的向量索引作答。负责处理项目索引的后端 worker 与文档入库
+worker 相互独立，可单独启动。
+
+- **根目录绑定**：管理员通过 `PROJECT_ALLOWED_ROOTS` 绑定若干「根名 → 磁盘路径」，
+  只允许在这些根目录下登记项目，杜绝任意路径访问。
+- **存储与限额**：登记的项目清单与元数据存放在 `PROJECT_STORAGE_DIR`（默认
+  `storage/projects`）。单个项目文件数上限 `PROJECT_MAX_FILES`、单文件字节上限
+  `PROJECT_MAX_FILE_BYTES`、总字节上限 `PROJECT_MAX_TOTAL_BYTES`；项目索引向量使用独立
+  前缀（`PROJECT_VECTOR_PREFIX`，默认 `proj_`），与普通文档向量互不干扰。
+- **忽略与清理**：项目内跳过二进制、`.git`、构建产物等目录，遵循项目的忽略规则，避免把
+  生成物与密钥索引进去。
+- **解析与同步**：支持常见源码与文档格式，`PROJECT_PARSE_BATCH` 控制批次；同步为手动
+  触发、后台增量执行，增量只处理变更。项目页面可查看同步进度/状态并触发展开或全量重建。
+- **访问控制**：登记的项目带可访问者范围；用户在对话中选择项目（`kind='project'` 的知识
+  库）时，只会检索并引用其有权访问的项目内容，来源预览会路由到项目内文件与行号/符号。
+
 ## 注意事项
 
 - 默认对话模型为 sheapi.top 的 `deepseek-v4.1-flash`（首字约 5s，不输出思考过程）；
@@ -402,6 +490,16 @@ npm run dev
   worker 未运行时文档停在 `pending`，`/health` 会显示 `worker: stale`。
   `/health` 的 `worker` 有三种取值：`alive`（正在处理且有新鲜心跳）、
   `stale`（有排队文档但无人领取，通常是 worker 没启动）、`idle`（队列为空，无法观测）。
+- worker 支持 `--role` 参数三种角色：`ingest`（文档入库，默认，即 `start-worker.bat` 的行为）、
+  `summary`（普通对话摘要压缩）、`project`（项目源码/文档索引与手动同步）。
+  **三种角色相互独立，需各自单独启动**，没有单一脚本能一次拉起全部：
+  ```bash
+  python worker.py                              # 入库（默认）
+  python worker.py --role summary               # 对话摘要
+  python worker.py --role project               # 项目索引
+  ```
+  只跑 `ingest` 时，摘要与会话记忆保持在已触发/排队状态、项目同步停在待处理状态——文档/摘要/
+  项目的领取循环互不占用，长任务不会互相饿死。
 - 本地模式下首次检索会加载 bge-m3 到内存，响应较慢，之后正常；云端模式无此问题。
 
 ## 生产部署

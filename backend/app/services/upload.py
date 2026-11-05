@@ -13,7 +13,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import UploadSession, UploadStatus
+from app.models import (
+    KNOWLEDGE_BASE_KIND_PROJECT,
+    Document,
+    KnowledgeBase,
+    UploadSession,
+    UploadStatus,
+)
 
 logger = logging.getLogger(__name__)
 COPY_BUF = 4 * 1024 * 1024
@@ -21,6 +27,17 @@ COPY_BUF = 4 * 1024 * 1024
 
 class UploadConflict(ValueError):
     """请求与已有上传状态/内容冲突。"""
+
+
+def _guard_project_kb(db, kb_id) -> None:
+    """服务层兜底：项目源码库拒绝普通分片写入。
+
+    项目库只能通过项目 API 登记维护；API 入口已先按 400 拒绝，这里仅防
+    直接绕过 API 调用本服务的路径，若被触达同样不允许落盘/合并/发布。
+    """
+    kb = db.get(KnowledgeBase, kb_id)
+    if kb is not None and kb.kind == KNOWLEDGE_BASE_KIND_PROJECT:
+        raise UploadConflict("项目源码库不支持此操作")
 
 
 def upload_root() -> Path:
@@ -81,6 +98,7 @@ def create_or_resume(
     db: Session, kb_id: uuid.UUID, filename: str, file_size: int, ext: str,
     user_id: uuid.UUID, content_sha256: str | None = None,
 ) -> UploadSession:
+    _guard_project_kb(db, kb_id)
     if not 0 < file_size <= settings.MAX_UPLOAD_MB * 1024 * 1024:
         raise UploadConflict(f"文件大小必须在 1 字节至 {settings.MAX_UPLOAD_MB}MB 之间")
     fingerprint = make_fingerprint(kb_id, filename, file_size, content_sha256, user_id)
@@ -139,6 +157,33 @@ def save_chunk(session: UploadSession, index: int, data: bytes) -> bool:
     return True
 
 
+def claimed_document_id(session: UploadSession) -> uuid.UUID:
+    """本次会话认领的文档 ID：已提交则用它，未提交也能由会话 ID 推导。"""
+    if session.document_id is not None:
+        return session.document_id
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"rag-upload:{session.id}")
+
+
+def remove_unreferenced_final(db: Session, session: UploadSession) -> bool:
+    """清理本会话认领的合并文件；被任何文档引用时一律保留。
+
+    进程在 complete 阶段二提交后、阶段三之前退出时，正式文件已落盘但会话
+    仍是 uploading。TTL/主动放弃只清 tmp 会把它留成孤儿，因此两者都调用
+    这里；但与同内容并发完成时该路径可能已被另一文档收编，所以先查引用，
+    绝不删除 canonical。
+    """
+    target = final_path(session.kb_id, claimed_document_id(session), session.file_ext)
+    referenced = db.scalar(select(Document.id).where(Document.stored_path == str(target)))
+    if referenced is not None:
+        return False
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("清理合并文件失败: %s", target, exc_info=True)
+        return False
+    return True
+
+
 def abort_session(db: Session, session: UploadSession) -> None:
     session = get_session(db, session.kb_id, session.id, lock=True)
     if session is None or session.status != UploadStatus.UPLOADING.value:
@@ -146,6 +191,8 @@ def abort_session(db: Session, session: UploadSession) -> None:
     session.status, session.received = UploadStatus.ABORTED.value, []
     db.commit()
     shutil.rmtree(tmp_dir(session.id), ignore_errors=True)
+    # 阶段二已落盘、阶段三尚未提交时被放弃：正式文件也必须清掉（引用者除外）。
+    remove_unreferenced_final(db, session)
 
 
 def _valid_final(session: UploadSession, target: Path) -> bool:
@@ -157,8 +204,26 @@ def _valid_final(session: UploadSession, target: Path) -> bool:
     return True
 
 
-def assemble(db: Session, session: UploadSession) -> uuid.UUID:
-    """持有会话行锁直到文档行一起提交；磁盘清理由调用方在提交后执行。"""
+class AssemblyResult:
+    """慢写阶段的结果：本次认领的文件与它的服务端真实摘要。
+
+    状态切换（completed/deduplicated/document_id）留给调用方在短事务里
+    与文档行一起提交，避免把知识库行锁跨在合并/哈希这类磁盘操作上。
+    """
+
+    def __init__(self, claimed_doc_id: uuid.UUID, path: Path, digest: str):
+        self.claimed_doc_id = claimed_doc_id
+        self.path = path
+        self.digest = digest
+
+
+def assemble(db: Session, session: UploadSession) -> AssemblyResult:
+    """只持有会话行锁完成合并与校验；提交由调用方负责。
+
+    慢写期间不碰知识库行，也不会提前把会话标记为 completed——若进程在
+    文件落盘与文档提交之间退出，重试仍能定位同一认领路径并继续。
+    """
+    _guard_project_kb(db, session.kb_id)
     session = get_session(db, session.kb_id, session.id, lock=True)
     if session is None or session.status == UploadStatus.ABORTED.value:
         raise UploadConflict("上传会话已终止")
@@ -197,10 +262,12 @@ def assemble(db: Session, session: UploadSession) -> uuid.UUID:
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
-    session.status = UploadStatus.COMPLETED.value
+    # 服务端真实摘要：声明值只参与上面的完整性校验，绝不直接落库。
+    with target.open("rb") as source:
+        digest_hex = hashlib.file_digest(source, "sha256").hexdigest()
     session.received = list(range(session.total_chunks))
     db.flush()
-    return doc_id
+    return AssemblyResult(doc_id, target, digest_hex)
 
 
 def cleanup_expired(db: Session) -> int:
@@ -212,6 +279,10 @@ def cleanup_expired(db: Session) -> int:
         session.status, session.received = UploadStatus.ABORTED.value, []
         shutil.rmtree(tmp_dir(session.id), ignore_errors=True)
     db.commit()
+    # 阶段二落盘后进程退出：会话已过期，正式文件也没有 worker 会再发布它。
+    # 逐个检查引用，避免误删并发完成时已被收编为 canonical 的同路径文件。
+    for session in stale:
+        remove_unreferenced_final(db, session)
     known = {str(sid) for sid in db.scalars(select(UploadSession.id).where(
         UploadSession.status == UploadStatus.UPLOADING.value)).all()}
     root = upload_root() / "tmp"

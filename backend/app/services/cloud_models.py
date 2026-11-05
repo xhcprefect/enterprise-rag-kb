@@ -15,8 +15,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -36,6 +39,28 @@ _RETRY_STATUS = {429, 500, 502, 503, 504}
 
 class CloudModelError(RuntimeError):
     """模型服务返回错误，消息里带上可读的原因。"""
+
+
+class EmbeddingStopped(CloudModelError):
+    """停机信号已到达：不再开始新的重试，交由入库任务回交检查点。
+
+    只在 ``embedding_stop_scope`` 内可能出现；正常聊天/查询调用不会触发。
+    """
+
+
+# 入库专用：把 worker 的停止事件注入当前线程的模型调用。ContextVar 只在
+# ``embedding_stop_scope`` 内有效，作用域退出即恢复，不跨请求、不影响聊天。
+_embedding_stop: ContextVar[threading.Event | None] = ContextVar("embedding_stop_event", default=None)
+
+
+@contextmanager
+def embedding_stop_scope(stop_event: threading.Event | None):
+    """为当前线程的入库向量调用注入停止感知；``None`` 时保持原行为。"""
+    token = _embedding_stop.set(stop_event)
+    try:
+        yield
+    finally:
+        _embedding_stop.reset(token)
 
 
 @dataclass(frozen=True)
@@ -78,18 +103,37 @@ def _shared_client(endpoint: _Endpoint) -> httpx.Client:
     return _clients[key]
 
 
+def _sleep_or_stop(seconds: float) -> None:
+    """退避等待；入库作用域内收到停机信号时立即醒来并放弃本次重试。
+
+    作用域外（聊天/查询）保持原来的 ``time.sleep`` 行为。
+    """
+    stop_event = _embedding_stop.get()
+    if stop_event is None:
+        time.sleep(seconds)
+        return
+    if stop_event.wait(seconds):
+        raise EmbeddingStopped("收到停机信号，不再重试向量请求")
+
+
 def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool = False,
           *, usage_call: ModelCall | None = None):
     """带指数退避的 POST。
 
     ``stream=False`` 返回 ``httpx.Response``；``stream=True`` 返回
     ``(client, response)`` 二元组，调用方负责关闭两者。
+
+    入库作用域内（``embedding_stop_scope``）收到停机信号后不再开始新尝试；
+    已经成功返回的响应不受影响，调用方仍可提交这一批结果。
     """
     url = endpoint.url(path)
     headers = endpoint.headers()
     last_error = ""
 
     for attempt in range(3):
+        stop_event = _embedding_stop.get()
+        if stop_event is not None and stop_event.is_set():
+            raise EmbeddingStopped("收到停机信号，取消向量请求")
         if attempt and usage_call:
             usage_call.retry()
         client = None
@@ -106,7 +150,7 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
                     client.close()
                     if usage_call:
                         usage_call.finish("failed")
-                    time.sleep(1.5 * (attempt + 1))
+                    _sleep_or_stop(1.5 * (attempt + 1))
                     continue
                 if response.status_code >= 400:
                     body = response.read().decode("utf-8", "replace")
@@ -122,7 +166,7 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
                 last_error = _format_error(endpoint.label, response.status_code, response.text)
                 if usage_call:
                     usage_call.finish("failed")
-                time.sleep(1.5 * (attempt + 1))
+                _sleep_or_stop(1.5 * (attempt + 1))
                 continue
             if response.status_code >= 400:
                 raise CloudModelError(
@@ -141,7 +185,7 @@ def _post(endpoint: _Endpoint, path: str, payload: dict[str, Any], stream: bool 
         if attempt < 2:
             if usage_call:
                 usage_call.finish("failed")
-            time.sleep(1.5 * (attempt + 1))
+            _sleep_or_stop(1.5 * (attempt + 1))
 
     raise CloudModelError(f"调用 {endpoint.label} 失败：{last_error}")
 

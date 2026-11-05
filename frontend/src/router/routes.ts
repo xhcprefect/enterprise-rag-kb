@@ -10,6 +10,7 @@ declare module 'vue-router' {
     roles?: UserRole[]
     menu?: { icon: string }
     activeMenu?: string
+    viewKey?: string
   }
 }
 
@@ -47,6 +48,19 @@ export const workspaceRoute: RouteRecordRaw = {
       name: 'knowledge',
       component: () => import('@/views/KnowledgeView.vue'),
       meta: { titleKey: 'nav.knowledge', menu: { icon: 'Files' } }
+    },
+    {
+      path: '/projects',
+      name: 'projects',
+      component: () => import('@/views/projects/ProjectsView.vue'),
+      meta: { titleKey: 'nav.projects', menu: { icon: 'FolderOpened' }, viewKey: 'projects' }
+    },
+    {
+      // 直接打开某个项目源：与列表页共用同一组件，路由参数决定初始选中项。
+      path: '/projects/:sourceId',
+      name: 'project',
+      component: () => import('@/views/projects/ProjectsView.vue'),
+      meta: { titleKey: 'nav.projects', activeMenu: '/projects', viewKey: 'projects' }
     },
     {
       path: '/documents/:kbId',

@@ -16,7 +16,11 @@ logger = logging.getLogger(__name__)
 # 按表分组，新增表直接往里加一项即可。
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "users": {"token_version": "INTEGER NOT NULL DEFAULT 0"},
-    "upload_sessions": {"content_sha256": "VARCHAR(64)"},
+    "upload_sessions": {
+        "content_sha256": "VARCHAR(64)",
+        # 分片完成时是否复用了同库已有文档；持久化以保证 complete 重放一致。
+        "deduplicated": "BOOLEAN NOT NULL DEFAULT FALSE",
+    },
     "documents": {
         "progress": "INTEGER NOT NULL DEFAULT 0",
         "cancel_requested": "BOOLEAN NOT NULL DEFAULT FALSE",
@@ -24,6 +28,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "parse_done": "BOOLEAN NOT NULL DEFAULT FALSE",
         "index_version": "INTEGER NOT NULL DEFAULT 0",
         "lease_id": "UUID",
+        # 服务端真实内容摘要；老数据保持 NULL，由 backfill 脚本按需补齐。
+        "content_sha256": "VARCHAR(64)",
     },
     "conversations": {
         # 普通对话模式新增；老会话默认按知识库问答解释，行为与升级前一致
@@ -32,6 +38,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "lease_expires_at": "TIMESTAMPTZ",
         "document_scope": "JSONB NOT NULL DEFAULT '[]'::jsonb",
         "scope_revision": "INTEGER NOT NULL DEFAULT 0",
+        # 会话置顶时间；NULL 表示未置顶，由会话排序使用。
+        "pinned_at": "TIMESTAMPTZ",
     },
     "messages": {
         "turn_id": "UUID REFERENCES chat_turns(id) ON DELETE CASCADE",
@@ -92,6 +100,40 @@ def init_db(create_admin: bool = True) -> None:
 
         if "messages" in table_names:
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_turn_role ON messages (turn_id, role)"))
+
+        # 本轮新增（记忆摘要 + 项目索引）的列与部分唯一索引：统一交给专用迁移 helper。
+        from app.db.migrations import ensure_foundation_schema
+
+        ensure_foundation_schema(conn)
+
+        # 文档内容去重：部分唯一索引只约束已算出摘要的行。
+        # 老库全为 NULL，因此可安全创建；若历史数据里已存在重复非空摘要
+        # （手工导入/绕过约束写入），唯一索引建不起来——此时 fail closed，
+        # 不允许在没有并发去重约束的情况下继续启动。脚本也不会自动改/删任何行，
+        # 只有人工确认 canonical 后清掉其余行的 hash 才能继续。
+        if "documents" in table_names:
+            duplicates = conn.execute(text(
+                "SELECT kb_id, content_sha256, count(*) AS n, "
+                "array_agg(id::text ORDER BY created_at, id::text) AS ids "
+                "FROM documents WHERE content_sha256 IS NOT NULL "
+                "GROUP BY kb_id, content_sha256 HAVING count(*) > 1"
+            )).all()
+            if duplicates:
+                details = "; ".join(
+                    f"kb={row.kb_id} sha256={row.content_sha256} rows={row.n} ids={','.join(row.ids)}"
+                    for row in duplicates
+                )
+                raise RuntimeError(
+                    "documents 存在重复 content_sha256，无法创建并发去重唯一索引 "
+                    "uq_documents_kb_content_sha256。启动已中止，避免在没有约束的情况下运行。"
+                    f"重复组：{details}。请先确认每组保留哪一行（canonical），"
+                    "人工把其余行的 content_sha256 置为 NULL（不删除文档/引用/向量），再重启服务；"
+                    "可先运行 scripts/backfill_document_hashes.py（默认 dry-run）查看重复组与缺文件。"
+                )
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_documents_kb_content_sha256 "
+                "ON documents (kb_id, content_sha256) WHERE content_sha256 IS NOT NULL"
+            ))
 
         # conversations.kb_id 原来非空（会话必须挂知识库）。普通对话没有知识库，
         # 需要放开。已是可空时这条是空操作，可重复执行。

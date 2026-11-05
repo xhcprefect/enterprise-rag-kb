@@ -53,7 +53,7 @@ class TopKResolutionTests(unittest.TestCase):
         db = MagicMock()
         reservation = SimpleNamespace(
             conversation_id=uuid.uuid4(), request_id=uuid.uuid4(), user_message_id=uuid.uuid4(),
-            turn_id=uuid.uuid4(), document_scope=[], scope_revision=0,
+            turn_id=uuid.uuid4(), document_scope=[], scope_revision=0, project_snapshot_id=None,
             replay_answer=None, question="q", mode="chat", status="pending",
         )
         for given, expected in ((None, 5), (3, 3)):

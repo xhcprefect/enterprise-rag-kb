@@ -2,7 +2,7 @@
 import enum
 import uuid
 
-from sqlalchemy import BigInteger, ForeignKey, Index, Integer, String, text
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -50,6 +50,11 @@ class UploadSession(Base, TimestampMixin):
     # 所以不建外键，仅用于重试时定位同一次合并）
     document_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, index=True
+    )
+    # complete 时若按服务端摘要复用了同库已有的 canonical 文档，在此持久化标记，
+    # 保证 complete 重放返回同样的 deduplicated 与同一文档 ID。
+    deduplicated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
     )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

@@ -65,6 +65,11 @@ def get_embeddings() -> Embeddings:
     return OllamaEmbeddings(
         model=settings.EMBEDDING_MODEL,
         base_url=settings.OLLAMA_BASE_URL,
+        # Ollama 客户端默认不设总超时，卡死的本地推理会让 stop_event 永远等不到
+        # 下一个安全点。与云端 EMBEDDING_TIMEOUT 对齐；不额外引入新配置项。
+        client_kwargs={"timeout": settings.EMBEDDING_TIMEOUT},
+        sync_client_kwargs={"timeout": settings.EMBEDDING_TIMEOUT},
+        async_client_kwargs={"timeout": settings.EMBEDDING_TIMEOUT},
     )
 
 

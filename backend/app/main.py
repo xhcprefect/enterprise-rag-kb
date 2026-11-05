@@ -17,6 +17,7 @@ from app.api.v1 import api_router
 from app.core.api_response import error_body, sanitized_validation_errors, validation_message
 from app.core.config import settings
 from app.core.logging import setup_logging
+from app.core.observability import HttpMetricsMiddleware
 from app.core.request_log import RequestLoggingMiddleware
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
@@ -121,6 +122,9 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Request-ID"],
 )
+# 指标中间件放在请求日志内侧：请求日志仍是最外层，能看到最终状态码；
+# 指标只按模板路由计数，不接触原始 UUID 路径。
+app.add_middleware(HttpMetricsMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(api_router, prefix=settings.API_V1_PREFIX)

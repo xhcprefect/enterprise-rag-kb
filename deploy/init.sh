@@ -77,12 +77,13 @@ ok "配置检查通过"
 set -a; source <(grep -E '^[A-Z_]+=' .env | sed 's/[[:space:]]*$//'); set +a
 DATA_DIR=${DATA_DIR:-./data}
 
-mkdir -p "$DATA_DIR"/{pgdata,uploads,logs,backups}
+mkdir -p "$DATA_DIR"/{pgdata,uploads,projects,logs,backups}
 chmod 700 "$DATA_DIR/pgdata"
 
-# 容器内 appuser 的 uid 是 1000，上传/日志卷需要可写
+# 容器内 appuser 的 uid 是 1000：上传/日志/项目 blob 卷需要可写
+# （项目 blob 由 project worker 写入、API 读取，必须与宿主目录同属主）。
 if command -v chown >/dev/null 2>&1 && [[ $(id -u) -eq 0 ]]; then
-  chown -R 1000:1000 "$DATA_DIR/uploads" "$DATA_DIR/logs"
+  chown -R 1000:1000 "$DATA_DIR/uploads" "$DATA_DIR/logs" "$DATA_DIR/projects"
 fi
 ok "数据目录就绪: $DATA_DIR"
 

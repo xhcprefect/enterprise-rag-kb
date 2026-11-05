@@ -8,7 +8,28 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from app.services.evaluation import EvaluationError, grade_case, make_report, read_jsonl, run_live_case, validate_cases, validate_responses
+from app.services.evaluation import (EvaluationError, build_identity, compare_reports, comparison_exit_code,
+                                     grade_case, make_report, read_json_document, read_jsonl,
+                                     run_live_case, validate_cases, validate_comparison_report,
+                                     validate_responses, validate_thresholds)
+
+# 允许进入配置身份的键；未知键直接拒绝，避免把令牌、URL 等私密值写进报告。
+CONFIG_KEYS = ("model", "embedding_model", "chunk_size", "chunk_overlap", "retrieval_top_k", "retrieval_rewrite")
+
+
+def _load_config(path):
+    if not path:
+        return {}
+    value = read_json_document(path)
+    unknown = sorted(set(value) - set(CONFIG_KEYS))
+    if unknown:
+        raise EvaluationError("评测配置含未知键: " + ", ".join(unknown))
+    return value
+
+
+def _default_documents_dir(dataset_path):
+    sibling = Path(dataset_path).parent / "documents"
+    return sibling if sibling.is_dir() else None
 
 
 def main(argv=None):
@@ -29,16 +50,36 @@ def main(argv=None):
     parser.add_argument("--output-price-per-million", type=float)
     parser.add_argument("--include-content", action="store_true", help="报告包含问题、答案与引用正文，可能包含业务敏感信息")
     parser.add_argument("--output", default="evaluation-results/report.json")
+    parser.add_argument("--documents-dir", help="参与内容身份计算的公开合成文档目录；默认使用问题集同级的 documents/")
+    parser.add_argument("--config-file", help="可选 JSON，仅允许 model/embedding_model/chunk_size/chunk_overlap/retrieval_top_k/retrieval_rewrite")
+    parser.add_argument("--baseline", help="用于比较的基线报告 JSON；缺身份或不可比时以专门退出码拒绝结论")
+    parser.add_argument("--thresholds", help="可选阈值 JSON；未提供的指标使用默认门槛")
+    parser.add_argument("--comparison-output", help="可选：把比较结果单独写入此 JSON 文件")
     args = parser.parse_args(argv)
     if not 1 <= args.max_cases <= 1000 or not math.isfinite(args.timeout) or not 0 < args.timeout <= 3600:
         parser.error("case 上限或请求超时不合法")
     for price in (args.input_price_per_million, args.output_price_per_million):
         if price is not None and (not math.isfinite(price) or price < 0):
             parser.error("价格必须为有限的非负值")
+    if args.comparison_output and not args.baseline:
+        parser.error("--comparison-output 需要同时提供 --baseline")
     try:
         cases = validate_cases(read_jsonl(args.dataset))[:args.max_cases]
         if not cases:
             raise EvaluationError("问题集为空")
+        thresholds = validate_thresholds(read_json_document(args.thresholds)) if args.thresholds else {}
+        config = _load_config(args.config_file)
+        documents_dir = Path(args.documents_dir) if args.documents_dir else _default_documents_dir(args.dataset)
+        if args.documents_dir and not documents_dir.is_dir():
+            # 显式指定的文档目录不存在是配置错误，不能悄悄退化成“无文档身份”。
+            raise EvaluationError("--documents-dir 不是目录")
+        # 配置值和身份必须在任何真实调用之前校验完毕，避免先付费调用再报配置错误。
+        identity = build_identity(cases, mode="live" if args.live else "offline",
+                                  documents_dir=documents_dir, **config)
+        baseline = read_json_document(args.baseline) if args.baseline else None
+        if baseline is not None:
+            # 坏基线也必须在发起模型调用前拒绝；旧基线缺 identity 仍交由比较判为不可比。
+            validate_comparison_report(baseline, "baseline")
         run_id = args.run_id or uuid.uuid4()
         responses = {}
         if not args.live:
@@ -78,14 +119,27 @@ def main(argv=None):
         else:
             for case in cases:
                 grade(case, responses.get(case["id"], {"error": "missing_response"}))
-        report = make_report(results, run_id)
+        report = make_report(results, run_id, identity=identity)
         report["mode"] = "live" if args.live else "offline"
+        comparison = None
+        if baseline is not None:
+            # 基线只读取指标字段；旧报告缺少 identity 时比较结论为 incomparable，而不是崩溃。
+            comparison = compare_reports(baseline, report, thresholds)
+            report["comparison"] = comparison
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        if comparison is not None and args.comparison_output:
+            target = Path(args.comparison_output)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(comparison, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
         print(f"评测完成: {report['passed']}/{report['cases']} 固定断言通过; mode={report['mode']}; run_id={run_id}")
+        if comparison is not None:
+            print(f"比较结论: {comparison['status']}/{comparison['verdict']}; reasons={','.join(comparison['reasons']) or '-'}; "
+                  f"regressions={','.join(comparison['regressions']) or '-'}")
         print("报告已写入指定输出文件；断言通过不等同于语义事实正确。")
-        return 0 if report["passed"] == report["cases"] else 1
+        return comparison_exit_code(comparison, assertions_passed=report["passed"] == report["cases"]) if comparison else (
+            0 if report["passed"] == report["cases"] else 1)
     except (EvaluationError, OSError) as exc:
         print("评测未执行或未完成:", str(exc) if isinstance(exc, EvaluationError) else type(exc).__name__)
         return 2

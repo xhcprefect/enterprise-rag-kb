@@ -7,7 +7,9 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 UsageKind = Literal["chat", "embedding", "rerank"]
-UsageOperation = Literal["generation", "rewrite", "query_embedding", "document_embedding", "rerank"]
+# summary 由普通对话摘要 worker 产生（kind 仍是 chat，但操作独立计量，不能借 rewrite 计费）；
+# project_embedding 保留给阶段二项目索引，先加入枚举便于统计过滤与前端标签。
+UsageOperation = Literal["generation", "rewrite", "query_embedding", "document_embedding", "rerank", "summary", "project_embedding"]
 Granularity = Literal["hour", "day", "month"]
 UsageVisibility = Literal["all", "mine"]
 Rate = Annotated[Decimal, Field(ge=0, le=1_000_000, max_digits=18, decimal_places=6, allow_inf_nan=False)]

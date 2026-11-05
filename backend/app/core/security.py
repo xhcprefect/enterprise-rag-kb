@@ -16,6 +16,13 @@ from app.core.config import settings
 _PASSWORD_PREFIX = "bcrypt-sha256:v1:"
 _PASSWORD_DOMAIN = b"enterprise-rag-kb/password/v1\x00"
 
+# 未知用户名也执行一次固定成本的校验，避免"用户存在与否"仅凭响应时间判断。
+# 这是进程启动时就固定的常量（bcrypt cost 与 hash_password 相同），绝不是每请求生成；
+# 任何请求都不可能通过它（明文不对应任何真实账号），它只用来消耗同等的 bcrypt 时间。
+DUMMY_PASSWORD_HASH = (
+    "bcrypt-sha256:v1:$2b$12$D97G6zZW.9gcGTx5BfPDE.lDq2gz/rImKkGoGi8L2qEMOWxZ6Ioay"
+)
+
 
 def _encode(password: str) -> bytes:
     digest = hashlib.sha256(_PASSWORD_DOMAIN + password.encode("utf-8")).digest()

@@ -2,6 +2,16 @@
   <el-drawer :model-value="modelValue" :title="t('chat.source.title')" size="min(760px, 95vw)" @update:model-value="emit('update:modelValue', $event)">
     <div v-if="loading" class="source-status" role="status">{{ t('chat.source.loading') }}</div>
     <el-alert v-else-if="error" :title="error" type="error" :closable="false" show-icon />
+    <template v-else-if="projectSource">
+      <h2 class="source-filename">{{ projectSource.relative_path }}</h2>
+      <p class="source-version">{{ t('chat.project.snapshotLabel', { id: projectSource.snapshot_id }) }}</p>
+      <p v-if="citation?.symbol" class="source-position">{{ t('chat.project.symbol', { name: citation.symbol }) }}</p>
+      <div v-for="chunk in projectSource.chunks" :key="chunk.chunk_index" class="source-chunk">
+        <div class="source-chunk-head">{{ t('chat.citations.chunk', { index: chunk.chunk_index + 1 }) }}<span>{{ sourceLocationLabels(chunk, t).join(' · ') }}</span></div>
+        <pre>{{ chunk.content }}</pre>
+      </div>
+      <p v-if="projectSource.truncated" class="source-position">{{ t('chat.source.truncated') }}</p>
+    </template>
     <template v-else-if="source">
       <h2 class="source-filename">{{ source.filename }}</h2>
       <p class="source-position">{{ position.join(' · ') || t('chat.source.noPosition') }}</p>
@@ -23,12 +33,15 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { docApi, type Citation, type SourcePreview } from '@/api'
+import { projectApi, type ProjectSourcePreview } from '@/api/projects'
 import { pdfSourceUrl, sourceLocationLabels, sourceTargetPage } from '@/utils/sourceLocation'
 
 const props = defineProps<{ modelValue: boolean; kbId: string; citation: Citation | null }>()
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 const { t } = useI18n()
 const source = ref<SourcePreview | null>(null)
+const projectSource = ref<ProjectSourcePreview | null>(null)
+let previewController: AbortController | null = null
 const loading = ref(false)
 const error = ref('')
 const pdfLoading = ref(false)
@@ -48,24 +61,42 @@ function clearPdf() {
 
 watch([() => props.modelValue, () => props.citation, () => props.kbId], async () => {
   const current = ++generation
+  previewController?.abort()
+  previewController = null
   clearPdf()
   source.value = null
+  projectSource.value = null
   error.value = ''
   loading.value = false
   if (!props.modelValue || !props.citation || !props.kbId) return
   const citation = props.citation
-  if (!citation.document_id || citation.chunk_index == null) {
+  const project = citation.source_kind === 'project'
+  if (citation.chunk_index == null || (project
+    ? !citation.source_id || !citation.snapshot_id || !citation.file_version_id
+    : !citation.document_id)) {
     error.value = t('chat.source.unavailable')
     return
   }
+  const request = new AbortController()
+  previewController = request
   loading.value = true
   try {
-    const { data } = await docApi.source(props.kbId, citation)
-    if (current === generation) source.value = data
+    if (project) {
+      const { data } = await projectApi.preview(citation.source_id!, citation.file_version_id!, {
+        snapshot_id: citation.snapshot_id!,
+        chunk_start: citation.chunk_index,
+        chunk_end: citation.chunk_end ?? citation.chunk_index,
+        signal: request.signal
+      })
+      if (current === generation) projectSource.value = data
+    } else {
+      const { data } = await docApi.source(props.kbId, citation)
+      if (current === generation) source.value = data
+    }
   } catch (err: any) {
-    if (current === generation) error.value = err?.message || t('chat.source.unavailable')
+    if (current === generation && !request.signal.aborted) error.value = err?.message || t('chat.source.unavailable')
   } finally {
-    if (current === generation) loading.value = false
+    if (current === generation) { loading.value = false; previewController = null }
   }
 }, { immediate: true })
 
@@ -85,7 +116,7 @@ async function loadPdf() {
   }
 }
 
-onBeforeUnmount(() => { generation += 1; clearPdf() })
+onBeforeUnmount(() => { generation += 1; previewController?.abort(); clearPdf() })
 </script>
 
 <style scoped>

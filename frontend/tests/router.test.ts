@@ -60,10 +60,10 @@ test('only login and fallback routes are registered before authentication', (t) 
 
 test('role filtering keeps the source configuration intact and menus match accessible routes', () => {
   const memberRoutes = filterAuthorizedRoutes([workspaceRoute], 'user')[0].children || []
-  assert.deepEqual(memberRoutes.map(route => route.name), ['chat', 'knowledge', 'documents', 'usage', 'profile'])
-  assert.equal(workspaceRoute.children?.length, 7)
-  assert.deepEqual(getNavigationItems(workspaceRoute, 'user').map(item => item.path), ['/chat', '/knowledge', '/usage'])
-  assert.deepEqual(getNavigationItems(workspaceRoute, 'admin').map(item => item.path), ['/chat', '/knowledge', '/usage', '/users', '/audit'])
+  assert.deepEqual(memberRoutes.map(route => route.name), ['chat', 'knowledge', 'projects', 'project', 'documents', 'usage', 'profile'])
+  assert.equal(workspaceRoute.children?.length, 9)
+  assert.deepEqual(getNavigationItems(workspaceRoute, 'user').map(item => item.path), ['/chat', '/knowledge', '/projects', '/usage'])
+  assert.deepEqual(getNavigationItems(workspaceRoute, 'admin').map(item => item.path), ['/chat', '/knowledge', '/projects', '/usage', '/users', '/audit'])
   assert.deepEqual(getNavigationItems(workspaceRoute), [])
   assert.equal(memberRoutes.find(route => route.name === 'documents')?.meta?.activeMenu, '/knowledge')
   assert.equal(memberRoutes.find(route => route.name === 'profile')?.meta?.activeMenu, '')
@@ -78,20 +78,30 @@ test('role filtering keeps the source configuration intact and menus match acces
   }
 })
 
+test('project navigation preserves the view key across source changes', async (t) => {
+  const { router } = createHarness(t, { token: 'admin-token', profile: admin })
+  for (const path of ['/projects', '/projects/source-a', '/projects/source-b', '/projects/source-a']) {
+    await router.push(path)
+    assert.equal(router.currentRoute.value.meta.viewKey, 'projects', path)
+  }
+  await router.push('/chat')
+  assert.equal(router.currentRoute.value.meta.viewKey, undefined)
+})
+
 test('dynamic registration is idempotent, replaces roles, and removes all business routes', (t) => {
   const { router, access } = createHarness(t)
   assert.equal(access.register('admin'), true)
   assert.equal(access.register('admin'), false)
   assert.equal(router.hasRoute('users'), true)
   assert.equal(router.hasRoute('audit'), true)
-  assert.equal(router.getRoutes().length, 10)
+  assert.equal(router.getRoutes().length, 12)
 
   assert.equal(access.register('user'), true)
   assert.equal(router.hasRoute('users'), false)
   assert.equal(router.hasRoute('audit'), false)
   assert.equal(router.hasRoute('chat'), true)
   assert.equal(router.hasRoute('usage'), true)
-  assert.equal(router.getRoutes().length, 8)
+  assert.equal(router.getRoutes().length, 10)
   access.reset()
   access.reset()
   assert.deepEqual(router.getRoutes().map(route => route.name).sort(), ['login', 'not-found'])

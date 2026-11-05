@@ -56,7 +56,7 @@
         </div>
       </header>
       <main class="main" :class="{ 'main-chat': route.name === 'chat' }">
-        <router-view v-slot="{ Component }"><transition name="page-fade" mode="out-in"><component :is="Component" :key="route.fullPath" /></transition></router-view>
+        <router-view v-slot="{ Component }"><transition name="page-fade" mode="out-in"><component :is="Component" :key="route.meta.viewKey ?? route.fullPath" /></transition></router-view>
       </main>
     </div>
   </div>

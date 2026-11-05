@@ -22,8 +22,14 @@ jobs:
           --health-cmd "pg_isready -U postgres -d ragkb_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
+      # 一次性、可清空的专用测试库：库名必须以 _test 结尾。
       TEST_DATABASE_URL: postgresql+psycopg://postgres:regression_only_password@127.0.0.1:5432/ragkb_test
+      # 归属标记必须带显式测试库前缀；CI 用每次运行唯一的一次性标签。
+      TEST_DATABASE_OWNER: ci-disposable:${{ github.run_id }}-${{ github.run_attempt }}
       ENVIRONMENT: development
+      # 测试环境禁读 .env，避免误连业务配置。
+      RAG_DISABLE_DOTENV: '1'
+      LOG_STDOUT_ONLY: '1'
     defaults:
       run:
         working-directory: backend
@@ -36,10 +42,17 @@ jobs:
           cache-dependency-path: backend/requirements.lock
       - run: python -m pip install -r requirements.lock
       - run: python -m pip check
+      # 真实 PG 集成用例共享同一把门：先显式写入库归属 comment（幂等；已有其它
+      # owner 的 comment 时 fail closed），再跑全部测试。缺 URL/owner 时该命令以
+      # 非零退出，避免“CI 配置了库却没跑集成用例”被误当作通过。
+      - name: Prepare disposable test database owner
+        run: python -m tests._memory_project_test_gate --prepare-owner
       - run: python -m unittest discover -s tests -t . -v
 
   frontend:
     runs-on: ubuntu-latest
+    env:
+      RAG_E2E: '1'
     defaults:
       run:
         working-directory: frontend
@@ -57,7 +70,87 @@ jobs:
 
   maintenance:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - run: for script in deploy/common.sh deploy/backup.sh deploy/restore.sh deploy/init.sh; do bash -n "$script"; done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: for script in deploy/*.sh deploy/monitoring/*.sh deploy/tests/*.sh; do bash -n "$script"; done
       - run: bash deploy/tests/test-maintenance.sh
+      - run: bash deploy/tests/test-remote-backup.sh
+      - run: bash deploy/tests/test-drill-guard.sh
+      - name: Prepare monitoring test image
+        run: docker pull prom/prometheus:v3.1.0
+      - run: bash deploy/tests/test-monitoring.sh
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RAG_DISABLE_DOTENV: '1'
+      RAG_E2E: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: python -m pip install -r backend/requirements.lock
+      - run: python -m pip check
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run typecheck:e2e
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - name: Prepare disposable database image
+        run: docker pull pgvector/pgvector:pg18
+      - name: Exercise real API, workers and production frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_dir="$RUNNER_TEMP/ragkb-browser-${{ github.run_id }}-${{ github.run_attempt }}"
+          cleanup() {
+            code=$?
+            trap - EXIT
+            set +e
+            python -I backend/scripts/e2e_env.py down --out "$run_dir" --wait 45
+            down_code=$?
+            wait "$harness_pid"
+            harness_code=$?
+            if (( code != 0 )); then exit "$code"; fi
+            if (( down_code != 0 )); then exit "$down_code"; fi
+            exit "$harness_code"
+          }
+          python -I backend/scripts/e2e_env.py up --out "$run_dir" \
+            --owner "ci${{ github.run_id }}-${{ github.run_attempt }}" --keep \
+            > "$RUNNER_TEMP/ragkb-browser-startup.log" 2>&1 &
+          harness_pid=$!
+          trap cleanup EXIT
+          for ((attempt=0; attempt<180; attempt++)); do
+            if [[ -f "$run_dir/READY" ]]; then break; fi
+            kill -0 "$harness_pid" 2>/dev/null || break
+            sleep 1
+          done
+          [[ -f "$run_dir/READY" ]] || { printf 'E2E environment did not become ready\n' >&2; exit 1; }
+          export RAG_E2E_MANIFEST="$run_dir/manifest.json"
+          npm --prefix frontend run test:e2e
+      - name: Retain browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-diagnostics
+          retention-days: 7
+          include-hidden-files: true
+          if-no-files-found: ignore
+          path: |
+            frontend/e2e/.artifacts/
+            frontend/e2e/.report/
+            ${{ runner.temp }}/ragkb-browser-startup.log
+            ${{ runner.temp }}/ragkb-browser-*/logs/
+            ${{ runner.temp }}/ragkb-browser-*/report.json

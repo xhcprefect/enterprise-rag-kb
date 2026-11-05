@@ -5,8 +5,10 @@ import { i18n } from '@/i18n'
 import type { ChatCompletion } from '@/utils/citations'
 import { createChatRequestId } from '@/utils/chatRequest'
 import { buildScopePatchBody, type DocumentScopeItem } from '@/utils/documentScope'
+import type { MemoryState } from '@/utils/memoryStatus'
 
 export type { DocumentScopeItem } from '@/utils/documentScope'
+export type { MemoryState, MemoryDisplay } from '@/utils/memoryStatus'
 
 // ---------- 类型 ----------
 export interface User {
@@ -27,6 +29,18 @@ export interface KnowledgeBase {
   is_public: boolean
   document_count: number
   created_at: string
+  /** 资源类型：普通上传库为 upload；项目索引专用私有库为 project。旧响应可能缺失。 */
+  kind?: 'upload' | 'project'
+  /** kind='project' 时的项目源/快照只读状态；普通库为 null/false。 */
+  project_source_id?: string | null
+  project_active_snapshot_id?: string | null
+  project_ready?: boolean
+  project_revoked?: boolean
+}
+
+/** 知识库是否为项目索引库（项目库不走文档上传/公开性编辑）。 */
+export function isProjectKb(kb: Pick<KnowledgeBase, 'kind'> | null | undefined): boolean {
+  return kb?.kind === 'project'
 }
 
 export interface DocumentItem {
@@ -66,6 +80,21 @@ export interface Citation extends SourceLocation {
   chunk_end?: number | null
   score: number | null
   snippet: string | null
+  /**
+   * 项目引用（source_kind='project'）：document_id 恒等于 file_version_id，
+   * filename 恒等于 relative_path。读取原文走 GET /projects/{source_id}/files/
+   * {file_version_id}/source?snapshot_id=...&chunk_start=...&chunk_end=...。
+   */
+  source_kind?: 'project' | null
+  source_id?: string | null
+  snapshot_id?: string | null
+  file_version_id?: string | null
+  relative_path?: string | null
+  language?: string | null
+  symbol?: string | null
+  symbol_kind?: string | null
+  manifest_fingerprint?: string | null
+  config_fingerprint?: string | null
 }
 
 export interface MessageItem {
@@ -97,6 +126,13 @@ export interface Conversation {
   document_scope?: DocumentScopeItem[]
   /** 范围版本号，用于 PATCH 与流式响应的并发保护；旧响应缺失时按 0。 */
   scope_revision?: number
+  /**
+   * 项目知识库会话绑定的快照 id（会话固定，不随后来的 active 漂移）。
+   * 非项目会话为 null/缺失。切换必须走 CAS PATCH，不能靠再次发送改绑。
+   */
+  project_snapshot_id?: string | null
+  /** 置顶时间；null/缺失表示未置顶。旧响应可能没有这个字段。 */
+  pinned_at?: string | null
 }
 
 export interface ConversationDetail extends Conversation {
@@ -107,9 +143,47 @@ export interface ConversationDetail extends Conversation {
 export interface ChatScopeResponse {
   document_scope: DocumentScopeItem[]
   scope_revision: number
+  /** 项目会话绑定快照；非项目会话为 null。 */
+  project_snapshot_id?: string | null
 }
 
-/** SSE meta 事件；document_scope/scope_revision 为可选的新字段。 */
+/**
+ * GET /chat/conversations/{id}/memory 的响应。后端提供完成的摘要状态字段；
+ * covered_turn_seq 是摘要实际纳入的最大轮次，绝不代表"全部历史已记住"。
+ */
+export interface MemoryStatus {
+  enabled: boolean
+  state: MemoryState
+  epoch: number
+  /** 当前摘要版本；无摘要时为 null（重置提交 expected_version=0）。 */
+  version: number | null
+  covered_turn_seq: number
+  next_turn_seq: number
+  structured: Record<string, unknown> | null
+  lag: boolean
+  truncated: boolean
+  error_code: string | null
+  error_message: string | null
+  updated_at: string | null
+}
+
+/** POST /chat/conversations/{id}/memory/reset 的结果。 */
+export interface MemoryResetResult {
+  epoch: number
+  version: null
+  covered_turn_seq: number
+  reset: boolean
+}
+
+/** SSE meta 或 done 事件里可选的摘要快照（additive，不覆盖完整状态）。 */
+export interface MemoryStreamSnapshot {
+  enabled: boolean
+  state: MemoryState
+  covered_turn_seq: number
+  lag: boolean
+}
+
+/** SSE meta 事件；document_scope/scope_revision/memory 为可选的新字段。 */
 export interface ChatStreamMeta {
   conversation_id: string
   request_id?: string
@@ -119,11 +193,23 @@ export interface ChatStreamMeta {
   stream_limits?: StreamLimits
   document_scope?: DocumentScopeItem[]
   scope_revision?: number
+  /** 本次 turn 实际绑定的项目快照；非项目为 null/缺失。 */
+  project_snapshot_id?: string | null
+  /** 本次 turn id；恢复/引用定位用，旧后端可能缺失。 */
+  turn_id?: string | null
+  memory?: MemoryStreamSnapshot
 }
 
 export interface PageResult<T> {
   total: number
   items: T[]
+}
+
+/** 分片上传完成的结果；deduplicated=true 表示服务端复用了已有文档。 */
+export interface UploadCompleteResult {
+  upload_id: string
+  document: DocumentItem
+  deduplicated: boolean
 }
 
 // ---------- 认证 ----------
@@ -231,6 +317,12 @@ export interface UploadSession {
   document_id: string | null
 }
 
+/**
+ * complete 的最长等待。合并由服务端同步完成，没有进度可言：给足大文件拼接时间，
+ * 但绝不允许无限等待；超时/取消都必须结束客户端的占用位。
+ */
+export const UPLOAD_COMPLETE_TIMEOUT_MS = 180_000
+
 export const uploadApi = {
   /** 建会话；仅同一用户、同库、同名同大小且完整内容摘要相同才会续传。 */
   createSession: (kbId: string, filename: string, fileSize: number, contentSha256: string) =>
@@ -260,12 +352,16 @@ export const uploadApi = {
         onUploadProgress: (e) => onProgress?.(e.loaded)
       }
     ),
-  /** 合并分片并创建文档；可能耗时几十秒（大文件拼接），单独放宽超时。 */
-  complete: (kbId: string, uploadId: string) =>
-    client.post<{ upload_id: string; document: DocumentItem }>(
+  /**
+   * 合并分片并创建文档；合并可能耗时几十秒，但必须有上限且可中断：
+   * 取消上传时要能立刻停止等待，release 占用位让队列继续。
+   */
+  complete: (kbId: string, uploadId: string, signal?: AbortSignal) =>
+    client.post<UploadCompleteResult>(
       `/knowledge-bases/${kbId}/upload-sessions/${uploadId}/complete`,
       undefined,
-      { timeout: 0 }
+      // 有限超时（不是 0=永不超时）；signal 由调用方在上传被取消时 abort。
+      { timeout: UPLOAD_COMPLETE_TIMEOUT_MS, signal }
     ),
   abort: (kbId: string, uploadId: string) =>
     client.delete(`/knowledge-bases/${kbId}/upload-sessions/${uploadId}`)
@@ -294,7 +390,8 @@ export const docApi = {
     params: { index_version: indexVersion }, responseType: 'blob'
   }),
   get: (kbId: string, docId: string) => client.get<DocumentItem>(`/knowledge-bases/${kbId}/documents/${docId}`),
-  list: (kbId: string, params: { page?: number; page_size?: number; status?: string }) =>
+  /** q 为文件名关键字（服务端做字面匹配、trim、最长 200 字符）。 */
+  list: (kbId: string, params: { page?: number; page_size?: number; status?: string; q?: string }) =>
     client.get<PageResult<DocumentItem>>(`/knowledge-bases/${kbId}/documents`, { params }),
   reindex: (kbId: string, docId: string) =>
     client.post<DocumentItem>(`/knowledge-bases/${kbId}/documents/${docId}/reindex`),
@@ -317,11 +414,30 @@ export const chatApi = {
   }),
   /** 检索条数滑块的初值：与后端 RETRIEVAL_TOP_K 同源，避免两处各硬编码一个数字。 */
   retrievalConfig: () => client.get<{ top_k: number }>('/chat/retrieval-config'),
-  /** kbId 与 mode 都可选：普通对话只传 mode，RAG 两个都传。 */
+  /** 旧接口：数组响应，最多 100 条，保留兼容。 */
   conversations: (params?: { kbId?: string; mode?: ChatMode }) =>
     client.get<Conversation[]>('/chat/conversations', {
       params: { kb_id: params?.kbId, mode: params?.mode }
     }),
+  /**
+   * 分页会话列表。q 是标题字面搜索（服务端 trim、最长 200）。
+   * 服务端按 pinned_at DESC NULLS LAST, updated_at DESC, id DESC 稳定排序。
+   */
+  conversationsPage: (params: {
+    kbId?: string
+    mode?: ChatMode
+    q?: string
+    page?: number
+    pageSize?: number
+    signal?: AbortSignal
+  } = {}) =>
+    client.get<PageResult<Conversation>>('/chat/conversations/page', {
+      params: { kb_id: params.kbId, mode: params.mode, q: params.q, page: params.page, page_size: params.pageSize },
+      signal: params.signal
+    }),
+  /** 更新会话元数据；只接受 title / pinned，至少一项。 */
+  updateConversation: (id: string, data: { title?: string; pinned?: boolean }) =>
+    client.patch<Conversation>(`/chat/conversations/${id}`, data),
   conversation: (id: string) => client.get<ConversationDetail>(`/chat/conversations/${id}`),
   /**
    * 更新会话限定的文档范围。空数组表示恢复整个知识库。
@@ -332,7 +448,35 @@ export const chatApi = {
       `/chat/conversations/${id}/scope`,
       buildScopePatchBody(documentIds, expectedRevision)
     ),
+  /**
+   * CAS 切换项目会话绑定的快照。expectedRevision 必须等于会话当前 scope_revision。
+   * 409 = 忙碌/版本过期，400 = 非项目会话，404/410 = 源被撤销或无权访问。
+   * 相同快照幂等，不递增版本。
+   */
+  setProjectSnapshot: (id: string, snapshotId: string, expectedRevision: number) =>
+    client.patch<ChatScopeResponse>(
+      `/chat/conversations/${id}/project-snapshot`,
+      { snapshot_id: snapshotId, expected_revision: expectedRevision }
+    ),
   removeConversation: (id: string) => client.delete(`/chat/conversations/${id}`)
+}
+
+/** 会话摘要（memory）读取与重置。本人会话限定（admin 也只读本人）。 */
+export const memoryApi = {
+  /** 读取摘要状态；GET 失败/404 由调用方按 unknown/不可用处理，不弹全局错误。 */
+  get: (conversationId: string, signal?: AbortSignal) =>
+    client.get<MemoryStatus>(`/chat/conversations/${conversationId}/memory`, {
+      signal, timeout: 3000,
+      validateStatus: status => [200, 403, 404].includes(status)
+    }),
+  /**
+   * 重置摘要。expected_version 与服务端当前版本不符（已被别处更新）、或会话正在
+   * 生成/恢复时返回 409；这里不弹全局错误，由调用方刷新状态而不是覆盖旧版。
+   */
+  reset: (conversationId: string, expectedVersion: number) =>
+    client.post<MemoryResetResult>(`/chat/conversations/${conversationId}/memory/reset`, {
+      expected_version: expectedVersion
+    }, { timeout: 5000, validateStatus: status => [200, 409].includes(status) })
 }
 
 /**
@@ -352,6 +496,11 @@ export async function streamChat(
     document_ids?: string[]
     /** 已有会话发送时的范围版本快照，用于并发保护 */
     scope_revision?: number
+    /**
+     * 项目知识库：仅新会话可显式指定快照；已有会话沿用绑定，改绑必须走 CAS PATCH。
+     * 项目请求必须完全省略 document_ids（后端把显式空数组也视为互斥 → 400）。
+     */
+    project_snapshot_id?: string
   },
   handlers: {
     onMeta?: (data: ChatStreamMeta) => void

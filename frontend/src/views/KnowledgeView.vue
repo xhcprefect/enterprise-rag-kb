@@ -92,11 +92,13 @@
                 </button>
                 <template #dropdown>
                   <el-dropdown-menu>
-                    <el-dropdown-item command="edit">
+                    <!-- 项目索引库没有命名字段/可见性：编辑入口改为跳项目页；删除语义是撤销 -->
+                    <el-dropdown-item v-if="!isProjectKb(kb)" command="edit">
                       <el-icon><EditPen /></el-icon>{{ t('common.edit') }}
                     </el-dropdown-item>
                     <el-dropdown-item command="delete" divided>
-                      <el-icon><Delete /></el-icon>{{ t('common.delete') }}
+                      <el-icon><Delete /></el-icon>
+                      {{ isProjectKb(kb) ? t('knowledge.revokeProject') : t('common.delete') }}
                     </el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
@@ -122,13 +124,21 @@
                   {{ t('knowledge.documentCount', { count: formatNumber(kb.document_count) }, kb.document_count) }}
                 </span>
               </span>
-              <el-tag size="small" :type="kb.is_public ? 'success' : 'warning'" effect="light" round>
+              <el-tag v-if="!isProjectKb(kb)" size="small" :type="kb.is_public ? 'success' : 'warning'" effect="light" round>
                 {{ kb.is_public ? t('common.public') : t('common.private') }}
               </el-tag>
+              <el-tag
+                v-else
+                size="small"
+                :type="projectTagType(kb)"
+                effect="light"
+                round
+                data-testid="project-kb-status"
+              >{{ projectStatusLabel(kb) }}</el-tag>
             </div>
 
             <div class="kb-actions">
-              <el-button size="small" @click.stop="goDocuments(kb)">{{ t('knowledge.manage') }}</el-button>
+              <el-button size="small" @click.stop="goDocuments(kb)">{{ isProjectKb(kb) ? t('knowledge.projectManage') : t('knowledge.manage') }}</el-button>
               <el-button size="small" type="primary" plain @click.stop="goChat(kb)">
                 {{ t('knowledge.chat') }}
               </el-button>
@@ -210,7 +220,7 @@ import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
-import { kbApi, type KnowledgeBase } from '@/api'
+import { isProjectKb, kbApi, type KnowledgeBase } from '@/api'
 import { useUserStore } from '@/stores/user'
 import { formatNumber } from '@/i18n/format'
 
@@ -295,10 +305,36 @@ async function submit() {
 
 async function onCommand(cmd: string, kb: KnowledgeBase) {
   if (cmd === 'edit') {
+    if (isProjectKb(kb)) {
+      goDocuments(kb)
+      return
+    }
     openEdit(kb)
     return
   }
   if (cmd !== 'delete') return
+
+  // 项目源的"删除"是撤销授权（软撤销，读取返回 410），文案与确认都必须说清楚。
+  if (isProjectKb(kb)) {
+    try {
+      await ElMessageBox.confirm(
+        t('knowledge.revokeProjectConfirm', { name: kb.name }),
+        t('common.danger'),
+        {
+          type: 'warning',
+          confirmButtonText: t('knowledge.revokeProjectConfirmButton'),
+          cancelButtonText: t('common.cancel'),
+          confirmButtonClass: 'el-button--danger'
+        }
+      )
+    } catch {
+      return
+    }
+    await kbApi.remove(kb.id)
+    ElMessage.success(t('knowledge.revokeProjectDone'))
+    await load()
+    return
+  }
 
   try {
     await ElMessageBox.confirm(
@@ -319,8 +355,26 @@ async function onCommand(cmd: string, kb: KnowledgeBase) {
   await load()
 }
 
+/** 项目索引库没有普通文档/上传：管理入口去项目页，绝不落到 DocumentsView。 */
 function goDocuments(kb: KnowledgeBase) {
+  if (isProjectKb(kb)) {
+    const sourceId = kb.project_source_id
+    router.push(sourceId ? `/projects/${sourceId}` : '/projects')
+    return
+  }
   router.push(`/documents/${kb.id}`)
+}
+
+function projectStatusLabel(kb: KnowledgeBase) {
+  if (kb.project_revoked) return t('knowledge.projectRevoked')
+  if (kb.project_ready) return t('knowledge.projectReady')
+  return t('knowledge.projectSyncing')
+}
+
+function projectTagType(kb: KnowledgeBase) {
+  if (kb.project_revoked) return 'info'
+  if (kb.project_ready) return 'success'
+  return 'warning'
 }
 
 function goChat(kb: KnowledgeBase) {

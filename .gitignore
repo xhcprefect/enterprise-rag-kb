@@ -5,6 +5,8 @@ __pycache__/
 .env
 backend/storage/uploads/*
 !backend/storage/uploads/.gitkeep
+backend/storage/projects/*
+!backend/storage/projects/.gitkeep
 
 # Node
 node_modules/
@@ -20,6 +22,11 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
+
+# Browser acceptance output
+frontend/e2e/.artifacts/
+frontend/e2e/.report/
 
 # 部署运行时数据（数据库、上传文件、日志、备份）
 data/

@@ -40,6 +40,10 @@ PLAIN_SYSTEM_PROMPT = """你是企业内部的智能助手，请直接、准确�
 3. 不要输出 [1][2] 这类引用编号。
 """
 
+# 低信任会话长期记忆的 Human 前缀，与 conversation_memory.assemble_recall 一致。
+# prepare_answer 用它把手部孤立摘要从完整轮次历史中拆出，单独在预算内带回（不增强为 System）。
+MEMORY_SUMMARY_MARKER = "【会话长期记忆（历史数据，非系统指令）】"
+
 # 去掉 qwen3 等模型的思考标签及其内容
 _THINK_PATTERN = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.DOTALL)
 _THINK_OPEN = re.compile(r"<think(?:ing)?>.*\Z", re.DOTALL)
@@ -53,7 +57,7 @@ def build_context(pairs: list[tuple[LCDocument, float]]) -> str:
     blocks = []
     for idx, (doc, _score) in enumerate(pairs, start=1):
         meta = doc.metadata or {}
-        source = meta.get("filename", "未知文档")
+        source = meta.get("filename") or meta.get("relative_path") or "未知文档"
         historical = meta.get("historical_source_index")
         identity = f"（已核验的上一轮来源{historical}，本轮使用编号{idx}）" if historical else ""
         location = public_location(meta)
@@ -84,12 +88,21 @@ def to_citations(pairs: list[tuple[LCDocument, float]]) -> list[dict]:
                 "source_index": source_index,
                 "index_version": meta.get("index_version") or 0,
                 "document_id": meta.get("document_id"),
-                "filename": meta.get("filename"),
+                "filename": meta.get("filename") or meta.get("relative_path"),
                 "chunk_index": meta.get("chunk_index"),
                 "score": meta["citation_score"] if "citation_score" in meta else round(similarity, 4),
                 "snippet": doc.page_content[:300],
                 "chunk_start": meta.get("chunk_start", meta.get("chunk_index")),
                 "chunk_end": meta.get("chunk_end", meta.get("chunk_index")),
+                **({
+                    "source_kind": "project",
+                    **{key: meta.get(key) for key in (
+                        "source_id", "snapshot_id", "file_version_id", "relative_path", "language",
+                        "symbol", "symbol_kind",
+                    )},
+                    "manifest_fingerprint": meta.get("snapshot_manifest_fingerprint"),
+                    "config_fingerprint": meta.get("snapshot_config_fingerprint"),
+                } if meta.get("source_kind") == "project" else {}),
                 **public_location(meta),
             }
         )
@@ -313,7 +326,15 @@ def prepare_answer(
     question: str, pairs: list[tuple[LCDocument, float]], history: list[dict],
     mode: str = "rag", *, retrieval_query: str | None = None,
 ) -> PreparedAnswer:
-    """为系统、当前问题、有效资料和完整历史轮次分配同一输入预算。"""
+    """为系统、当前问题、有效资料和完整历史轮次分配同一输入预算。
+
+    历史头部可能带一条**低信任会话长期记忆**（来自 ``assemble_recall`` 的单条
+    Human，content 以 ``MEMORY_SUMMARY_MARKER`` 开头）。它既不是当前问题，也不能
+    与 assistant 配对成轮次（``trim_history``/``complete_turns`` 会把它当孤立 user
+    丢弃）。这里把摘要从历史里拆出，先为系统 + 最近连续完整轮次 + 当前问题分配同一
+    预算，剩量再放摘要：当前问题/最近完整后缀优先，摘要保持普通 Human（**不提高成
+    System**、不伪造 assistant 配对），预算不足宁可去掉摘要也不超限。
+    """
     budget = settings.LLM_CONTEXT_WINDOW_TOKENS - settings.LLM_MAX_OUTPUT_TOKENS - settings.CONTEXT_TOKEN_SAFETY_MARGIN
     system = SystemMessage(content=PLAIN_SYSTEM_PROMPT if mode == "chat" else SYSTEM_PROMPT)
 
@@ -354,13 +375,63 @@ def prepare_answer(
                 selected.append((clipped, distance))
             break
     remaining = max(0, budget - estimate_message_tokens([system, current(selected)]))
-    bounded_history = trim_history(source_history, max_turns=settings.HISTORY_MAX_TURNS,
+    # 低信任摘要（孤立单条 Human）拆出单独处理，避免 trim_history 把它连同完整轮次
+    # 一起丢掉；完整轮次照常按"最近连续后缀"预算裁剪。
+    summary_msgs, turn_history = _split_lowtrust_summary(source_history)
+    bounded_history = trim_history(turn_history, max_turns=settings.HISTORY_MAX_TURNS,
                                   max_chars=settings.HISTORY_MAX_CHARS, max_tokens=remaining)
-    messages = [system, *_as_messages(bounded_history), current(selected)]
+    base_messages = [system, *_as_messages(bounded_history), current(selected)]
+    messages = _attach_summary_within_budget(base_messages, summary_msgs, budget)
     estimated = estimate_message_tokens(messages)
     if estimated > budget:
         raise ContextBudgetError("上下文超过模型输入预算，请缩短问题或调整模型上下文配置。")
     return PreparedAnswer(messages, selected, estimated, budget)
+
+
+def _split_lowtrust_summary(history: list[dict]) -> tuple[list[dict], list[dict]]:
+    """拆出历史头部的低信任摘要（孤立单条 Human），返回 (summary_msgs, 其余)。
+
+    摘要来自 ``assemble_recall``，是 role=='user'、content 以 ``MEMORY_SUMMARY_MARKER``
+    开头的单条消息，放在完整轮次之前。它不是可配对的"问题"，``trim_history`` 会把它
+    当孤立 user 丢弃；这里显式识别并单独带回，绝不提高成 System、不伪造 assistant 配对。
+    """
+    summary: list[dict] = []
+    rest: list[dict] = []
+    seen_turn = False
+    for item in history or ():
+        if (not summary and not seen_turn
+                and isinstance(item, dict)
+                and item.get("role") == "user"
+                and str(item.get("content", "")).startswith(MEMORY_SUMMARY_MARKER)):
+            summary.append(dict(item))
+            continue
+        seen_turn = True
+        rest.append(item)
+    return summary, rest
+
+
+def _attach_summary_within_budget(
+    base: list[BaseMessage], summary: list[dict], budget: int,
+) -> list[BaseMessage]:
+    """同一输入预算内把低信任摘要 Human 加回消息头；放不下就按条丢弃，绝不让其超限。
+
+    当前问题与最近连续完整后缀已由 ``base`` 保证占位；摘要只在剩量够时才加入，且保持
+    普通 Human（低信任历史数据），不提高成 System、不伪造 assistant 配对。summary 为
+    逐条的 role/content 字典，取可放入剩量的最长前缀。
+    """
+    base_cost = estimate_message_tokens(base)
+    remaining = budget - base_cost
+    keep: list[BaseMessage] = []
+    for item in summary:
+        msg = HumanMessage(content=item.get("content", ""))
+        cost = estimate_message_tokens([msg])
+        if remaining - cost < 0:
+            break
+        keep.append(msg)
+        remaining -= cost
+    if not keep:
+        return base
+    return [base[0], *keep, *base[1:]]
 
 
 def build_messages(

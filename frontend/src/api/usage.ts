@@ -9,6 +9,8 @@ export type UsageOperation =
   | 'query_embedding'
   | 'document_embedding'
   | 'rerank'
+  | 'summary'
+  | 'project_embedding'
 export type UsageModelKind = 'chat' | 'embedding' | 'rerank'
 
 export interface UsageMetrics {

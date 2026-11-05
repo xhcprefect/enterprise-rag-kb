@@ -1,4 +1,11 @@
-"""可续传的入库任务：持续心跳、租约隔离、版本化向量和原子发布。"""
+"""可续传的入库任务：持续心跳、租约隔离、版本化向量和原子发布。
+
+停机（SIGTERM/SIGINT）是与“用户取消”不同的协作分支：
+- worker 传入 ``stop_event`` 后，任务只在安全点停下，已完整的解析/向量检查点保留；
+- 解析中途停止时 ``parse_done`` 必须仍为 False，下次会丢弃不完整分块重新切分；
+- 已成功返回的当前 embedding 批次照常提交，之后才把文档退回 pending 并清空租约；
+- 取消与租约丢失的判定永远先于停止回交，旧 worker 不能借停机复活任务。
+"""
 import logging
 import threading
 import time
@@ -17,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import Document, DocumentChunk, DocumentStatus, KnowledgeBase
+from app.services.cloud_models import EmbeddingStopped, embedding_stop_scope
 from app.services.structured_documents import iter_structured_chunks
 from app.services.hybrid_search import build_search_text
 from app.services.usage_tracking import ModelCall, UsageContext, usage_scope
@@ -34,6 +42,14 @@ class IngestCancelled(Exception):
 
 class IngestLeaseLost(Exception):
     """文档删除、索引代次改变或任务已被其他 worker 领取。"""
+
+
+class IngestStopped(Exception):
+    """进程停机：任务在安全点协作退出，已完成的检查点保留。"""
+
+
+def _stop_requested(stop_event) -> bool:
+    return stop_event is not None and stop_event.is_set()
 
 
 @dataclass(frozen=True)
@@ -88,7 +104,12 @@ def _locked_doc(db: Session, job: IngestJob, *, allow_cancel: bool = False) -> D
 
 @contextmanager
 def _heartbeats(job: IngestJob):
-    """网络请求/解析期间独立续约；更新也带租约条件，旧任务无法续新任务的租约。"""
+    """网络请求/解析期间独立续约；更新也带租约条件，旧任务无法续新任务的租约。
+
+    退出时先让线程醒来再 join。即便 join 超时，线程的下一次 UPDATE 仍带
+    ``lease_id``/``index_version``/``processing`` 条件，无法刷新已经交回或
+    被其他 worker 接管的租约。
+    """
     stopped = threading.Event()
     interval = max(1.0, min(30.0, settings.INGEST_STALE_SECONDS / 3))
 
@@ -136,7 +157,12 @@ def _claim(db: Session, document_id: uuid.UUID, lease_id: uuid.UUID | None) -> I
     return job
 
 
-def _persist_chunks(db: Session, job: IngestJob) -> int:
+def _persist_chunks(db: Session, job: IngestJob, stop_event=None) -> int:
+    """切分并分批落库；停机时在安全点退出，``parse_done`` 保持 False。
+
+    中途停止前已落库的分块属于“不完整解析”，回交时会被清掉；下一次任务从
+    文件头重新切分，不会把部分结果当作可续传检查点。
+    """
     pending: list[DocumentChunk] = []
     next_index = 0
     progress = 0.0
@@ -152,6 +178,8 @@ def _persist_chunks(db: Session, job: IngestJob) -> int:
         pending.clear()
 
     for chunk in iter_structured_chunks(Path(job.stored_path), settings.CHUNK_SIZE, settings.CHUNK_OVERLAP):
+        if _stop_requested(stop_event):
+            raise IngestStopped
         content, progress = chunk.content, chunk.progress
         pending.append(DocumentChunk(document_id=job.document_id, chunk_index=next_index, content=content,
                                      source_metadata=chunk.metadata,
@@ -163,7 +191,14 @@ def _persist_chunks(db: Session, job: IngestJob) -> int:
     return next_index
 
 
-def _embed_pending(db: Session, job: IngestJob, store, total: int, done: int) -> None:
+def _embed_pending(db: Session, job: IngestJob, store, total: int, done: int, stop_event=None) -> None:
+    """逐批向量化。停止优先级：
+
+    1. 每轮先核验租约/取消（``_locked_doc``）——删除、重建代次、取消永远最先；
+    2. 没有待处理分块时正常返回，让最终发布完成（无批次就不会有半批状态）；
+    3. 有批次且已收到停止信号时，不再发起新请求，直接交回；
+    4. 网络调用成功后本批照常原子落库，下一轮再停——成功响应不丢弃。
+    """
     while True:
         _locked_doc(db, job)
         rows = db.scalars(select(DocumentChunk).where(
@@ -172,6 +207,9 @@ def _embed_pending(db: Session, job: IngestJob, store, total: int, done: int) ->
         if not rows:
             db.commit()
             return
+        if _stop_requested(stop_event):
+            db.rollback()
+            raise IngestStopped
         contents = [row.content for row in rows]
         row_ids = [row.id for row in rows]
         indexes = [row.chunk_index for row in rows]
@@ -183,7 +221,7 @@ def _embed_pending(db: Session, job: IngestJob, store, total: int, done: int) ->
 
         context = UsageContext(user_id=job.user_id, kb_id=job.kb_id, document_id=job.document_id,
                                operation="document_embedding")
-        with usage_scope(context):
+        with usage_scope(context), embedding_stop_scope(stop_event):
             local_call = ModelCall("embedding", "ollama", settings.EMBEDDING_MODEL) if settings.EMBEDDING_PROVIDER != "cloud" else None
             try:
                 vectors = store.embeddings.embed_documents(contents)
@@ -203,6 +241,7 @@ def _embed_pending(db: Session, job: IngestJob, store, total: int, done: int) ->
                        f"{job.document_id}:{job.version}:{index}" for index in indexes]
 
         # 删除/取消/重新领取可能发生在网络调用期间；写回前必须重新加锁并核验租约。
+        # 注意：这里不检查停止信号——本轮请求已经成功，应先落库再在下一轮退出。
         doc = _locked_doc(db, job)
         persist_vectors(db, store, payload, vectors, identifiers)
         db.execute(update(DocumentChunk).where(DocumentChunk.id.in_(row_ids)).values(embedded=True))
@@ -212,12 +251,60 @@ def _embed_pending(db: Session, job: IngestJob, store, total: int, done: int) ->
         db.commit()  # 向量与 embedded 标记同一事务提交。
 
 
-def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None) -> None:
+def _cancel_job(db: Session, job: IngestJob) -> None:
+    """用户取消的收尾：删除向量与分块，标记 CANCELLED。租约变化时静默放弃。"""
+    try:
+        doc = _locked_doc(db, job, allow_cancel=True)
+        kb = db.get(KnowledgeBase, job.kb_id)
+        if kb is not None:
+            delete_document_vectors(kb.collection_name, str(job.document_id), db=db)
+        db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == job.document_id))
+        doc.status, doc.error_message = DocumentStatus.CANCELLED.value, "已取消入库"
+        doc.progress = doc.chunk_count = doc.char_count = 0
+        doc.parse_done, doc.lease_id = False, None
+        db.commit()
+    except IngestLeaseLost:
+        db.rollback()
+
+
+def _hand_back_stopped(db: Session, job: IngestJob) -> None:
+    """停机交回：完成后才回 pending，让其他 worker/下次启动续传。
+
+    先重新核验租约与取消（``_locked_doc`` 会抛 ``IngestLeaseLost``/``IngestCancelled``），
+    所以删除、重建代次或用户取消永远优先于停机。解析未完成的分块会被丢弃，
+    ``parse_done`` 保持 False；已完成的解析与向量检查点原样保留。
+    """
+    doc = _locked_doc(db, job)
+    if not doc.parse_done:
+        kb = db.get(KnowledgeBase, job.kb_id)
+        if kb is not None:
+            delete_document_vectors(kb.collection_name, str(job.document_id), db=db)
+        db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == job.document_id))
+        doc.progress = doc.chunk_count = doc.char_count = 0
+    doc.status = DocumentStatus.PENDING.value
+    doc.error_message = None
+    doc.heartbeat_at, doc.lease_id = None, None
+    db.commit()
+
+
+def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None, *,
+                         stop_event: threading.Event | None = None) -> None:
+    """处理一份文档；``stop_event`` 仅在 worker 停机时传入。
+
+    不传 ``stop_event`` 时行为与之前完全一致：正常的续传、取消、失败状态不变。
+    """
     started = time.perf_counter()
     job: IngestJob | None = None
     with SessionLocal() as db:
         try:
+            # 已停止且没有拿到租约：不领取任何新任务。已经由 worker 领取的
+            # 任务仍要走 _claim 才能安全交回，否则会一直停在 processing。
+            if _stop_requested(stop_event) and lease_id is None:
+                logger.info("已收到停机信号，跳过领取: %s", document_id)
+                return
             job = _claim(db, uuid.UUID(document_id), lease_id)
+            if _stop_requested(stop_event):
+                raise IngestStopped
             kb = db.get(KnowledgeBase, job.kb_id)
             if kb is None:
                 raise IngestLeaseLost
@@ -232,7 +319,10 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None) ->
                     delete_document_vectors(collection, document_id, db=db)
                 db.commit()
                 if not parse_done:
-                    total = _persist_chunks(db, job)
+                    # 正常返回即代表整份文件已切分并落库；中途停机由 _persist_chunks
+                    # 抛 IngestStopped，因此这里可以安全地置 parse_done。即便此刻已收到
+                    # 停机信号，完整解析也应当作为检查点保留，供下次直接向量化。
+                    total = _persist_chunks(db, job, stop_event)
                     if not total:
                         raise ValueError("切分后无有效内容")
                     doc = _locked_doc(db, job)
@@ -247,8 +337,11 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None) ->
                 done = db.scalar(select(func.count()).select_from(DocumentChunk).where(
                     DocumentChunk.document_id == job.document_id, DocumentChunk.embedded.is_(True))) or 0
                 db.commit()
-                _embed_pending(db, job, store, total, done)
+                _embed_pending(db, job, store, total, done, stop_event)
 
+                # 走到这里说明没有待嵌入分块（或全部完成）：发布只是一次本地事务，
+                # 不再发起模型调用，因此即使此刻已收到停机信号也让它提交完成，
+                # 避免把一份已经全部向量化的文档无谓地退回队列。
                 doc = _locked_doc(db, job)
                 count, chars = db.execute(select(
                     func.count(), func.coalesce(func.sum(func.length(DocumentChunk.content)), 0),
@@ -265,23 +358,38 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None) ->
         except IngestLeaseLost:
             db.rollback()
             logger.info("文档已删除或任务租约已改变，停止写入: %s", document_id)
-        except IngestCancelled:
+        except (IngestStopped, EmbeddingStopped):
             db.rollback()
             if job is not None:
                 try:
-                    doc = _locked_doc(db, job, allow_cancel=True)
-                    kb = db.get(KnowledgeBase, job.kb_id)
-                    if kb is not None:
-                        delete_document_vectors(kb.collection_name, document_id, db=db)
-                    db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == job.document_id))
-                    doc.status, doc.error_message = DocumentStatus.CANCELLED.value, "已取消入库"
-                    doc.progress = doc.chunk_count = doc.char_count = 0
-                    doc.parse_done, doc.lease_id = False, None
-                    db.commit()
+                    _hand_back_stopped(db, job)
+                    logger.info("停机信号：入库任务已交回 pending: %s", document_id)
+                except IngestCancelled:
+                    db.rollback()
+                    _cancel_job(db, job)
                 except IngestLeaseLost:
                     db.rollback()
-        except Exception as exc:
+        except IngestCancelled:
             db.rollback()
+            if job is not None:
+                _cancel_job(db, job)
+        except Exception as exc:  # noqa: BLE001 - 保留原有失败兜底
+            db.rollback()
+            if job is not None and _stop_requested(stop_event):
+                # 调用超时/网络异常恰好发生在停机时：这是可续传的中断，不是普通失败。
+                # 但取消/删除/代次变化仍必须先核验，不能借停机复活旧任务。
+                try:
+                    _hand_back_stopped(db, job)
+                    logger.warning("停机期间向量调用未完成，任务已交回 pending: %s", document_id)
+                    return
+                except IngestCancelled:
+                    db.rollback()
+                    _cancel_job(db, job)
+                    return
+                except IngestLeaseLost:
+                    db.rollback()
+                    logger.info("停机期间租约已改变，放弃写回: %s", document_id)
+                    return
             logger.exception("文档处理失败: %s", document_id)
             if job is not None:
                 try:

@@ -6,7 +6,13 @@ from sqlalchemy.orm import Session as DBSession
 
 from app.api.deps import get_current_user, write_audit
 from app.core.config import settings
-from app.core.security import create_access_token, hash_password, password_needs_upgrade, verify_password
+from app.core.security import (
+    DUMMY_PASSWORD_HASH,
+    create_access_token,
+    hash_password,
+    password_needs_upgrade,
+    verify_password,
+)
 from app.db.session import get_db
 from app.models import User
 from app.schemas.auth import LoginRequest, TokenResponse
@@ -22,11 +28,19 @@ def login(payload: LoginRequest, request: Request, db: DBSession = Depends(get_d
     user = db.scalar(select(User).where(User.username == payload.username).with_for_update())
     ip = request.client.host if request.client else "-"
 
-    if user is None or not verify_password(payload.password, user.password_hash):
-        logger.warning(
-            "登录失败: username=%s ip=%s 原因=%s",
-            payload.username, ip, "用户不存在" if user is None else "密码错误",
+    if user is None:
+        # 未知用户名也做一次同成本校验：否则"账号不存在"会因跳过 bcrypt 而明显更快。
+        # 使用模块级固定 dummy hash（进程启动即固定，不是每请求生成），
+        # 每个请求只做这一次校验；真实账号分支只校验真实 hash 一次。
+        verify_password(payload.password, DUMMY_PASSWORD_HASH)
+        logger.warning("登录失败: username=%s ip=%s 原因=用户不存在", payload.username, ip)
+        write_audit(db, request, None, "login_failed", payload.username)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"
         )
+
+    if not verify_password(payload.password, user.password_hash):
+        logger.warning("登录失败: username=%s ip=%s 原因=密码错误", payload.username, ip)
         write_audit(db, request, user, "login_failed", payload.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误"

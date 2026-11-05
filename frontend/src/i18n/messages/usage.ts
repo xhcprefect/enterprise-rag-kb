@@ -105,7 +105,9 @@ export default {
         rewrite: '追问补全',
         query_embedding: '查询向量',
         document_embedding: '文档向量',
-        rerank: '重排'
+        rerank: '重排',
+        summary: '会话摘要',
+        project_embedding: '项目向量'
       },
       kinds: {
         chat: '对话',
@@ -271,7 +273,9 @@ export default {
         rewrite: 'Follow-up rewrite',
         query_embedding: 'Query embedding',
         document_embedding: 'Document embedding',
-        rerank: 'Rerank'
+        rerank: 'Rerank',
+        summary: 'Conversation summary',
+        project_embedding: 'Project embedding'
       },
       kinds: {
         chat: 'Chat',

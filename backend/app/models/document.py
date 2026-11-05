@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -43,15 +44,36 @@ class KnowledgeBase(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     is_public: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # 资源类型：'upload'（上传文档库，默认） / 'project'（项目源码库）。
+    # 项目库禁止普通上传/分片 complete/reindex/cancel 等旁路；普通 KB PATCH 改不了 kind。
+    kind: Mapped[str] = mapped_column(String(16), default="upload", server_default="'upload'", nullable=False)
 
     owner: Mapped["User | None"] = relationship()
     documents: Mapped[list["Document"]] = relationship(
         back_populates="knowledge_base", cascade="all, delete-orphan"
     )
+    project_source: Mapped["ProjectSource | None"] = relationship(
+        back_populates="knowledge_base",
+        cascade="all, delete-orphan",
+        # ProjectSource.kb_id NOT NULL FK ON DELETE CASCADE：让 DB 级联，避免 ORM 先置 NULL。
+        passive_deletes=True,
+        uselist=False,
+    )
 
 
 class Document(Base, TimestampMixin):
     __tablename__ = "documents"
+    __table_args__ = (
+        # 同一知识库内相同内容只保留一份 canonical：仅对已算出摘要的行生效，
+        # 老数据（NULL）与 backfill 未覆盖的行不受约束，也不会被删除或合并。
+        Index(
+            "uq_documents_kb_content_sha256",
+            "kb_id",
+            "content_sha256",
+            unique=True,
+            postgresql_where=text("content_sha256 IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -63,6 +85,9 @@ class Document(Base, TimestampMixin):
     file_ext: Mapped[str] = mapped_column(String(16), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     stored_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # 服务端实际计算的完整内容摘要；上传时声明值只用于续传/完整性校验，从不直接写入。
+    # 老数据与 backfill 未覆盖的行为 NULL，唯一索引是部分索引，因此可以共存。
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), default=DocumentStatus.PENDING.value, index=True, nullable=False
     )

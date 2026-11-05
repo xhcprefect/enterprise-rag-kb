@@ -1,4 +1,5 @@
 """应用配置：全部来自环境变量 / .env，便于容器化与多环境部署。"""
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -6,10 +7,16 @@ from pydantic import Field, field_validator, model_validator
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# 测试/离线环境显式禁用 .env：开关必须在导入本模块之前设置（SettingsConfigDict
+# 在类构造时求值）。正常运行时保持旧行为，仍然读取工作目录下的 .env。
+_TRUTHY = {"1", "true", "yes", "on"}
+DOTENV_DISABLED = os.environ.get("RAG_DISABLE_DOTENV", "").strip().lower() in _TRUTHY
+_ENV_FILE = None if DOTENV_DISABLED else ".env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True
+        env_file=_ENV_FILE, env_file_encoding="utf-8", extra="ignore", hide_input_in_errors=True
     )
 
     # 应用
@@ -118,6 +125,46 @@ class Settings(BaseSettings):
     INGEST_STALE_SECONDS: int = 300            # 心跳超时判定（大于单批耗时的数倍）
     CHUNK_PERSIST_BATCH: int = 500             # 分块落库批大小
 
+    # ===== 普通对话摘要压缩（默认关闭，不新增后台模型调用）=====
+    CHAT_MEMORY_ENABLED: bool = False          # false = 完全回到现有窗口裁剪
+    # 已发布摘要 + 未覆盖完整轮次可占用的输入 token 预算；不超过可用输入预算。
+    MEMORY_HISTORY_TOKEN_BUDGET: int = Field(default=8000, ge=256, le=524288)
+    # 达到该比例或未归档完整轮次数达到阈值即入队摘要。
+    MEMORY_TRIGGER_RATIO: float = Field(default=0.75, gt=0.0, le=1.0)
+    MEMORY_TRIGGER_TURNS: int = Field(default=8, ge=1, le=1000)
+    # 摘要后保留的最近完整轮次原文。
+    MEMORY_KEEP_RECENT_TURNS: int = Field(default=4, ge=0, le=100)
+    # 单次摘要输出的 token 上限与超时。
+    MEMORY_SUMMARY_MAX_TOKENS: int = Field(default=1200, ge=64, le=32768)
+    MEMORY_SUMMARY_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=3600)
+    # 失败有限退避：最大尝试次数与重试等待。
+    MEMORY_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=20)
+    # 摘要任务租约与轮询间隔。
+    MEMORY_JOB_LEASE_SECONDS: int = Field(default=300, ge=30, le=86400)
+    MEMORY_POLL_SECONDS: float = Field(default=2.0, gt=0, le=120)
+    # 单次摘要输入最多纳入的完整轮次数（硬界，防止无界 batch）。
+    MEMORY_MAX_INPUT_TURNS: int = Field(default=200, ge=1, le=10000)
+
+    # ===== 本地项目文档/源码索引 =====
+    # 授权根目录映射 {root_key: 绝对路径}；默认空 = 不创建任何项目源。
+    # 永远不写入本机真实授权目录，仅显式配置的键可用。
+    PROJECT_ALLOWED_ROOTS: dict[str, str] = Field(default_factory=dict)
+    # 受控 blob/快照存储目录（系统拥有），绝不把源路径当打开句柄。
+    PROJECT_STORAGE_DIR: str = "storage/projects"
+    # 单次同步硬界：文件数、单文件字节、总字节。
+    PROJECT_MAX_FILES: int = Field(default=5000, ge=1, le=1000000)
+    PROJECT_MAX_FILE_BYTES: int = Field(default=4 * 1024 * 1024, ge=1024)
+    PROJECT_MAX_TOTAL_BYTES: int = Field(default=512 * 1024 * 1024, ge=1024)
+    # 解析/embedding 批与超时；租约/轮询与摘要独立。
+    PROJECT_PARSE_BATCH: int = Field(default=8, ge=1, le=1000)
+    PROJECT_EMBEDDING_TIMEOUT_SECONDS: float = Field(default=120.0, gt=0, le=3600)
+    PROJECT_JOB_LEASE_SECONDS: int = Field(default=300, ge=30, le=86400)
+    PROJECT_POLL_SECONDS: float = Field(default=2.0, gt=0, le=120)
+    PROJECT_STALE_SECONDS: int = Field(default=300, ge=3, le=86400)
+    PROJECT_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=20)
+    # 项目 KB 的向量 collection 前缀；同一源/配置共享，跨配置不误复用。
+    PROJECT_VECTOR_PREFIX: str = "proj_"
+
     # CORS
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
 
@@ -127,6 +174,15 @@ class Settings(BaseSettings):
     LOG_MAX_BYTES: int = 10 * 1024 * 1024   # 单文件 10MB
     LOG_BACKUP_COUNT: int = 5               # 保留 5 份历史
     LOG_SLOW_REQUEST_MS: int = 3000         # 超过该耗时的请求按 WARNING 记录
+    # 容器/云平台场景只保留 stdout；默认仍写按 component 分文件的滚动日志。
+    LOG_STDOUT_ONLY: bool = False
+
+    # ===== 运维观测 =====
+    # Prometheus 采集令牌：空值表示不开放采集（/operations/metrics 不可用）。
+    # 它是独立的采集凭据，管理员 JWT 不能代替。
+    METRICS_TOKEN: str = ""
+    # 运维摘要查询数据库的硬超时；超时返回明确的不可用状态，不阻塞请求。
+    OPERATIONS_DB_TIMEOUT_SECONDS: float = Field(default=2.0, gt=0, le=30)
 
     @field_validator("LLM_REASONING_EFFORT", mode="before")
     @classmethod
@@ -143,6 +199,11 @@ class Settings(BaseSettings):
             raise ValueError("上传大小配置不合法")
         if self.INGEST_STALE_SECONDS < 3 or self.THREAD_POOL_SIZE < 1:
             raise ValueError("入库超时或线程池配置不合法")
+        if self.CHAT_MEMORY_ENABLED and self.MEMORY_HISTORY_TOKEN_BUDGET > (
+            self.LLM_CONTEXT_WINDOW_TOKENS - self.LLM_MAX_OUTPUT_TOKENS - self.CONTEXT_TOKEN_SAFETY_MARGIN
+        ):
+            raise ValueError("MEMORY_HISTORY_TOKEN_BUDGET 必须不超过可用输入预算"
+                             "（窗口 - 最大输出 - 安全余量）")
         if self.ENVIRONMENT == "production" and (
             len(self.JWT_SECRET) < 32 or "please-change" in self.JWT_SECRET or "change-me" in self.JWT_SECRET
         ):

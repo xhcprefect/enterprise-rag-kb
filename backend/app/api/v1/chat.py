@@ -1,27 +1,34 @@
 import asyncio
 import logging
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
+from datetime import datetime, timezone
 
 import anyio
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session as DBSession
 from starlette.requests import ClientDisconnect
 
 from app.api.deps import admit_chat, get_current_user, write_audit
 from app.core.config import settings
+from app.core.observability import start_chat
 from app.db.session import SessionLocal, get_db
 from app.models import CONVERSATION_MODE_CHAT, CONVERSATION_MODE_RAG, ChatTurn, Conversation, KnowledgeBase, Message, User
 from app.schemas.chat import (
-    Citation, ChatMode, ChatRequest, ChatRequestState, ConversationDetail, ConversationRead,
-    DocumentScopeState, DocumentScopeUpdate, MessageRead, RetrievalConfig,
+    Citation, ChatMode, ChatRequest, ChatRequestState, ConversationDetail, ConversationMetadataUpdate,
+    ConversationRead, DocumentScopeState, DocumentScopeUpdate, MemoryResetRequest, MemoryResetResult,
+    MemoryStatus, MessageRead, ProjectSnapshotUpdate, RetrievalConfig,
 )
-from app.schemas.common import ApiResponse
-from app.services import chat_turns, document_scopes, followup, rag, usage_tracking
+from app.schemas.common import ApiResponse, PageResult
+from app.services import (
+    chat_turns, document_scopes, followup, memory_service, project_chat_scope,
+    project_retrieval, project_sources, rag, usage_tracking,
+)
 from app.services.cloud_models import CloudModelError
 from app.services.context_window import ContextBudgetError
 from app.services.vector_store import load_ready_citations
@@ -38,6 +45,41 @@ def _get_conversation(db: DBSession, conversation_id: uuid.UUID, user: User) -> 
     if conv is None or (conv.user_id != user.id and not user.is_admin):
         raise HTTPException(status_code=404, detail="会话不存在")
     return conv
+
+
+def _get_owned_conversation(db: DBSession, conversation_id: uuid.UUID, user: User) -> Conversation:
+    """元数据写操作只认会话本人；管理员读权限不能扩展到改别人的会话。"""
+    conv = db.get(Conversation, conversation_id, populate_existing=True)
+    if conv is None or conv.user_id != user.id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return conv
+
+
+def _conversation_filters(kb_id: uuid.UUID | None, mode: ChatMode | None, q: str | None):
+    """列表筛选：始终按当前用户收敛，q 为标题字面匹配。"""
+    clauses = []
+    if kb_id:
+        clauses.append(Conversation.kb_id == kb_id)
+    if mode:
+        clauses.append(Conversation.mode == mode)
+    if q:
+        clauses.append(Conversation.title.icontains(q, autoescape=True))
+    return clauses
+
+
+def _conversation_order():
+    # 稳定排序：置顶优先（NULL 最后），再按更新时间与 ID 兜底。
+    return (Conversation.pinned_at.desc().nulls_last(),
+            Conversation.updated_at.desc(), Conversation.id.desc())
+
+
+def _validate_query(q: str | None) -> str | None:
+    if q is None:
+        return None
+    value = q.strip()
+    if len(value) > 200:
+        raise HTTPException(status_code=422, detail="搜索关键字不能超过 200 个字符")
+    return value or None
 
 
 def _get_kb(db: DBSession, kb_id: uuid.UUID, user: User) -> KnowledgeBase:
@@ -64,13 +106,68 @@ def list_conversations(kb_id: uuid.UUID | None = None, mode: ChatMode | None = N
         stmt = stmt.where(Conversation.kb_id == kb_id)
     if mode:
         stmt = stmt.where(Conversation.mode == mode)
-    rows = db.scalars(stmt.order_by(Conversation.updated_at.desc()).limit(100)).all()
+    rows = db.scalars(stmt.order_by(*_conversation_order()).limit(100)).all()
     return ApiResponse(data=[ConversationRead.model_validate(r) for r in rows])
+
+
+@router.get("/conversations/page", response_model=ApiResponse[PageResult[ConversationRead]], summary="我的会话分页列表")
+def page_conversations(q: str | None = Query(None), page: int = Query(1, ge=1),
+                       page_size: int = Query(20, ge=1, le=100), kb_id: uuid.UUID | None = None,
+                       mode: ChatMode | None = None, db: DBSession = Depends(get_db),
+                       user: User = Depends(get_current_user)):
+    # 固定路由必须放在 /conversations/{conversation_id} 之前，否则 "page" 会被当成会话 ID。
+    keyword = _validate_query(q)
+    clauses = _conversation_filters(kb_id, mode, keyword)
+    base = select(Conversation).where(Conversation.user_id == user.id, *clauses)
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+    rows = db.scalars(
+        base.order_by(*_conversation_order()).offset((page - 1) * page_size).limit(page_size)
+    ).all()
+    return ApiResponse(data=PageResult(
+        total=total, items=[ConversationRead.model_validate(row) for row in rows]
+    ))
+
+
+@router.patch("/conversations/{conversation_id}", response_model=ApiResponse[ConversationRead], summary="重命名或置顶会话")
+def update_conversation_metadata(conversation_id: uuid.UUID, payload: ConversationMetadataUpdate, request: Request,
+                                 db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
+    # 仅会话本人可改；管理员对他人的读权限不延伸到这里。
+    conv = _get_owned_conversation(db, conversation_id, user)
+    # RAG 会话沿用知识库访问校验：权限被撤销后不能借元数据接口继续操作。
+    if conv.mode == CONVERSATION_MODE_RAG and conv.kb_id is not None:
+        _get_kb(db, conv.kb_id, user)
+    fields = payload.model_fields_set
+    values = {}
+    if "title" in fields:
+        values["title"] = payload.title
+    if "pinned" in fields:
+        values["pinned_at"] = datetime.now(timezone.utc) if payload.pinned else None
+    if "pinned" in fields and payload.pinned and conv.pinned_at is not None:
+        # 已经置顶时不刷新置顶时间，避免一次无意义的改名/重复置顶打乱排序。
+        values["pinned_at"] = conv.pinned_at
+    # 显式带上原 updated_at：TimestampMixin 的 onupdate 只在未提供该列时生效，
+    # 这样元数据变更不会把会话顶到"最近更新"的最前面，也不影响正在生成的租约。
+    db.execute(
+        update(Conversation)
+        .where(Conversation.id == conv.id, Conversation.user_id == user.id)
+        .values(**values, updated_at=Conversation.updated_at)
+    )
+    db.commit()
+    db.refresh(conv)
+    try:
+        detail = {"fields": sorted(fields), "title": conv.title, "pinned": conv.pinned_at is not None}
+        write_audit(db, request, user, "conversation_metadata", conv.title, detail)
+    except Exception:
+        # 审计失败不能撤销已经成功的元数据。
+        logger.warning("会话元数据已更新，审计写入失败: conversation=%s", conversation_id)
+    return ApiResponse(data=ConversationRead.model_validate(conv))
 
 
 @router.get("/conversations/{conversation_id}", response_model=ApiResponse[ConversationDetail], summary="会话详情")
 def get_conversation(conversation_id: uuid.UUID, db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     conv = _get_conversation(db, conversation_id, user)
+    if getattr(conv, "project_snapshot_id", None) is not None:
+        project_chat_scope.replay_project_check(db, user.id, conv.project_snapshot_id)
     detail = ConversationDetail.model_validate(conv)
     completed_turns = {message.turn_id for message in detail.messages if message.turn_id and message.role == "assistant"}
     traces = dict(db.execute(select(ChatTurn.id, ChatTurn.trace).where(
@@ -90,13 +187,72 @@ def get_conversation(conversation_id: uuid.UUID, db: DBSession = Depends(get_db)
 @router.patch("/conversations/{conversation_id}/scope", response_model=ApiResponse[DocumentScopeState], summary="调整会话文档范围")
 def set_document_scope(conversation_id: uuid.UUID, payload: DocumentScopeUpdate,
                        db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
-    conv = _get_conversation(db, conversation_id, user)
+    conv = _get_owned_conversation(db, conversation_id, user)
     if conv.mode != CONVERSATION_MODE_RAG or conv.kb_id is None:
         raise HTTPException(400, "普通对话不支持文档范围")
-    _get_kb(db, conv.kb_id, user)
+    kb = _get_kb(db, conv.kb_id, user)
+    if kb.kind == "project":
+        raise HTTPException(400, "项目知识库请通过项目快照调整范围")
     selected, revision = chat_turns.set_document_scope(db, conversation_id, payload.document_ids,
                                                      payload.expected_revision)
     return ApiResponse(data=DocumentScopeState(document_scope=selected, scope_revision=revision))
+
+
+@router.patch("/conversations/{conversation_id}/project-snapshot", response_model=ApiResponse[DocumentScopeState],
+              summary="切换会话项目快照")
+def set_project_snapshot(conversation_id: uuid.UUID, payload: ProjectSnapshotUpdate,
+                         db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
+    conv = _get_owned_conversation(db, conversation_id, user)
+    if conv.mode != CONVERSATION_MODE_RAG or conv.kb_id is None:
+        raise HTTPException(400, "仅项目知识库会话支持项目快照")
+    _get_kb(db, conv.kb_id, user)
+    snapshot_id, revision = chat_turns.set_project_snapshot(
+        db, conversation_id, user, payload.snapshot_id, payload.expected_revision,
+    )
+    return ApiResponse(data=DocumentScopeState(
+        document_scope=[], scope_revision=revision, project_snapshot_id=snapshot_id,
+    ))
+
+
+@router.get("/conversations/{conversation_id}/memory", response_model=ApiResponse[MemoryStatus], summary="读取会话摘要状态")
+def get_conversation_memory(conversation_id: uuid.UUID, db: DBSession = Depends(get_db),
+                            user: User = Depends(get_current_user)):
+    # 只读本人会话的摘要状态；管理员对他人的读权限不延伸到这里的记忆。
+    conv = _get_owned_conversation(db, conversation_id, user)
+    return ApiResponse(data=memory_service.read_memory_status(db, conv))
+
+
+@router.post("/conversations/{conversation_id}/memory/reset", response_model=ApiResponse[MemoryResetResult],
+             summary="重置会话记忆")
+def reset_conversation_memory(conversation_id: uuid.UUID, payload: MemoryResetRequest,
+                              db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
+    # 仅会话本人可重置（管理员不能重置他人会话）。
+    conv = _get_owned_conversation(db, conversation_id, user)
+    if not memory_service.memory_enabled(conv):
+        raise HTTPException(400, "该会话未启用记忆摘要")
+    # 会话行锁内判定：正在生成答案（有效 active 问答租约）阻重置（409）；
+    # 后台摘要任务 pending/processing 不阻塞——reset 会原子作废其 job 与 lease。
+    conv = db.scalar(select(Conversation).where(Conversation.id == conversation_id)
+                     .with_for_update().execution_options(populate_existing=True))
+    if conv is None:
+        raise HTTPException(404, "会话不存在")
+    if conv.memory_epoch is None:
+        conv.memory_epoch = 0
+    now = datetime.now(timezone.utc)
+    if conv.active_turn_id is not None and conv.lease_expires_at and conv.lease_expires_at > now:
+        raise HTTPException(409, "回答正在生成，无法重置记忆，请等待完成或停止后重试")
+    if conv.active_turn_id is not None:
+        # 租约已过期：回收残留的活跃问答，避免重置与它并发。
+        chat_turns._expire_active(db, conv)
+    try:
+        result = memory_service.reset_memory(db, conv, payload.expected_version)
+    except ValueError as exc:
+        db.rollback()
+        if str(exc) == "memory_version_mismatch":
+            raise HTTPException(409, "记忆版本已改变，请刷新后重试") from exc
+        raise
+    db.commit()
+    return ApiResponse(data=result)
 
 
 @router.delete("/conversations/{conversation_id}", response_model=ApiResponse[None], summary="删除会话")
@@ -139,6 +295,8 @@ def get_request_state(request_id: uuid.UUID, db: DBSession = Depends(get_db), us
         if conv.kb_id is None:
             raise HTTPException(410, "原知识库已删除，请求结果不可用")
         _get_kb(db, conv.kb_id, user)  # 权限撤销后不能靠旧请求读取结果。
+        if getattr(turn, "project_snapshot_id", None) is not None:
+            project_chat_scope.replay_project_check(db, user.id, turn.project_snapshot_id)
     chat_turns.expire_request(db, turn)
     finish_reason, truncated = _completion_flags(turn.trace)
     message = None
@@ -156,6 +314,7 @@ def get_request_state(request_id: uuid.UUID, db: DBSession = Depends(get_db), us
         request_id=request_id, conversation_id=conv.id, user_message_id=turn.user_message_id,
         status=turn.status, message=message, finish_reason=finish_reason, truncated=truncated,
         document_scope=getattr(conv, "document_scope", None) or [], scope_revision=getattr(conv, "scope_revision", 0) or 0,
+        project_snapshot_id=getattr(turn, "project_snapshot_id", None),
         error_code=trace.get("error_code") if turn.status in {"failed", "cancelled"} else None,
         error_message=trace.get("error_message") if turn.status in {"failed", "cancelled"} else None,
     ))
@@ -226,6 +385,59 @@ def _retrieve_plan(collection, plan, top_k, active_scope, *, reset_scope=False):
     return docs, plan, scope_update
 
 
+def _retrieve_project_plan(snapshot_id, user_id, plan, top_k):
+    """项目检索始终按本轮固定快照重读原文，历史回答只用于定位来源。"""
+    with SessionLocal() as session:
+        user = session.get(User, user_id)
+        if user is None or not user.is_active:
+            raise chat_turns.ChatLeaseLost("用户已不可用，请重新登录")
+        try:
+            anchors, file_ids = [], None
+            if plan.status in {"reference", "document_followup", "elaboration"}:
+                requested = plan.citations
+                if any(item.get("source_kind") != "project" or
+                       item.get("snapshot_id") != str(snapshot_id) for item in requested):
+                    return [], followup.RetrievalPlan(
+                        plan.query, "clarify", "该历史来源不属于当前项目快照，请先切换到原快照或重新提问。",
+                        topic=plan.topic,
+                    ), None
+                anchors = project_retrieval.load_project_citations(session, snapshot_id, requested, user)
+                if len(anchors) != len(requested):
+                    return [], followup.RetrievalPlan(
+                        plan.query, "clarify", "您指定的项目来源已不可用或无法核验，请重新选择文件或快照。",
+                        topic=plan.topic,
+                    ), None
+                for (doc, _score), citation in zip(anchors, requested):
+                    doc.metadata["historical_source_index"] = citation.get("source_index")
+                if plan.status == "reference":
+                    return anchors, plan, None
+                file_ids = list(dict.fromkeys(doc.metadata["file_version_id"] for doc, _score in anchors))
+            fresh = project_retrieval.retrieve_project(
+                session, snapshot_id, user, plan.topic or plan.query, top_k, file_version_ids=file_ids,
+            )
+            # 项目入口返回融合后的文档，不暴露余弦距离；缺少真实分数时保持未知。
+            pairs = [(doc, 0.0) for doc in fresh]
+            for doc, _score in pairs:
+                doc.metadata.setdefault("citation_score", None)
+            anchor_limit = min(5, max(1, top_k // 2))
+            result, covered = [], set()
+            for doc, score in [*anchors[:anchor_limit], *pairs, *anchors[anchor_limit:]]:
+                meta = doc.metadata
+                first = meta.get("chunk_start", meta["chunk_index"])
+                last = meta.get("chunk_end", meta["chunk_index"])
+                keys = {(meta["file_version_id"], index) for index in range(first, last + 1)}
+                if keys <= covered:
+                    continue
+                result.append((doc, score))
+                covered.update(keys)
+                if len(result) >= top_k:
+                    break
+            return result, plan, None
+        except (project_retrieval.ProjectSnapshotNotReady, project_sources.ProjectSourceNotFound,
+                project_sources.ProjectSourceRevoked) as exc:
+            raise chat_turns.ChatLeaseLost("项目快照不再可用或访问权限已改变，请刷新会话") from exc
+
+
 @router.post("/stream", dependencies=[Depends(admit_chat)], summary="流式问答（SSE）")
 def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     if payload.include_trace and not user.is_admin:
@@ -254,10 +466,13 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         db, user_id=user.id, conversation_id=payload.conversation_id, kb_id=kb.id if kb else None,
         mode=mode, question=payload.question, top_k=top_k, request_id=payload.request_id,
         document_ids=payload.document_ids, scope_revision=payload.scope_revision,
+        project_snapshot_id=payload.project_snapshot_id,
         reset_scope=mode == CONVERSATION_MODE_RAG and followup.is_topic_switch(payload.question),
     )
     conv_id = str(reservation.conversation_id)
-    scope_state = {"document_scope": reservation.document_scope, "scope_revision": reservation.scope_revision}
+    project_sid = reservation.project_snapshot_id
+    scope_state = {"document_scope": reservation.document_scope, "scope_revision": reservation.scope_revision,
+                   "project_snapshot_id": str(project_sid) if project_sid else None}
     meta = {"conversation_id": conv_id, "request_id": str(reservation.request_id),
             "user_message_id": str(reservation.user_message_id), "citations": [], "mode": mode,
             "stream_limits": public_limits(), **scope_state}
@@ -267,7 +482,8 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         if replay_conv.mode != mode or replay_conv.kb_id != (kb.id if kb else None):
             raise HTTPException(409, "原会话配置已改变，请刷新后重试")
         scope_state = {"document_scope": getattr(replay_conv, "document_scope", []) or [],
-                       "scope_revision": getattr(replay_conv, "scope_revision", 0) or 0}
+                       "scope_revision": getattr(replay_conv, "scope_revision", 0) or 0,
+                       "project_snapshot_id": str(project_sid) if project_sid else None}
         meta.update(scope_state)
         db.commit()
         async def replay_source():
@@ -301,35 +517,84 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                     await controlled.aclose()
         return ManagedChatResponse(replay(), lambda: None)
 
+    # 只有真正开始一次新生成才观测；历史回答的重放不计入生成指标。
+    # 观测对象在持久化与流式主体之前创建，使历史加载失败、客户端未消费响应体、
+    # 断连与取消都能收口同一个 gauge，且 finish 幂等只会生效一次。
+    observation = start_chat(mode)
+    stream_started = time.monotonic()
+    metric_lock = threading.Lock()
+    metric_state: dict = {"first_token_ms": None, "stages": {}, "done": False}
+
+    def record_stage(name, value):
+        if value is None:
+            return
+        with metric_lock:
+            metric_state["stages"][name] = value
+
+    def note_first_token():
+        """首个非空白正文到达时记录一次；与 StreamState 的首字语义一致。"""
+        with metric_lock:
+            if metric_state["first_token_ms"] is not None:
+                return
+        record_first_token((time.monotonic() - stream_started) * 1000)
+
+    def record_first_token(value):
+        if value is None:
+            return
+        with metric_lock:
+            if metric_state["first_token_ms"] is None:
+                metric_state["first_token_ms"] = value
+
+    def finalize_metrics(status):
+        # 不引用 state / docs 等流式局部变量：cleanup 可能在这些对象建立前运行。
+        with metric_lock:
+            if metric_state["done"]:
+                return
+            metric_state["done"] = True
+            first_token = metric_state["first_token_ms"]
+            stages = dict(metric_state["stages"])
+        # total_ms 省略：由观测对象按真实起点补齐，不能用响应头时延冒充生成时长。
+        observation.finish(status, first_token_ms=first_token, stages_ms=stages)
+
     cleaned = False
     def cleanup(status="cancelled", *, error_code=None, error_message=None):
         nonlocal cleaned
+        finalize_metrics(status)
         if not cleaned:
             chat_turns.end_turn(reservation, status, error_code=error_code, error_message=error_message)
             cleaned = True
 
     try:
-        history_rows = db.scalars(select(Message).where(
-            Message.conversation_id == reservation.conversation_id, Message.status == "completed",
-        ).order_by(Message.created_at.desc(), Message.id.desc()).limit(settings.HISTORY_MAX_TURNS * 2)).all()
-        # 主题随已完成请求保存，刷新页面、跨进程或历史窗口缩短后也能继续澄清。
-        # 只读取当前会话的内部主题字段，不把诊断明细或旧答案变成本轮证据。
-        turn_ids = {m.turn_id for m in history_rows if isinstance(getattr(m, "turn_id", None), uuid.UUID)}
-        topics = {}
-        if mode == CONVERSATION_MODE_RAG and turn_ids:
-            traces = db.execute(select(ChatTurn.id, ChatTurn.trace).where(
-                ChatTurn.id.in_(turn_ids), ChatTurn.conversation_id == reservation.conversation_id,
-                ChatTurn.status == "completed",
-            )).all()
-            topics = {identifier: trace["followup_topic"] for identifier, trace in traces
-                      if isinstance(trace, dict) and isinstance(trace.get("followup_topic"), str)
-                      and 0 < len(trace["followup_topic"]) <= settings.HISTORY_MAX_CHARS}
-        history = [{"id": str(m.id), "role": m.role, "content": m.content,
-                    "reply_to_id": str(m.reply_to_id) if getattr(m, "reply_to_id", None) else None,
-                    "turn_id": str(m.turn_id) if getattr(m, "turn_id", None) else None, "status": getattr(m, "status", "completed"),
-                    "followup_topic": topics.get(getattr(m, "turn_id", None)) if m.role == "assistant" else None,
-                    "citations": rag.finalize_citations(m.content, m.citations or []) if m.role == "assistant" else []}
-                   for m in reversed(history_rows)]
+        memory_meta = None
+        # 普通对话且启用记忆时，历史来自"已发布摘要 + 水位后最近完整轮原文"（不含 RAG
+        # 主题/引用）；否则回落到原有 HISTORY_MAX_TURNS 窗口裁剪（行为与升级前一致）。
+        # conv 在该函数作用域可能未定义（新建会话），从认领事务保存的会话重新读取。
+        memory_conv = db.get(Conversation, reservation.conversation_id)
+        if mode == CONVERSATION_MODE_CHAT and memory_service.memory_enabled(memory_conv):
+            history, mem_lag, mem_truncated = memory_service.build_chat_history(db, memory_conv, payload.question)
+            memory_meta = {"mode": "memory", "lag": mem_lag, "truncated": mem_truncated}
+        else:
+            history_rows = db.scalars(select(Message).where(
+                Message.conversation_id == reservation.conversation_id, Message.status == "completed",
+            ).order_by(Message.created_at.desc(), Message.id.desc()).limit(settings.HISTORY_MAX_TURNS * 2)).all()
+            # 主题随已完成请求保存，刷新页面、跨进程或历史窗口缩短后也能继续澄清。
+            # 只读取当前会话的内部主题字段，不把诊断明细或旧答案变成本轮证据。
+            turn_ids = {m.turn_id for m in history_rows if isinstance(getattr(m, "turn_id", None), uuid.UUID)}
+            topics = {}
+            if mode == CONVERSATION_MODE_RAG and turn_ids:
+                traces = db.execute(select(ChatTurn.id, ChatTurn.trace).where(
+                    ChatTurn.id.in_(turn_ids), ChatTurn.conversation_id == reservation.conversation_id,
+                    ChatTurn.status == "completed",
+                )).all()
+                topics = {identifier: trace["followup_topic"] for identifier, trace in traces
+                          if isinstance(trace, dict) and isinstance(trace.get("followup_topic"), str)
+                          and 0 < len(trace["followup_topic"]) <= settings.HISTORY_MAX_CHARS}
+            history = [{"id": str(m.id), "role": m.role, "content": m.content,
+                        "reply_to_id": str(m.reply_to_id) if getattr(m, "reply_to_id", None) else None,
+                        "turn_id": str(m.turn_id) if getattr(m, "turn_id", None) else None, "status": getattr(m, "status", "completed"),
+                        "followup_topic": topics.get(getattr(m, "turn_id", None)) if m.role == "assistant" else None,
+                        "citations": rag.finalize_citations(m.content, m.citations or []) if m.role == "assistant" else []}
+                       for m in reversed(history_rows)]
         db.commit()  # 流式等待期间不占请求会话的连接。
     except Exception:
         cleanup("failed")
@@ -375,17 +640,24 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                     return followup.plan_retrieval(question, history, **plan_options)
             plan = await in_worker(plan_query)
             rewrite_ms = (time.monotonic() - t) * 1000
+            record_stage("rewrite", rewrite_ms)
             if not plan.clarification:
                 t = time.monotonic()
                 def retrieve():
                     with usage_tracking.usage_scope(usage_context.for_operation("query_embedding")):
+                        if project_sid is not None:
+                            return _retrieve_project_plan(project_sid, user_id, plan, top_k)
                         return _retrieve_plan(collection, plan, top_k, reservation.document_scope,
                                               reset_scope=followup.is_topic_switch(question))
                 docs, plan, scope_update = await in_worker(retrieve)
                 retrieve_ms = (time.monotonic() - t) * 1000
+                # trace 中的 retrieve_ms 对应固定阶段 retrieval；不能把整份 trace 当阶段表。
+                record_stage("retrieval", retrieve_ms)
         candidate_sources = _source_identities(docs)
         if not plan.clarification and (mode == CONVERSATION_MODE_CHAT or docs):
+            t_prompt = time.monotonic()
             prepared = await in_worker(lambda: rag.prepare_answer(question, docs, history, mode=mode, retrieval_query=plan.query))
+            record_stage("prompt", (time.monotonic() - t_prompt) * 1000)
             docs = prepared.pairs
         candidates = rag.to_citations(docs)
         yield StreamEvent("status", {"phase": "generating"})
@@ -406,6 +678,9 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                         raise StreamFault("stream_limit", "模型回答超过允许的长度，请缩小问题范围")
                     answer_chars += len(token)
                     answer_parts.append(token)
+                    if token.strip():
+                        # 首字时间只在模型真正输出正文时记录；澄清文案不算生成首字。
+                        note_first_token()
                     for offset in range(0, len(token), 4096):
                         yield StreamEvent("delta", {"content": token[offset:offset + 4096]})
             finally:
@@ -417,6 +692,7 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         state.remaining()
         citations = rag.finalize_citations(answer, candidates)
         generation_ms = (time.monotonic() - t_llm) * 1000
+        record_stage("generation", generation_ms)
         latency = round((time.monotonic() - state.started_at) * 1000)
         reason = usage.get("finish_reason")
         truncated = reason == "length"
@@ -428,15 +704,21 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                  "finish_reason": reason, "truncated": truncated,
                  "input_tokens_estimate": prepared.input_tokens if prepared else 0,
                  "input_budget": prepared.input_budget if prepared else 0,
-                 "usage": actual_usage or None, "usage_scope": "generation_only"}
+                 "usage": actual_usage or None, "usage_scope": "generation_only",
+                 "memory": memory_meta}
         yield StreamEvent("status", {"phase": "saving"})
 
         def save_answer():
             nonlocal cleaned
+            t_save = time.monotonic()
             with SessionLocal() as session:
                 completion_options = {"scope_update": scope_update} if scope_update is not None else {}
                 message_id = chat_turns.complete_turn(session, reservation, answer, citations, latency, trace, **completion_options)
                 cleaned = True
+                record_stage("persistence", (time.monotonic() - t_save) * 1000)
+                # 写回成功即视为一次完整生成；之后即使客户端不再读取响应体，
+                # finally 里的默认 cancelled 也不会覆盖这个已完成状态（finish 幂等）。
+                finalize_metrics("completed")
                 detail = {"mode": mode, "conversation_id": conv_id, "request_id": str(reservation.request_id),
                           "retrieval_status": plan.status, "context_tokens_estimate": trace["input_tokens_estimate"]}
                 if kb:
@@ -457,6 +739,7 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         revision = reservation.scope_revision + int(final_scope != reservation.document_scope)
         done = {"latency_ms": latency, "citations": citations, "message_id": str(message_id),
                 "document_scope": final_scope, "scope_revision": revision, "finish_reason": reason,
+                "project_snapshot_id": str(project_sid) if project_sid else None,
                 "truncated": truncated, "first_token_ms": state.first_token_ms}
         if payload.include_trace:
             done["trace"] = trace

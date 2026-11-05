@@ -24,6 +24,15 @@ class KnowledgeBaseRead(BaseModel):
     is_public: bool
     document_count: int = 0
     created_at: datetime
+    # 资源类型：upload / project。普通上传分支保持不变（默认 upload）；
+    # 项目源对应 kind='project' 的专用私有 KB（写仅管理员，不经正常 KB 创建）。
+    kind: str = "upload"
+    # 项目源只读状态字段（kind='project' 时才有）；普通 KB 恒为 None/False。
+    # 供前端 kbApi.list 识别 project 并展示同步状态；读取沿 KB ACL。
+    project_source_id: uuid.UUID | None = None
+    project_active_snapshot_id: uuid.UUID | None = None
+    project_ready: bool = False
+    project_revoked: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -43,6 +52,12 @@ class DocumentRead(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class DocumentUploadRead(DocumentRead):
+    """小文件上传回执：在文档字段之外标明本次是否复用了同库已有内容。"""
+
+    deduplicated: bool = False
 
 
 class SourceChunkRead(BaseModel):
@@ -92,6 +107,8 @@ class UploadSessionRead(BaseModel):
 class UploadCompleteRead(BaseModel):
     upload_id: uuid.UUID
     document: DocumentRead
+    # true = 服务端按真实内容摘要复用了同知识库已有文档，未新建、未改名、未改旧引用。
+    deduplicated: bool = False
 
 
 class UploadChunkRead(BaseModel):

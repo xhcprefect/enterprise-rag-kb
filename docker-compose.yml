@@ -1,8 +1,12 @@
-# 生产部署编排：db + api + worker + web，一条命令拉起。
+# 生产部署编排：db + api + worker(ingest) + worker-summary + worker-project + web。
 #
 # 数据全部落在宿主机 ${DATA_DIR}（默认 ./data）下，便于：
 #   1. 挂到独立数据盘 —— 机器若被回收，换台机器把目录拷过去即可恢复；
 #   2. 备份脚本直接按目录打包，不用进容器。
+#
+# projects 存储（PROJECT_STORAGE_DIR）是 API 与项目 worker 共用的**持久卷**：
+# 内容寻址的 blob 由 project worker 写入，API 读取；不挂同一个卷就会出现
+# “同步成功但引用读不到原文”。
 #
 # 首次部署：
 #   cp backend/.env.example backend/.env    # 填写密钥，改 JWT_SECRET / ADMIN_PASSWORD
@@ -55,11 +59,20 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
       UPLOAD_DIR: /data/uploads
       LOG_DIR: /data/logs
+      PROJECT_STORAGE_DIR: /data/projects
     volumes:
       # 必须与 worker 共用同一个上传目录：worker 要读取 api 落盘的文件，
       # 分片上传的 os.replace 也要求两边看到同一个文件系统
       - ${DATA_DIR:-./data}/uploads:/data/uploads
       - ${DATA_DIR:-./data}/logs:/data/logs
+      # 项目 blob 存储在宿主机上由备份/恢复脚本按目录打包。API 只读取/校验，
+      # 但挂载必须与 project worker 完全一致。
+      - ${DATA_DIR:-./data}/projects:/data/projects
+      # 默认**不**挂任何宿主机项目目录（PROJECT_ALLOWED_ROOTS 默认空）。
+      # 管理员显式授权宿主机目录时，API 与 project worker 必须挂到**同一个容器路径**：
+      # API 创建项目源时要对授权根做 pin 指纹（open_source_anchor），容器内看不到
+      # 该路径就无法建源；worker 也要在同一路径扫描。只读即可。
+      # - ${PROJECT_ROOT_HOST:-/srv/projects}:/srv/projects:ro
     depends_on:
       db:
         condition: service_healthy
@@ -88,6 +101,11 @@ services:
     image: rag-kb-backend:latest
     restart: unless-stopped
     command: ["python", "worker.py"]
+    # 停写预算：与 deploy/common.sh 的 WORKER_STOP_TIMEOUT_SECONDS 同源（默认 180s）。
+    # 备份/恢复先 stop worker，再在这个期限内等它跑完当前任务并退出；到期 Docker 会强杀。
+    # 强杀并不丢任务：worker 靠心跳/租约把 processing 文档退回 pending 续传。
+    # 因此这里只承诺“等待上限”，不能承诺每个解析/慢流任务都在该秒数内优雅完成。
+    stop_grace_period: ${WORKER_STOP_TIMEOUT_SECONDS:-180}s
     env_file:
       - ./backend/.env
     environment:
@@ -95,9 +113,11 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
       UPLOAD_DIR: /data/uploads
       LOG_DIR: /data/logs
+      PROJECT_STORAGE_DIR: /data/projects
     volumes:
       - ${DATA_DIR:-./data}/uploads:/data/uploads
       - ${DATA_DIR:-./data}/logs:/data/logs
+      - ${DATA_DIR:-./data}/projects:/data/projects
     depends_on:
       db:
         condition: service_healthy
@@ -110,10 +130,85 @@ services:
     # 若要 scale，先把 LOG_DIR 指到各副本独立的目录或改成只输出 stdout。
     networks: [internal]
 
+  # ===== 独立角色 worker（按 profile 启动，默认不随 `up -d` 起）=====
+  #
+  # 摘要与项目同步各自独占一个进程，避免长文档入库、模型摘要和项目扫描互相饿死。
+  # 没有开启对应功能时不要启动它们：worker-summary 消费不了任务时只是空转轮询，
+  # worker-project 在 PROJECT_ALLOWED_ROOTS 为空时没有可同步的源。
+  #
+  # 启动方式：
+  #   docker compose --profile summary up -d worker-summary   # CHAT_MEMORY_ENABLED=true 时
+  #   docker compose --profile project up -d worker-project   # 配置了 PROJECT_ALLOWED_ROOTS 时
+  #   docker compose --profile summary --profile project up -d # 两者都要
+  #
+  # 维护脚本按容器标签识别“正在运行的写服务”，因此只重启原本已启动的角色。
+  worker-summary:
+    build:
+      context: ./backend
+    image: rag-kb-backend:latest
+    restart: unless-stopped
+    profiles: ["summary"]
+    command: ["python", "worker.py", "--role", "summary"]
+    stop_grace_period: ${WORKER_STOP_TIMEOUT_SECONDS:-180}s
+    env_file:
+      - ./backend/.env
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
+      UPLOAD_DIR: /data/uploads
+      LOG_DIR: /data/logs
+      PROJECT_STORAGE_DIR: /data/projects
+    volumes:
+      - ${DATA_DIR:-./data}/uploads:/data/uploads
+      - ${DATA_DIR:-./data}/logs:/data/logs
+      - ${DATA_DIR:-./data}/projects:/data/projects
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks: [internal]
+
+  worker-project:
+    build:
+      context: ./backend
+    image: rag-kb-backend:latest
+    restart: unless-stopped
+    profiles: ["project"]
+    command: ["python", "worker.py", "--role", "project"]
+    stop_grace_period: ${WORKER_STOP_TIMEOUT_SECONDS:-180}s
+    env_file:
+      - ./backend/.env
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
+      UPLOAD_DIR: /data/uploads
+      LOG_DIR: /data/logs
+      # 项目同步必须与 API 看到同一份 blob 存储（内容寻址）。
+      PROJECT_STORAGE_DIR: /data/projects
+    volumes:
+      - ${DATA_DIR:-./data}/uploads:/data/uploads
+      - ${DATA_DIR:-./data}/logs:/data/logs
+      - ${DATA_DIR:-./data}/projects:/data/projects
+      # 默认**不**挂任何宿主机项目目录：PROJECT_ALLOWED_ROOTS 默认空，项目源无法创建。
+      # 真要索引宿主机目录时，管理员显式设置 PROJECT_ALLOWED_ROOTS，并**同时**在
+      # api 与 worker-project 下取消同一行的注释（只读；容器内路径必须一致）：
+      # - ${PROJECT_ROOT_HOST:-/srv/projects}:/srv/projects:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks: [internal]
+
   web:
     build:
       context: ./frontend
     restart: unless-stopped
+    environment:
+      # 默认 HTTP；HTTPS 由 docker-compose.https.yml 覆盖为 https 并补齐其余变量。
+      RAGKB_TLS_MODE: ${RAGKB_TLS_MODE:-http}
+      RAGKB_TRUSTED_PROXIES: ${RAGKB_TRUSTED_PROXIES:-}
     ports:
       - "${WEB_PORT:-80}:80"
     # 对外承接所有浏览器连接，同样是镜像默认的 1024 会先于 worker_connections 撞墙。

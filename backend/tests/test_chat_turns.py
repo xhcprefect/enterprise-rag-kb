@@ -19,7 +19,7 @@ class ChatTurnTests(unittest.TestCase):
         self.user_id, self.conv_id, self.request_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         self.kwargs = dict(user_id=self.user_id, conversation_id=self.conv_id, kb_id=None,
                            mode="chat", question="question", top_k=6, request_id=self.request_id)
-        self.conv = SimpleNamespace(id=self.conv_id, mode="chat", kb_id=None, active_turn_id=None,
+        self.conv = SimpleNamespace(id=self.conv_id, user_id=self.user_id, mode="chat", kb_id=None, active_turn_id=None,
                                     lease_expires_at=None, updated_at=None)
         self.db = MagicMock()
 
@@ -49,6 +49,14 @@ class ChatTurnTests(unittest.TestCase):
         self.assertEqual(rows[1].conversation_id, rows[0].id)
         self.db.commit.assert_called_once()
 
+    def test_another_users_conversation_cannot_be_claimed(self):
+        self.conv.user_id = uuid.uuid4()
+        with self.assertRaises(HTTPException) as error:
+            self.claim()
+        self.assertEqual(error.exception.status_code, 404)
+        self.db.add.assert_not_called()
+        self.db.commit.assert_not_called()
+
     def test_busy_conversation_rejects_before_saving_a_second_question(self):
         self.conv.active_turn_id = uuid.uuid4()
         self.conv.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
@@ -71,7 +79,8 @@ class ChatTurnTests(unittest.TestCase):
     def previous(self, status="completed"):
         return SimpleNamespace(id=uuid.uuid4(), request_id=self.request_id, user_id=self.user_id,
                                conversation_id=self.conv_id, user_message_id=uuid.uuid4(), status=status,
-                               payload_hash=turns.payload_hash("question", "chat", None, 6), trace={"status": "original"})
+                               payload_hash=turns.payload_hash("question", "chat", None, 6), trace={"status": "original"},
+                               project_snapshot_id=None)
 
     def test_completed_duplicate_replays_without_new_messages_or_generation(self):
         previous = self.previous()

@@ -15,6 +15,8 @@ export interface ChatRequestState {
   error_message?: string | null
   document_scope: DocumentScopeItem[]
   scope_revision: number
+  /** 原请求那一轮实际绑定的项目快照；非项目请求为 null/缺失。 */
+  project_snapshot_id?: string | null
 }
 
 export function validateRequestState(value: unknown, requestId: string, conversationId?: string | null): ChatRequestState {
@@ -47,7 +49,8 @@ export function recoveredCompletion(state: ChatRequestState): ChatCompletion {
   return {
     message_id: state.message.id, latency_ms: state.message.latency_ms, citations: state.message.citations ?? [],
     truncated: state.truncated, finish_reason: state.finish_reason,
-    document_scope: state.document_scope, scope_revision: state.scope_revision
+    document_scope: state.document_scope, scope_revision: state.scope_revision,
+    project_snapshot_id: state.project_snapshot_id ?? null
   }
 }
 

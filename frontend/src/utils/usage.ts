@@ -39,7 +39,9 @@ export const USAGE_OPERATIONS: readonly UsageOperation[] = [
   'rewrite',
   'query_embedding',
   'document_embedding',
-  'rerank'
+  'rerank',
+  'summary',
+  'project_embedding'
 ]
 
 export const USAGE_KINDS: readonly UsageModelKind[] = ['chat', 'embedding', 'rerank']

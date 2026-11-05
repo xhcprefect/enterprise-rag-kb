@@ -13,6 +13,8 @@ export interface ChatCompletion {
   /** 自动选择/换话题后后端实际生效的范围；仅在有该字段时更新 UI。 */
   document_scope?: DocumentScopeItem[]
   scope_revision?: number
+  /** 本轮实际绑定的项目快照；非项目为 null/缺失。 */
+  project_snapshot_id?: string | null
 }
 
 export function getCompletedCitations(

@@ -52,12 +52,15 @@ def setup_logging(component: str = "app") -> None:
     if not _CONFIGURED:
         _CONFIGURED = True
         root.addHandler(_console_handler())
-        try:
-            root.addHandler(_file_handler(component))
-        except OSError as exc:  # 目录不可写时退化为仅控制台
-            logging.getLogger(__name__).warning(
-                "无法创建日志文件（%s），仅输出到控制台: %s", settings.LOG_DIR, exc
-            )
+        # LOG_STDOUT_ONLY=true 时只保留控制台输出（容器/k8s 由平台收集），
+        # 默认仍按 component 写滚动文件，行为不变。
+        if not settings.LOG_STDOUT_ONLY:
+            try:
+                root.addHandler(_file_handler(component))
+            except OSError as exc:  # 目录不可写时退化为仅控制台
+                logging.getLogger(__name__).warning(
+                    "无法创建日志文件（%s），仅输出到控制台: %s", settings.LOG_DIR, exc
+                )
 
     # uvicorn 自带 handler，且它配置时未必设置 propagate=False：
     # 若不显式关掉传播，同一条日志会被"uvicorn 自己的 handler + 根 handler"写两遍。
