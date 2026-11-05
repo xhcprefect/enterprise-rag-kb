@@ -39,12 +39,18 @@ prepare_token_copy() {
   case "$(realpath "$src")" in
     "$repo"|"$repo"/*) echo 'METRICS_TOKEN 文件不能在仓库内' >&2; exit 1 ;;
   esac
-  # 源文件不允许组/其他用户可读。
-  perms=$(stat -c '%a' "$src" 2>/dev/null || echo '')
-  [[ -n "$perms" ]] || { echo "无法读取令牌文件权限: $src" >&2; exit 1; }
-  (( (8#$perms & 077) == 0 )) || {
-    echo "令牌文件权限过宽（$perms），请 chmod 600 $src" >&2; exit 1;
-  }
+  # Linux 强制源文件仅属主可读；NTFS 的访问权限由 ACL 决定，Git Bash 的
+  # mode 位不能证明 0600。部署和 CI 在 Linux 上执行该检查。
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) : ;;
+    *)
+      perms=$(stat -c '%a' "$src" 2>/dev/null || echo '')
+      [[ -n "$perms" ]] || { echo "无法读取令牌文件权限: $src" >&2; exit 1; }
+      (( (8#$perms & 077) == 0 )) || {
+        echo "令牌文件权限过宽（$perms），请 chmod 600 $src" >&2; exit 1;
+      }
+      ;;
+  esac
   [[ -s "$src" ]] || { echo "令牌文件为空: $src" >&2; exit 1; }
   # 去掉行尾换行后非空，避免把多行/空令牌塞进 Authorization 头。
   local value
@@ -58,7 +64,8 @@ prepare_token_copy() {
   mkdir -p "$dst_dir"
   chmod 0755 "$dst_dir"
   dst="$dst_dir/metrics_token"
-  # 直接写目标（umask 022 -> 0644），再降到 0444，避免权限窗口。
+  # 旧副本为 0444；重复渲染时先移除，再生成只读副本。
+  rm -f "$dst"
   ( umask 022; printf '%s\n' "$value" > "$dst" )
   chmod 0444 "$dst"
   [[ -r "$dst" ]] || { echo "生成的令牌副本不可读: $dst" >&2; exit 1; }
@@ -109,6 +116,42 @@ RAGKB_ALERT_QUEUE_BACKLOG=${RAGKB_ALERT_QUEUE_BACKLOG:-50};              positiv
 RAGKB_ALERT_PENDING_AGE_SECONDS=${RAGKB_ALERT_PENDING_AGE_SECONDS:-1800}; positive_int RAGKB_ALERT_PENDING_AGE_SECONDS "$RAGKB_ALERT_PENDING_AGE_SECONDS" 604800
 RAGKB_ALERT_POOL_SATURATION=${RAGKB_ALERT_POOL_SATURATION:-0.9};          ratio RAGKB_ALERT_POOL_SATURATION "$RAGKB_ALERT_POOL_SATURATION"
 
+# ---------- 可选告警投递目标（默认无，保持只采集） ----------
+# 值为逗号分隔的 **host:port** 列表，仅此一种形式：不解析、不接受 http(s)://
+# 前缀，也不做任何隐式 scheme 转换（静默去掉 https:// 会变成明文访问）。
+# 严格白名单：主机名/IP 只允许字母数字与 _ . -，端口 1-65535；含空白、换行、
+# 引号、${}、连续或末尾逗号一律拒绝——不把原始输入回显到错误信息里，避免误填
+# URL/凭据时泄漏到日志。
+bad_alert_target() { echo "RAGKB_ALERTMANAGER_TARGET 不合法：$1" >&2; exit 1; }
+alertmanager_targets=()
+RAGKB_ALERTMANAGER_TARGET=${RAGKB_ALERTMANAGER_TARGET:-}
+if [[ -n "$RAGKB_ALERTMANAGER_TARGET" ]]; then
+  # 只取单行；CR/LF 会让 read 静默丢弃尾部，必须显式拒绝整值。
+  [[ "$RAGKB_ALERTMANAGER_TARGET" != *$'\r'* ]] || bad_alert_target '不能包含回车'
+  [[ "$RAGKB_ALERTMANAGER_TARGET" != *$'\n'* ]] || bad_alert_target '不能包含换行'
+  [[ "$RAGKB_ALERTMANAGER_TARGET" =~ [[:space:]] ]] && bad_alert_target '不能包含空白字符'
+  [[ "$RAGKB_ALERTMANAGER_TARGET" != ,* && "$RAGKB_ALERTMANAGER_TARGET" != *, && "$RAGKB_ALERTMANAGER_TARGET" != *,,* ]] \
+    || bad_alert_target '不能有空的逗号项'
+  IFS=',' read -r -a raw_targets <<< "$RAGKB_ALERTMANAGER_TARGET"
+  ((${#raw_targets[@]} <= 5)) || bad_alert_target '最多 5 个目标'
+  for target in "${raw_targets[@]}"; do
+    [[ -n "$target" ]] || bad_alert_target '不能有空的逗号项'
+    [[ "$target" =~ ^([A-Za-z0-9]([A-Za-z0-9_.-]{0,252})):([1-9][0-9]{0,4})$ ]] \
+      || bad_alert_target '必须是 host:port（不接受 URL/scheme 前缀）'
+    (( 10#${BASH_REMATCH[3]} <= 65535 )) || bad_alert_target '端口必须在 1-65535'
+    alertmanager_targets+=("${BASH_REMATCH[1]}:${BASH_REMATCH[3]}")
+  done
+fi
+
+RAGKB_ALERTING_BLOCK=''
+if ((${#alertmanager_targets[@]} > 0)); then
+  RAGKB_ALERTING_BLOCK=$'alerting:\n  alertmanagers:\n    - static_configs:\n        - targets:'
+  for target in "${alertmanager_targets[@]}"; do
+    RAGKB_ALERTING_BLOCK+=$'\n            - "'"$target"'"'
+  done
+fi
+export RAGKB_ALERTING_BLOCK
+
 export RAGKB_SCRAPE_INTERVAL RAGKB_SCRAPE_TIMEOUT RAGKB_INSTANCE_LABEL
 export RAGKB_ALERT_FIRST_TOKEN_QUANTILE RAGKB_ALERT_HTTP_QUANTILE
 export RAGKB_ALERT_FAILURE_RATIO RAGKB_ALERT_HTTP_5XX_RATIO
@@ -116,6 +159,8 @@ export RAGKB_ALERT_FIRST_TOKEN_SECONDS RAGKB_ALERT_STAGE_SECONDS RAGKB_ALERT_HTT
 export RAGKB_ALERT_IN_FLIGHT_MAX RAGKB_ALERT_HTTP_IN_FLIGHT_MAX
 export RAGKB_ALERT_FAILURE_MIN_COUNT RAGKB_ALERT_HTTP_5XX_MIN_COUNT
 export RAGKB_ALERT_QUEUE_BACKLOG RAGKB_ALERT_PENDING_AGE_SECONDS RAGKB_ALERT_POOL_SATURATION
+
+render_allowlist='RAGKB_SCRAPE_INTERVAL RAGKB_SCRAPE_TIMEOUT RAGKB_INSTANCE_LABEL RAGKB_ALERTING_BLOCK RAGKB_ALERT_FIRST_TOKEN_QUANTILE RAGKB_ALERT_HTTP_QUANTILE RAGKB_ALERT_FAILURE_RATIO RAGKB_ALERT_HTTP_5XX_RATIO RAGKB_ALERT_FIRST_TOKEN_SECONDS RAGKB_ALERT_STAGE_SECONDS RAGKB_ALERT_HTTP_SECONDS RAGKB_ALERT_IN_FLIGHT_MAX RAGKB_ALERT_HTTP_IN_FLIGHT_MAX RAGKB_ALERT_FAILURE_MIN_COUNT RAGKB_ALERT_HTTP_5XX_MIN_COUNT RAGKB_ALERT_QUEUE_BACKLOG RAGKB_ALERT_PENDING_AGE_SECONDS RAGKB_ALERT_POOL_SATURATION'
 
 render() { # 源文件 目标文件
   local src=$1 dst=$2
@@ -127,14 +172,16 @@ render() { # 源文件 目标文件
   # 读不到。渲染时就显式放宽（目录 0755 可遍历、文件 0644 可读），
   # 不依赖后续批量 chmod，避免中途失败留下不可读产物。
   chmod 0755 "$(dirname "$dst")"
-  awk '
+  awk -v allowed="$render_allowlist" '
+    BEGIN { allow = " " allowed " " }
     {
       line=$0
       while (match(line, /\$\{[A-Z0-9_]+(:-[^}]*)?\}/)) {
         token=substr(line, RSTART, RLENGTH)
         name=token
         sub(/^\$\{/, "", name); sub(/(:-[^}]*)?\}$/, "", name)
-        if (!(name in ENVIRON)) { printf "未知占位符: %s\n", token > "/dev/stderr"; exit 3 }
+        if (index(allow, " " name " ") == 0) { printf "未知占位符: %s\n", token > "/dev/stderr"; exit 3 }
+        if (!(name in ENVIRON)) { printf "未导出变量: %s\n", token > "/dev/stderr"; exit 3 }
         val=ENVIRON[name]
         line=substr(line, 1, RSTART-1) val substr(line, RSTART+RLENGTH)
       }

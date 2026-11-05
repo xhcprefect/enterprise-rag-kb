@@ -67,12 +67,18 @@ enterprise-rag-kb/
 │   │   ├── stores/        # Pinia
 │   │   └── views/         # 页面
 │   ├── Dockerfile
-│   └── nginx.conf         # 生产 Nginx 配置
+│   ├── nginx.conf         # 生产 Nginx 配置（HTTP）
+│   └── nginx/
+│       ├── tls.conf       # 可选 HTTPS 入口（由 docker-compose.https.yml 挂载覆盖）
+│       └── snippets/      # 两套配置共用的 location / 代理 / TLS 参数
 ├── deploy/
 │   ├── init.sh            # 首次部署检查
-│   ├── backup.sh          # 备份（数据库 + 上传文件 + 项目 blob）
-│   └── restore.sh         # 恢复
+│   ├── backup.sh          # 备份（数据库 + 上传文件 + 项目 blob + 校验清单）
+│   ├── restore.sh         # 恢复（1–3 个参数，校验清单后恢复）
+│   └── tests/
+│       └── restore-drill.sh   # 隔离恢复演练（专用临时 Compose 项目）
 ├── docker-compose.yml     # db / api / worker / web；summary、project 可选 profile
+├── docker-compose.https.yml   # 可选 HTTPS 覆盖（80 跳转 + 443 站点）
 ├── DEPLOY.md              # 生产部署手册
 ├── start-backend.bat
 └── start-frontend.bat
@@ -520,3 +526,12 @@ docker compose up -d --build
 `web`（Nginx 静态托管 + 反代）。`api` 与 `worker` 是**同一个镜像**
 （`rag-kb-backend`，只差启动命令），构建一次、两个容器共用，不会出现版本漂移。
 数据统一落在 `${DATA_DIR}`，附备份/恢复脚本，适配可能被回收的竞价实例。
+
+备份产出同一 stamp 的 `ragdb`、`uploads`、`projects` 三份归档和最后发布的 `manifest-*.sha256` 清单；
+恢复按清单校验后覆盖，旧的两件套备份仍兼容（不改动现有 `projects/`）。日常维护入口见
+[DEPLOY.md](DEPLOY.md#数据与备份)，恢复能力用 `deploy/tests/restore-drill.sh` 在隔离环境演练。
+可选的 HTTPS 用 `docker-compose.https.yml` 覆盖启用，见 [DEPLOY.md](DEPLOY.md#https)。
+
+评测工具支持完整本地语料、公开检索配置和可选索引清单的身份校验，旧身份基线会明确判为不可比；业务问题集可用 `--require-reviewed` 检查人工核验状态，并输出分层样本数与固定断言结果。用法见 [评测说明](backend/evaluation/README.md) 与 [业务标注模板](backend/evaluation/templates/README.md)。
+
+审计写入失败通过脱敏日志、无标签指标和管理员摘要可见；可选的 Prometheus → Alertmanager → 通用 webhook 通知链路及启停步骤见 [监控与告警说明](deploy/monitoring/README.md)。上线仍需准备真实接收器和经人工核验的业务样本。

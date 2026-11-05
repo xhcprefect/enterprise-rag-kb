@@ -10,11 +10,14 @@ from urllib.parse import urlparse
 import httpx
 from app.services.evaluation import (EvaluationError, build_identity, compare_reports, comparison_exit_code,
                                      grade_case, make_report, read_json_document, read_jsonl,
-                                     run_live_case, validate_cases, validate_comparison_report,
+                                     require_reviewed_cases, run_live_case, validate_cases, validate_comparison_report,
                                      validate_responses, validate_thresholds)
 
 # 允许进入配置身份的键；未知键直接拒绝，避免把令牌、URL 等私密值写进报告。
-CONFIG_KEYS = ("model", "embedding_model", "chunk_size", "chunk_overlap", "retrieval_top_k", "retrieval_rewrite")
+# 这里不含 RERANK_BASE_URL / RERANK_API_KEY：重排服务地址和密钥永远不进报告。
+CONFIG_KEYS = ("model", "embedding_model", "chunk_size", "chunk_overlap", "retrieval_top_k", "retrieval_rewrite",
+               "hybrid_retrieval_enabled", "rerank_enabled", "rerank_model", "retrieval_min_similarity",
+               "retrieval_neighbor_chunks", "retrieval_max_per_doc", "rerank_max_chars", "keyword_candidates")
 
 
 def _load_config(path):
@@ -24,6 +27,18 @@ def _load_config(path):
     unknown = sorted(set(value) - set(CONFIG_KEYS))
     if unknown:
         raise EvaluationError("评测配置含未知键: " + ", ".join(unknown))
+    return value
+
+
+def _load_index_manifest(path):
+    """可选索引结构清单；格式见 README，只接受白名单字段。"""
+    if not path:
+        return None
+    value = read_json_document(path)
+    if isinstance(value, dict):
+        unknown = sorted(set(value) - {"documents"})
+        if unknown:
+            raise EvaluationError("索引清单含未知键: " + ", ".join(unknown))
     return value
 
 
@@ -50,8 +65,11 @@ def main(argv=None):
     parser.add_argument("--output-price-per-million", type=float)
     parser.add_argument("--include-content", action="store_true", help="报告包含问题、答案与引用正文，可能包含业务敏感信息")
     parser.add_argument("--output", default="evaluation-results/report.json")
-    parser.add_argument("--documents-dir", help="参与内容身份计算的公开合成文档目录；默认使用问题集同级的 documents/")
-    parser.add_argument("--config-file", help="可选 JSON，仅允许 model/embedding_model/chunk_size/chunk_overlap/retrieval_top_k/retrieval_rewrite")
+    parser.add_argument("--documents-dir", help="声明为本地语料快照的目录；整棵目录参与身份计算，默认使用问题集同级的 documents/")
+    parser.add_argument("--index-manifest", help="可选 JSON：document_id/index_version/content_sha256/chunk_count 结构清单，生成索引结构指纹")
+    parser.add_argument("--require-reviewed", action="store_true",
+                        help="严格业务模式：拒绝未完成人工核验或仍含模板占位符的用例；在任何真实调用前检查")
+    parser.add_argument("--config-file", help="可选 JSON，仅允许公开检索/模型参数（含 hybrid/rerank 开关），拒绝 URL 与凭据")
     parser.add_argument("--baseline", help="用于比较的基线报告 JSON；缺身份或不可比时以专门退出码拒绝结论")
     parser.add_argument("--thresholds", help="可选阈值 JSON；未提供的指标使用默认门槛")
     parser.add_argument("--comparison-output", help="可选：把比较结果单独写入此 JSON 文件")
@@ -67,15 +85,19 @@ def main(argv=None):
         cases = validate_cases(read_jsonl(args.dataset))[:args.max_cases]
         if not cases:
             raise EvaluationError("问题集为空")
+        if args.require_reviewed:
+            # 严格业务模式必须在任何真实调用前拒绝未核验/占位符用例。
+            require_reviewed_cases(cases)
         thresholds = validate_thresholds(read_json_document(args.thresholds)) if args.thresholds else {}
         config = _load_config(args.config_file)
+        index_manifest = _load_index_manifest(args.index_manifest)
         documents_dir = Path(args.documents_dir) if args.documents_dir else _default_documents_dir(args.dataset)
         if args.documents_dir and not documents_dir.is_dir():
             # 显式指定的文档目录不存在是配置错误，不能悄悄退化成“无文档身份”。
             raise EvaluationError("--documents-dir 不是目录")
         # 配置值和身份必须在任何真实调用之前校验完毕，避免先付费调用再报配置错误。
         identity = build_identity(cases, mode="live" if args.live else "offline",
-                                  documents_dir=documents_dir, **config)
+                                  documents_dir=documents_dir, index_manifest=index_manifest, **config)
         baseline = read_json_document(args.baseline) if args.baseline else None
         if baseline is not None:
             # 坏基线也必须在发起模型调用前拒绝；旧基线缺 identity 仍交由比较判为不可比。

@@ -285,6 +285,7 @@ class OperationsTestCase(unittest.TestCase):
             data = body["data"]
             self.assertTrue(data["process_local"])
             self.assertFalse(data["degraded"])
+            self.assertEqual(data["audit"], {"write_failures": 0})
             self.assertIsNotNone(data["queue"])
             self.assertGreaterEqual(data["queue"]["statuses"]["pending"], 1)
             self.assertGreaterEqual(data["queue"]["stale_processing"], 1)
@@ -302,6 +303,7 @@ class OperationsTestCase(unittest.TestCase):
     def test_summary_degrades_when_database_unavailable(self):
         from sqlalchemy import create_engine
 
+        metrics.audit_write_failed()
         broken = create_engine("postgresql+psycopg://ragtest:bad@127.0.0.1:9/unreachable",
                                connect_args={"connect_timeout": 1})
         with patch.object(db_session, "engine", broken), \
@@ -310,6 +312,7 @@ class OperationsTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()["data"]
         self.assertTrue(data["degraded"])
+        self.assertEqual(data["audit"], {"write_failures": 1})
         self.assertIsNone(data["queue"])
         self.assertEqual(data["database"]["status"], "unavailable")
         self.assertIn(data["database"]["error"], {"query_failed", "timeout"})
@@ -334,10 +337,12 @@ class OperationsTestCase(unittest.TestCase):
         self.assertLess(elapsed, 4.0)
 
     def test_summary_chat_counters_are_process_local(self):
+        metrics.audit_write_failed()
         start_chat("rag").finish("completed", first_token_ms=5, total_ms=6)
         response = self.client.get("/api/v1/operations/summary", headers=self._admin_headers())
         data = response.json()["data"]
         self.assertEqual(data["chat"]["finished"].get("rag:completed"), 1)
+        self.assertEqual(data["audit"], {"write_failures": 1})
         self.assertTrue(data["process_local"])
 
 

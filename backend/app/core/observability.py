@@ -211,6 +211,9 @@ class _Metrics:
         self._chat_first_token: dict[str, _Histogram] = {}
         self._chat_total: dict[str, _Histogram] = {}
         self._chat_stage: dict[tuple[str, str], _Histogram] = {}
+        # 审计写入失败：刻意不设任何标签（action/用户/目标都不参与），
+        # 只暴露"这一进程累计失败了多少次"。
+        self._audit_write_failures = 0
 
     # ---- HTTP ---------------------------------------------------------
     def http_request_started(self) -> None:
@@ -322,6 +325,12 @@ class _Metrics:
                     histogram.observe(value / 1000.0)
         return True
 
+    # ---- Audit --------------------------------------------------------
+    def audit_write_failed(self) -> None:
+        """记录一次审计写入失败；无标签，任何调用方都无法注入业务数据。"""
+        with self._lock:
+            self._audit_write_failures += 1
+
     # ---- Snapshot / rendering ----------------------------------------
     def snapshot(self) -> dict:
         """给管理员摘要用的结构化快照；不包含任何用户/请求标识。"""
@@ -340,6 +349,9 @@ class _Metrics:
                         for (mode, status), count in self._chat_finished.items()
                     },
                 },
+                "audit": {
+                    "write_failures": self._audit_write_failures,
+                },
             }
 
     def reset(self) -> None:
@@ -355,6 +367,7 @@ class _Metrics:
             self._chat_first_token.clear()
             self._chat_total.clear()
             self._chat_stage.clear()
+            self._audit_write_failures = 0
 
     def render(self) -> str:
         with self._lock:
@@ -369,6 +382,7 @@ class _Metrics:
             chat_first_token = {key: histogram.freeze() for key, histogram in self._chat_first_token.items()}
             chat_total = {key: histogram.freeze() for key, histogram in self._chat_total.items()}
             chat_stage = {key: histogram.freeze() for key, histogram in self._chat_stage.items()}
+            audit_write_failures = self._audit_write_failures
 
         lines: list[str] = []
 
@@ -428,6 +442,14 @@ class _Metrics:
         for mode, stage in sorted(chat_stage):
             labels = (("mode", mode), ("stage", stage))
             lines.extend(_render_histogram("ragkb_chat_stage_seconds", labels, chat_stage[(mode, stage)]))
+
+        family(
+            "ragkb_audit_write_failures_total",
+            "counter",
+            "Audit-log write failures in this process; unlabeled so no business data can become a label.",
+        )
+        # 始终输出（含 0），与队列状态指标一致：告警可以直接 increase(...) > 0。
+        lines.append(f"ragkb_audit_write_failures_total {audit_write_failures}")
 
         family("ragkb_metrics_process_local", "gauge", "Constant 1; metrics are process-local and not shared across replicas.")
         lines.append("ragkb_metrics_process_local 1")

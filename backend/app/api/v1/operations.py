@@ -260,6 +260,8 @@ async def get_summary(_admin=Depends(require_admin)):
     database = await _database_summary()
     snapshot = metrics.snapshot()
     chat, http = snapshot["chat"], snapshot["http"]
+    # 审计失败只暴露进程内累计次数（无标签、无业务数据），与 /metrics 同源。
+    audit = snapshot["audit"]
     if database.get("status") == "ok":
         queue = {
             "statuses": database["statuses"],
@@ -273,6 +275,7 @@ async def get_summary(_admin=Depends(require_admin)):
             "process_local": True,
             "chat": chat,
             "http": http,
+            "audit": audit,
             "queue": queue,
             "database": {"status": "ok", "pool": database.get("pool")},
             "degraded": False,
@@ -283,6 +286,7 @@ async def get_summary(_admin=Depends(require_admin)):
             "process_local": True,
             "chat": chat,
             "http": http,
+            "audit": audit,
             "queue": None,
             "database": {
                 "status": "unavailable",

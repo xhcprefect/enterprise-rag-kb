@@ -17,17 +17,35 @@
   "first_token_ms_samples": 8,
   "total_ms_samples": 8,
   "generation_cost_samples": 0,
+  "reviewed_cases": 0,
+  "unreviewed_cases": 8,
+  "strata": {
+    "unclassified": {
+      "cases": 8,
+      "passed": 8,
+      "assertion_pass_rate": 1.0,
+      "reviewed": 0,
+      "unreviewed": 8,
+      "review_complete": 0,
+      "review_incomplete": 0,
+      "failure_reasons": {}
+    }
+  },
+  "failure_reasons": {},
   "notes": [
     "固定断言和来源匹配不是语义事实正确率。",
     "费用只包含已返回实际用量的回答生成，不包含追问补全、向量化和重排。",
     "首字延迟针对最后一轮；总耗时包含 case 的所有准备轮次。",
-    "p50/p95 只使用实际返回的样本；样本数为 0 时保持 null，不补 0。"
+    "p50/p95 只使用实际返回的样本；样本数为 0 时保持 null，不补 0。",
+    "reviewed_cases 只表示核验元数据齐全，不代表语义准确率。"
   ],
   "results": [
     {
       "id": "platform-chunk-locate",
       "passed": true,
       "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
       "expected_outcome": "answer",
       "outcome": "answer",
       "candidate_source_recall": 1.0,
@@ -46,6 +64,8 @@
       "id": "platform-cross-doc",
       "passed": true,
       "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
       "expected_outcome": "answer",
       "outcome": "answer",
       "candidate_source_recall": 1.0,
@@ -64,6 +84,8 @@
       "id": "platform-refuse",
       "passed": true,
       "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
       "expected_outcome": "refuse",
       "outcome": "refuse",
       "candidate_source_recall": null,
@@ -82,6 +104,8 @@
       "id": "platform-followup",
       "passed": true,
       "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
       "expected_outcome": "answer",
       "outcome": "answer",
       "candidate_source_recall": 1.0,
@@ -100,6 +124,8 @@
       "id": "platform-topic-switch",
       "passed": true,
       "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
       "expected_outcome": "answer",
       "outcome": "answer",
       "candidate_source_recall": 1.0,
@@ -118,6 +144,8 @@
       "id": "platform-scope-selected",
       "passed": true,
       "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
       "expected_outcome": "answer",
       "outcome": "answer",
       "candidate_source_recall": 1.0,
@@ -136,6 +164,8 @@
       "id": "platform-old-generation",
       "passed": true,
       "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
       "expected_outcome": "answer",
       "outcome": "answer",
       "candidate_source_recall": 1.0,
@@ -154,6 +184,8 @@
       "id": "platform-scope-followup",
       "passed": true,
       "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
       "expected_outcome": "answer",
       "outcome": "answer",
       "candidate_source_recall": 1.0,
@@ -170,16 +202,16 @@
     }
   ],
   "identity": {
-    "schema": 1,
+    "schema": 2,
     "metrics_version": 1,
     "dataset": {
-      "schema": 1,
+      "schema": 2,
       "case_count": 8,
       "sha256": "6fe2d59eeb0c819084701f996076c0b3466c90c07fdc6a7dcbe4698777fb4256",
       "documents": {
-        "files": 3,
-        "missing": 0,
-        "sha256": "3f357c9a7af89a983ad944acc26b649edaf8497e62cdb04f3f4cc70e68da9897"
+        "kind": "declared-local-snapshot",
+        "files": 6,
+        "sha256": "3fb19a6a1c5bcd9fc58ccd80b82ad0bcba70f4127ee2d649776993d8301e2003"
       }
     },
     "config": {

@@ -93,15 +93,15 @@
 **PowerShell（Windows 自带，最省事）**
 
 ```powershell
-Test-NetConnection -ComputerName <服务器公网IP> -Port 22    # TcpTestSucceeded : True
-Test-NetConnection -ComputerName <服务器公网IP> -Port 5432  # 应为 False，且选项受限
+Test-NetConnection -ComputerName YOUR_SERVER_IP -Port 22    # TcpTestSucceeded : True
+Test-NetConnection -ComputerName YOUR_SERVER_IP -Port 5432  # 应为 False，且选项受限
 ```
 
 **Git Bash（有 `nc` 时）**
 
 ```bash
-nc -zvw5 <服务器公网IP> 22      # 成功则输出 "succeeded" 或 "open"
-nc -zvw5 <服务器公网IP> 5432    # 应超时/失败
+nc -zvw5 YOUR_SERVER_IP 22      # 成功则输出 "succeeded" 或 "open"
+nc -zvw5 YOUR_SERVER_IP 5432    # 应超时/失败
 ```
 
 > **80 端口在部署前一定是"拒绝"**（Nginx 还没跑），这是正常的，
@@ -120,13 +120,14 @@ nc -zvw5 <服务器公网IP> 5432    # 应超时/失败
 ### 2.1 连接
 
 ```bash
-ssh -i /path/to/your-key.pem ubuntu@<服务器公网IP>
+# 将 YOUR_SERVER_IP 替换为实际服务器公网 IP
+ssh -i /path/to/your-key.pem ubuntu@YOUR_SERVER_IP
 ```
 
 首次连接会问 `Are you sure you want to continue connecting?`，输入 `yes`。
 
 > 腾讯云 Ubuntu 镜像默认用户是 `ubuntu`，不是 `root`。
-> 若用密码登录，`ssh ubuntu@<IP>` 后输入控制台设置的密码。
+> 若用密码登录，`ssh ubuntu@YOUR_SERVER_IP` 后输入控制台设置的密码。
 
 ### 2.2 系统更新与时区
 
@@ -546,7 +547,7 @@ docker compose logs worker --tail 20        # 应看到启动日志
 
 ### 8.3 浏览器端完整验收
 
-打开 `http://<服务器公网IP>/`，用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录。
+打开 `http://YOUR_SERVER_IP/`，用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录。
 
 | # | 操作 | 期望结果 |
 |---|---|---|
@@ -575,7 +576,7 @@ API Key 无效或余额不足。
 在**本地**机器执行（不是服务器上）：
 
 ```bash
-curl -s http://<服务器公网IP>/health
+curl -s http://YOUR_SERVER_IP/health
 ```
 
 能返回 JSON 说明安全组 + Nginx + api 三层都通了。
@@ -596,26 +597,27 @@ curl -s http://<服务器公网IP>/health
 
 ### 9.2 配置步骤
 
-1. DNS 加 A 记录：`kb.你的域名.com → <服务器公网IP>`
-2. 安全组放行 443
-3. 签发证书（webroot 模式）：
+HTTPS 通过 **Compose 覆盖文件**启用。先把 DNS 指向服务器并放行 80/443，再按
+[DEPLOY.md 的 HTTPS 流程](DEPLOY.md#https) 准备仓库外证书。默认 HTTP 入口尚不支持 ACME webroot，
+首次 standalone 签发、失败恢复与续期 hook 的完整命令统一维护在那里。
+
+证书准备好后，根 `.env` 填入：
 
 ```bash
-sudo apt-get install -y certbot
-sudo certbot certonly --webroot -w /var/www/certbot -d kb.你的域名.com
+RAGKB_SERVER_NAME=kb.example.com
+RAGKB_TLS_CERT_DIR=/srv/ragkb-certs
 ```
 
-4. 编辑 `frontend/nginx.conf`，取消文件末尾 HTTPS 段的注释，填入域名与证书路径
-5. 重建前端：
+然后启动并验证：
 
 ```bash
-docker compose build web && docker compose up -d web
+docker compose -f docker-compose.yml -f docker-compose.https.yml up -d
+curl -I http://kb.example.com             # 301 到 HTTPS
+curl -fsS https://kb.example.com/health
 ```
 
-6. 把 `backend/.env` 的 `CORS_ORIGINS` 改成 `https://kb.你的域名.com`
-
-> `frontend/nginx.conf` 同时被复制进镜像（`frontend/Dockerfile` 的 `COPY nginx.conf`），
-> 所以**改完必须重新 build**，光 `restart` 不生效。
+之后所有 Compose 维护命令都保留 HTTPS 覆盖文件。Certbot 续期不会自动更新挂载目录中的证书副本，
+上线时一并配置详细手册中的 deploy hook，成功续期后同步副本并重启 web。
 
 ---
 
@@ -626,8 +628,9 @@ docker compose build web && docker compose up -d web
 ```
 data/
 ├── pgdata/      # PostgreSQL 数据目录（向量、文档元数据、用户）
-├── uploads/     # 上传的原始文件
-├── logs/        # 应用日志
+├── uploads/     # 上传的原始文件与分片
+├── projects/    # 项目源码 blob（API 与 project worker 共用）
+├── logs/        # 应用日志（cron 日志也写这里）
 └── backups/     # 备份产物
 ```
 
@@ -637,42 +640,67 @@ data/
 
 ```bash
 ./deploy/backup.sh
-# 2026-10-24 14:12:00 备份完成: 18K + 493B -> ./data/backups
+# 备份完成: ./data/backups/manifest-20261024-141159-12345.sha256（包含数据库、上传文件与项目存储校验值）
 ```
 
-产物是两个文件：`ragdb-<时间戳>.sql.gz` + `uploads-<时间戳>.tar.gz`。
-脚本会自动删除 **7 天前**的旧备份（`KEEP_DAYS`，可用环境变量覆盖），
-即至少保留最近一周，不是"只留 7 份"。
+一次备份产出**同一时间标识（stamp）**的一组文件，stamp 形如 `20261024-141159-12345`：
 
-脚本会**实际解压并校验内容**（不只看文件大小），所以不会出现"看起来成功"的空备份。
+| 文件 | 内容 |
+|---|---|
+| `ragdb-<stamp>.sql.gz` | 数据库逻辑备份（`pg_dump --clean --if-exists`） |
+| `uploads-<stamp>.tar.gz` | `${DATA_DIR}/uploads` |
+| `projects-<stamp>.tar.gz` | `${DATA_DIR}/projects`（未启用项目索引时为空目录） |
+| `manifest-<stamp>.sha256` | 三个文件的 SHA-256 清单，**最后发布**，见到它才代表这一组完整 |
+
+只有归档、没有清单的 stamp 不能当作完整的新备份来恢复。备份会短暂停写 API/worker，
+结束后只恢复原本在运行的服务；`KEEP_DAYS` 默认 7 天，按文件时间清理四类产物。
 
 ### 10.3 定时备份
 
 ```bash
-crontab -e
+mkdir -p "$HOME/enterprise-rag-kb/data/logs"     # 重定向目标必须先可写
+
+(crontab -l 2>/dev/null | grep -v "deploy/backup.sh"; \
+ echo '20 3 * * * cd $HOME/enterprise-rag-kb && ./deploy/backup.sh >> $HOME/enterprise-rag-kb/data/logs/backup.log 2>&1') | crontab -
+crontab -l
 ```
 
-加入一行（注意换成你的实际路径）：
-
-```
-20 3 * * * /home/ubuntu/enterprise-rag-kb/deploy/backup.sh >> /var/log/rag-backup.log 2>&1
-```
-
-验证 cron 生效：
+日志**不要写 `/var/log`**（普通用户没有写权限，cron 报错还看不到）。装完先模拟 cron 的精简环境跑一次：
 
 ```bash
-tail -f /var/log/rag-backup.log
-ls -lh data/backups/
+env -i HOME=$HOME PATH=/usr/bin:/bin SHELL=/bin/sh \
+  /bin/sh -c 'cd $HOME/enterprise-rag-kb && ./deploy/backup.sh'
+# 应输出「备份完成: ...」，exit 0
+```
+
+再确认任务真的在跑（有日志、有新产物），而不是"装过就算"：
+
+```bash
+tail -n 20 data/logs/backup.log
+ls -lt data/backups | head
 ```
 
 ### 10.4 恢复
 
+三个参数按同一 stamp、同一目录传（第三个 `projects` 可省略，脚本会按清单自动发现）：
+
 ```bash
-./deploy/restore.sh data/backups/ragdb-20261024-141159.sql.gz \
-                    data/backups/uploads-20261024-141159.tar.gz
+./deploy/restore.sh data/backups/ragdb-20261024-141159-12345.sql.gz \
+                    data/backups/uploads-20261024-141159-12345.tar.gz \
+                    data/backups/projects-20261024-141159-12345.tar.gz
 ```
 
-会先停 `api` / `worker`，恢复后再启动，中间有 `yes` 二次确认。
+会先校验清单与压缩包，再停 `api` / `worker`，恢复后只重启原本在运行的服务，中间有 `yes` 二次确认。
+
+**旧备份（只有 `ragdb` + `uploads`）**：照旧传两个参数即可恢复；脚本会提示"本次不恢复项目存储"，
+**现有 `projects/` 目录保持不变**，不要事后手工删除。
+
+> 恢复会覆盖线上数据。日常验证"备份真的能恢复"用隔离演练：
+> `./deploy/tests/restore-drill.sh`（dry-run）或 `--isolated`（临时 Compose 项目里真实恢复）。
+> 它只操作临时 PostgreSQL 与临时目录，不碰生产 `DATA_DIR`、不停生产服务。
+
+完整的备份行为、cron 踩坑、恢复参数与演练安全边界统一维护在
+[DEPLOY.md 的「数据与备份」](DEPLOY.md#数据与备份)，本节只列最短可执行步骤。
 
 ### 10.5 换机器怎么迁
 
@@ -806,7 +834,8 @@ docker compose exec db psql -U postgres -d ragdb \
 
 ```bash
 git log --oneline -5
-git checkout <上一个提交>
+# 将 YOUR_PREVIOUS_COMMIT 替换为已确认的回滚提交 ID
+git checkout YOUR_PREVIOUS_COMMIT
 docker compose up -d --build
 ```
 

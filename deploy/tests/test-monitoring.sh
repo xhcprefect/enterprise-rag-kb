@@ -37,9 +37,21 @@ chmod 0755 "$work"
     bash "$repo/deploy/monitoring/render-prometheus.sh"
 )
 case "$(uname -s)" in
-  MINGW*|MSYS*) printf 'skip: NTFS/Git Bash 不提供真实的源文件 0600 语义；Linux CI 会断言该权限\n' ;;
-  *) [[ $(stat -c '%a' "$work/source-token") == 600 ]] ;;
+  MINGW*|MSYS*|CYGWIN*) printf 'skip: NTFS/Git Bash 不提供真实的源文件 0600 语义；Linux CI 会断言该权限\n' ;;
+  *)
+    [[ $(stat -c '%a' "$work/source-token") == 600 ]]
+    chmod 0644 "$work/source-token"
+    if ENV_FILE=/dev/null OUT_DIR="$work/bad-permissions" RAGKB_METRICS_TOKEN_FILE="$work/source-token" \
+        bash "$repo/deploy/monitoring/render-prometheus.sh" >/dev/null 2>&1; then
+      printf 'Linux 上 0644 令牌源文件应被拒绝\n' >&2; exit 1
+    fi
+    chmod 0600 "$work/source-token"
+    ;;
+
 esac
+# 旧副本为 0444，重复渲染应能更新而非 Permission denied。
+ENV_FILE=/dev/null OUT_DIR="$work/rendered" RAGKB_METRICS_TOKEN_FILE="$work/source-token" \
+  bash "$repo/deploy/monitoring/render-prometheus.sh" >/dev/null
 [[ $(stat -c '%a' "$work/rendered/secrets/metrics_token") == 444 ]]
 for directory in "$work/rendered" "$work/rendered/prometheus" "$work/rendered/prometheus/rules" "$work/rendered/secrets"; do
   [[ $(stat -c '%a' "$directory") == 755 ]]
@@ -53,6 +65,15 @@ for rule in "$work/rendered/prometheus/rules/"*.yml; do
   docker run --rm --network none --user 65534:65534 "${mounts[@]}" --entrypoint promtool "$image" \
     check rules "/etc/prometheus/rules/$(basename "$rule")"
 done
+# 真实执行规则单元测试，规则文件数变化时不需要改硬编码计数。
+mkdir -p "$work/rendered/prometheus/tests"
+chmod 0755 "$work/rendered/prometheus/tests"
+for rule_test in "$repo"/deploy/monitoring/prometheus/tests/*.yml; do
+  cp "$rule_test" "$work/rendered/prometheus/tests/"
+  chmod 0644 "$work/rendered/prometheus/tests/$(basename "$rule_test")"
+  docker run --rm --network none --user 65534:65534 "${mounts[@]}" --entrypoint promtool "$image" \
+    test rules "/etc/prometheus/tests/$(basename "$rule_test")"
+done
 # 从实际监控 Compose 读取参数，避免测试命令漏掉生产中新增的无效开关。
 printf 'networks:\n  internal: {}\n' > "$work/network.yml"
 : > "$work/empty.env"
@@ -65,9 +86,11 @@ RAGKB_PROMETHEUS_SECRET_DIR="$(host_path "$work/rendered/secrets")" \
 mapfile -t prom_args < "$work/command.txt"
 # Windows Python 输出 CRLF，参数本身不带回车。
 for index in "${!prom_args[@]}"; do prom_args[$index]=${prom_args[$index]%$'\r'}; done
-container_id=$(docker run -d --user 65534:65534 --read-only --add-host backend:127.0.0.1 \
+# create 成功即登记精确 ID，start 失败也由 EXIT trap 收回本轮容器。
+container_id=$(docker create --user 65534:65534 --read-only --add-host backend:127.0.0.1 \
   --label "io.ragkb.monitoring-test.owner=$owner" --tmpfs /prometheus:rw,uid=65534,gid=65534,mode=0755 \
   --publish 127.0.0.1::9090 "${mounts[@]}" "$image" "${prom_args[@]}")
+docker start "$container_id" >/dev/null
 published=$(docker port "$container_id" 9090/tcp)
 port=${published##*:}
 port=${port//$'\r'/}

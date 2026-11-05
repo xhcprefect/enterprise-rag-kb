@@ -207,9 +207,10 @@ docker compose exec api python -m scripts.migrate_keyword_index
 ```
 data/
 ├── pgdata/      # PostgreSQL 数据目录
-├── uploads/     # 上传的原始文档
-├── logs/        # 应用日志
-└── backups/     # 备份产物
+├── uploads/     # 上传的原始文档与分片
+├── projects/    # 项目源码 blob（API 与 project worker 共用）
+├── logs/        # 应用日志（cron 日志也写这里）
+└── backups/     # 备份产物（BACKUP_DIR 可覆盖）
 ```
 
 ### 为什么这样设计
@@ -224,18 +225,47 @@ data/
 
 ```bash
 ./deploy/backup.sh
-# 2026-10-24 14:12:00 备份完成: 18K + 493B -> ./data/backups
+# 备份完成: ./data/backups/manifest-20261024-141159-12345.sha256（包含数据库、上传文件与项目存储校验值）
 ```
 
-产物：`ragdb-<时间戳>.sql.gz` + `uploads-<时间戳>.tar.gz`，默认保留 7 天。
+一次备份产出**同一时间标识（stamp）**的一组文件，stamp 形如 `20261024-141159-12345`：
 
-脚本会**实际解压并检查内容**，不会因为磁盘满而留下"看起来成功"的空备份。
+| 文件 | 内容 |
+|---|---|
+| `ragdb-<stamp>.sql.gz` | `pg_dump --clean --if-exists` 的 PostgreSQL 逻辑备份 |
+| `uploads-<stamp>.tar.gz` | `${DATA_DIR}/uploads`，归档内顶层目录为 `uploads/` |
+| `projects-<stamp>.tar.gz` | `${DATA_DIR}/projects`，归档内顶层目录为 `projects/` |
+| `manifest-<stamp>.sha256` | 上面三个文件的 SHA-256 清单，**最后发布** |
+
+**清单最后发布是有意的**：看到某个 stamp 的 `manifest-*.sha256` 就表示这一组产物已经完整生成并通过校验。
+反过来，**只有归档、没有清单的 stamp 不能当作完整的新备份来恢复**——没跑完或校验失败时，脚本会清掉这一组产物，
+但历史遗留/手工拷贝仍可能留下孤立归档。清单本身是两行（旧格式：db + uploads）或三行（新格式：db + uploads + projects）。
+
+`projects/` 不存在时（未启用项目索引的老部署），脚本会先建空目录，归档里是一个空的 `projects/`，
+清单仍是三行新格式，恢复行为一致。
+
+脚本会**实际解压并校验内容**（gzip、pg_dump 标识、归档目录范围、链接类型），不会因为磁盘满而留下"看起来成功"的空备份。
+
+其他行为：
+
+- **短暂停写**：备份前停止正在运行的写服务（`api`、`worker`，以及启用 profile 时在跑的 `worker-summary`、`worker-project`），
+  完成后**只重启原本在运行的**那些容器；原本停着的不会被顺手拉起。停写等待上限由 `.env` 的
+  `WORKER_STOP_TIMEOUT_SECONDS`（默认 180 秒）与 `API_STOP_TIMEOUT_SECONDS`（默认 30 秒）控制。
+- **维护锁**：`${DATA_DIR}/.maintenance.lock`，同时只允许一个备份/恢复任务；另一个会直接退出。
+- **保留期**：`KEEP_DAYS` 默认 7，按文件修改时间清理这四类过期产物（可用环境变量覆盖），即"至少保留最近一周"，不是"只留 7 份"。
+- **异地备份**（可选）：`RAGKB_REMOTE_BACKUP_ENABLED=true` 时，服务恢复后才调用 `deploy/remote-backup.sh` 上传；
+  失败只让脚本非零退出，本地产物保留。配置见 `.env.example`。
 
 ### 定时备份
 
 **必须配**，尤其在这类竞价实例上——机器被回收时手动备份等于没有备份。
 
+日志目录 `data/logs` 必须先存在且当前用户可写（`deploy/init.sh` 会建；若手工跳过了 init 就自己 `mkdir -p`）。
+不要写 `/var/log`：普通用户没有写权限，重定向会直接失败，而 cron 的报错只会进系统邮件（基本看不到）。
+
 ```bash
+mkdir -p "$HOME/enterprise-rag-kb/data/logs"   # 重定向目标必须可写
+
 # 一条命令装好（幂等，重复执行不会叠加）
 (crontab -l 2>/dev/null | grep -v "deploy/backup.sh"; \
  echo '20 3 * * * cd $HOME/enterprise-rag-kb && ./deploy/backup.sh >> $HOME/enterprise-rag-kb/data/logs/backup.log 2>&1') | crontab -
@@ -243,11 +273,7 @@ data/
 crontab -l                                    # 确认已装
 ```
 
-两个容易踩的坑，上面的写法已经避开：
-
-- **日志不要写 `/var/log`**：普通用户 `ubuntu` 对它没有写权限，重定向会直接失败，
-  而 cron 的报错只会进系统邮件（基本看不到）。写 `data/logs/` 下。
-- **不要写死绝对路径**：用 `$HOME` 或 `cd` 进项目目录，换机器、换用户名都不用改。
+不要写死绝对路径：用 `$HOME` 或先 `cd` 进项目目录，换机器、换用户名都不用改。
 
 装完**务必模拟 cron 的精简环境实测一次**，`cron` 能跑不代表 `crontab` 里那条能跑：
 
@@ -259,14 +285,59 @@ env -i HOME=$HOME PATH=/usr/bin:/bin SHELL=/bin/sh \
 
 `cron` 不继承登录 shell 的 PATH / 环境变量，是这类任务最常见的静默失败原因。
 
+**确认任务真的在跑**（只看有没有报错不够，要看有没有新产物）：
+
+```bash
+tail -n 20 data/logs/backup.log
+ls -lt data/backups | head          # 最近一组时间戳应该是今天 03:20 之后
+```
+
+因为备份会短暂停写，**不要和其他维护操作（升级、恢复）排在同一个时间段**；维护锁会让后启动的那个直接失败。
+
 ### 恢复
 
 ```bash
-./deploy/restore.sh data/backups/ragdb-20261024-141159.sql.gz \
-                    data/backups/uploads-20261024-141159.tar.gz
+./deploy/restore.sh data/backups/ragdb-20261024-141159-12345.sql.gz \
+                    data/backups/uploads-20261024-141159-12345.tar.gz \
+                    data/backups/projects-20261024-141159-12345.tar.gz
 ```
 
-会先停 api/worker 再覆盖数据，有二次确认。
+- 参数是 1–3 个：`<ragdb-*.sql.gz> [uploads-*.tar.gz] [projects-*.tar.gz]`，按顺序即可。
+- **同一 stamp、同一目录**：三个归档必须来自同一次备份，且放在同一目录；stamp 或目录不一致会直接拒绝。
+- 清单里的 projects 项声明了项目存储时，第三个参数可以省略，脚本会在同目录自动找 `projects-<stamp>.tar.gz`；
+  找不到就报错，不会静默跳过。
+- **旧备份兼容**：只有 `ragdb` + `uploads`（两参数、无清单或两行清单）仍可恢复。
+  这种情况下**现有 `projects/` 目录保持不变**，脚本会明确提示"本次不恢复项目存储"；
+  不要在恢复旧备份后又手工删 `projects/`，否则项目来源内容会丢失。
+- 只传数据库（一个参数）也能恢复，但脚本会警告源文件可能与数据库不匹配。
+- 流程：先校验（gzip、pg_dump 标识、归档目录范围与链接类型、配对与清单 SHA-256），再解压到暂存目录；
+  随后停写、交换目录、SQL 以 `--single-transaction -v ON_ERROR_STOP=1` 执行；失败时回滚数据库并还原被替换的目录。
+  恢复结束只重启**原本在运行的**写服务。执行中有 `yes` 二次确认。
+
+> 恢复会覆盖线上数据，且停机时间取决于数据库大小。日常验证恢复能力请用下面的隔离演练，
+> **不要拿业务库或生产 `DATA_DIR` 试手**。
+
+### 恢复演练（隔离，不影响生产）
+
+`deploy/tests/restore-drill.sh` 在独立的临时 Compose 项目里做**真实**的 pg_dump + psql 恢复，
+再核对行内容与上传文件 SHA-256，不接触生产 `DATA_DIR`、不停生产服务、不写任何远端。
+它使用自带的 `deploy/tests/drill-compose.yml`（只含一个隔离 PostgreSQL）和自己的临时 env，
+**不加载仓库根的 `docker-compose.yml`**（后者带 `env_file: backend/.env`）。
+
+```bash
+./deploy/tests/restore-drill.sh                 # 默认 dry-run：只打印计划，不创建任何资源
+./deploy/tests/restore-drill.sh --isolated      # 真实执行，结束后清理
+./deploy/tests/restore-drill.sh --isolated --keep   # 保留现场排查
+```
+
+安全边界（脚本内已校验，不要绕过）：
+
+- 每次生成唯一 owner（`drill-<时间戳>-<pid>-<随机>`）和项目名前缀 `ragkb-drill-`；
+  清理前逐项核对资源标签，任何不一致就停手并保留现场，**不使用 `compose down -v`** 按项目名批量删除。
+- 临时目录必须在仓库外且名字含 owner；端口默认 `127.0.0.1:55999`（可用 `DRILL_PG_PORT` 改）。
+- 只写测试库、测试上传文件；**不要指向真实数据库或生产上传目录**。
+
+这是"验证备份能恢复"的日常手段；真实业务恢复仍走上面的 `restore.sh`，两者不要混用。
 
 ## 日常运维
 
@@ -352,7 +423,8 @@ ls -d data/pgdata
 ### 回滚
 
 ```bash
-git checkout <上一个提交>
+# 将 YOUR_PREVIOUS_COMMIT 替换为已确认的回滚提交 ID
+git checkout YOUR_PREVIOUS_COMMIT
 docker compose build && docker compose up -d
 ```
 
@@ -488,16 +560,196 @@ docker compose exec api python -c \
   > /tmp/openapi.json
 ```
 
+## 可选监控与通知
+
+默认部署不启动监控与通知。启用 Prometheus 采集、可选 Alertmanager 通用 webhook、更新配置和恢复仅采集的完整命令，统一见 [监控与告警说明](deploy/monitoring/README.md)。通知接收地址从仓库外的 secret 文件读取；飞书、钉钉、企业微信机器人需要协议适配器。
+
+审计写入失败仍不影响已提交的业务流程，同时会增加无标签的 `ragkb_audit_write_failures_total` 并记录脱敏异常类型。管理员摘要的 `data.audit.write_failures` 与指标同源，数据库查询降级时仍可查看；这些计数属于当前 API 进程，重启会清零。默认规则包含新增失败和持续失败告警，只有部署方显式开启通知链路后才会投递。
+
 ## HTTPS
 
-当前按 HTTP 部署，`frontend/nginx.conf` 里已留好注释块。拿到域名后：
+HTTP 是默认形态；HTTPS 是一个**Compose 覆盖文件**，不需要改 `frontend/nginx.conf`，也不需要重新构建镜像。
+覆盖层 `docker-compose.https.yml` 会把 `/etc/nginx/conf.d/app.conf` 换成仓库里的 `frontend/nginx/tls.conf`：
 
-1. 域名 A 记录指向服务器 IP，放行 80/443
-2. 用 certbot 签发证书（webroot 模式）
-3. 取消 `nginx.conf` 里 HTTPS 段的注释，填上域名和证书路径
-4. `docker compose build web && docker compose up -d web`
+- 80 端口只做 ACME 校验（`/.well-known/acme-challenge/`）和 `301` 跳转到 `https://<RAGKB_SERVER_NAME>`；
+  跳转目标是固定的 `RAGKB_SERVER_NAME`，**不反射请求里的 `Host`**。
+- 443 端口承载站点，沿用 HTTP 模式同一批 `frontend/nginx/snippets/`（`/api` 代理、SSE 不缓冲、上传大小、`/docs` 404 语义完全一致）。
+- 容器启动时先跑 `frontend/nginx/entrypoint/40-render-ragkb.sh`：校验域名与证书/私钥文件、渲染
+  `server_name` / 301 目标 / HSTS 片段，然后执行 `nginx -t`。任何一项不合法**容器直接启动失败**，不会带着半截配置对外服务。
 
-同时把 `backend/.env` 的 `CORS_ORIGINS` 改成 `https://你的域名`。
+### 前置条件
+
+1. 域名 A 记录指向服务器 IP；安全组放行 80 与 443（`WEB_PORT` / `WEB_TLS_PORT` 若改过则放行对应端口）。
+2. 证书由可信 CA 签发，**放在仓库之外的目录**，目录内含 `fullchain.pem` 与 `privkey.pem`。
+   **不要把证书或私钥复制进仓库**，也不要提交进 git。
+3. 中国大陆地域用域名访问 80 端口需要 ICP 备案。
+
+### 首次签发证书
+
+**先有证书，HTTPS 覆盖才能启动**——入口脚本会校验证书文件，缺失就直接启动失败。
+默认 HTTP 配置里**没有** `/.well-known/acme-challenge/` 的 location，基础 compose 也没有挂载 ACME webroot，
+所以**不能**在 HTTPS 尚未启动时用 `certbot --webroot` 对本项目站点做首次签发。
+按现有条件任选一种：
+
+**方式 A：已有证书（最简单）**——从 CA 控制台或其他服务器拿到证书，直接把**目录**挂给容器：
+
+```bash
+sudo install -d -m 755 /srv/ragkb-certs
+# 把 fullchain.pem（含中间证书）与 privkey.pem 放进该目录；私钥建议 0600、属主为运行 compose 的用户
+sudo chmod 600 /srv/ragkb-certs/privkey.pem
+# RAGKB_TLS_CERT_DIR=/srv/ragkb-certs
+```
+
+**方式 B：用 certbot standalone 首次签发**——standalone 需要自己绑定 80，而 80 被 web 容器占用，
+所以必须短暂停掉 web。先装包（`apt` 在停站之前完成），再把"停站 → 签发 → 恢复"放进一个子 shell，
+用 `trap ... EXIT` 保证**任何中途失败或 Ctrl-C** 都会把 HTTP 站点拉回来：
+
+```bash
+sudo apt-get install -y certbot          # 先装好，不要在停站窗口里跑 apt
+
+( set -eu
+  trap 'docker compose start web' EXIT   # 成功、失败、中断都恢复 HTTP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  docker compose stop web                # 基础配置停站；db/api/worker 不受影响
+  docker compose ps                      # 确认 web 已退出
+  sudo certbot certonly --standalone -d kb.example.com
+)
+docker compose ps                        # 确认 web 已恢复与运行
+
+# 证书取出到仓库外目录（live/ 下是软链接，用 -L 解引用拷出实际文件）
+sudo install -d -m 755 /srv/ragkb-certs
+sudo cp -L /etc/letsencrypt/live/kb.example.com/fullchain.pem /srv/ragkb-certs/
+sudo cp -L /etc/letsencrypt/live/kb.example.com/privkey.pem   /srv/ragkb-certs/
+sudo chmod 600 /srv/ragkb-certs/privkey.pem
+```
+
+子 shell 开了 `set -eu`：签发失败立即退出并触发 EXIT 恢复；INT/TERM 先 `exit 130/143`，
+同样会走 EXIT 把 web 拉回来。拷贝证书在恢复之后进行，出问题也不会让站点停着。
+（`certbot` 报 80 被占用，基本就是 `docker compose stop web` 没执行或执行失败。）
+若签发成功但之后想改用 webroot 续期，见下文「证书续期」的 `reconfigure`。
+
+配置好根 `.env` 后按下一节启动 HTTPS。此后再续期改用 webroot（见「证书续期」），
+不需要再停站点。
+
+### 配置（根 `.env`）
+
+```bash
+RAGKB_SERVER_NAME=kb.example.com          # 必填；必须是已解析到本机的小写 DNS 域名，不接受 IP/通配符
+RAGKB_TLS_CERT_DIR=/srv/ragkb-certs       # 必填；宿主机绝对路径，仓库外，只读挂载到 /etc/nginx/certs
+# 可选：RAGKB_HSTS_MAX_AGE=31536000       # 首次上线建议先用 300，确认无误再调大
+# 可选：RAGKB_ACME_WEBROOT=./data/acme    # certbot --webroot 目录，只读挂到 /var/www/certbot
+# 可选：WEB_TLS_PORT=443
+```
+
+`RAGKB_SERVER_NAME` 和 `RAGKB_TLS_CERT_DIR` 是**必填**：缺任一项 compose 直接报错（`${VAR:?}`），
+不会退回到默认路径。`RAGKB_TLS_MODE`、`RAGKB_TLS_CERT`、`RAGKB_TLS_KEY` 由覆盖文件写入，
+不需要在根 `.env` 里重复设置；`RAGKB_TLS_CERT` / `RAGKB_TLS_KEY` 是**容器内**路径
+（`/etc/nginx/certs/fullchain.pem` / `privkey.pem`），与挂载目录对应。
+
+同时把 `backend/.env` 的 `CORS_ORIGINS` 改成 `https://kb.example.com`（若前端同源访问，可保留默认）。
+
+### 启动
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.https.yml ps
+docker compose -f docker-compose.yml -f docker-compose.https.yml logs web | tail -20   # 应看到 nginx -t 通过
+```
+
+后续每次都要带 `-f docker-compose.https.yml`，否则会退回 HTTP 配置（80 端口正常、443 不监听）。
+
+### 证书续期
+
+前提：HTTPS 覆盖已经启动（80 端口由容器提供 ACME 校验，此后续期都不需要停站）。
+
+证书目录是宿主机上的**普通目录**，容器只读挂载。`certbot renew` 只更新 `/etc/letsencrypt`，
+**不会**自动更新 `RAGKB_TLS_CERT_DIR` 的副本，所以要用 hook 把"续期 → 同步副本 → 重启容器"串起来。
+
+**1）把续期方式切成 webroot（仅 standalone 首次签发的需要做一次）**
+
+Certbot ≥ 2.3 用 `reconfigure`：会先做 staging 校验，成功后才把 webroot 认证器**持久化**到续期配置里。
+不要用 `certonly --webroot` 代替——对刚签发且未到期的证书，它可能不保存新的 authenticator，
+之后的 `renew` 仍走 standalone 并因 80 被占用失败。
+
+```bash
+certbot --version                        # 必须 >= 2.3
+sudo certbot reconfigure --cert-name kb.example.com \
+  --webroot -w "$HOME/enterprise-rag-kb/data/acme"
+```
+
+webroot 续期依赖两件事，缺一不可：HTTPS 覆盖的 80 端口 server 提供 `/.well-known/acme-challenge/`
+（`tls.conf` 已 include `snippets/acme.conf`），且 certbot 的 `-w` 与 `RAGKB_ACME_WEBROOT`
+（默认 `./data/acme`，只读挂到 `/var/www/certbot`）指向同一宿主机目录。
+
+**2）注册续期 hook：同步副本并重启**
+
+把脚本放进 `/etc/letsencrypt/renewal-hooks/deploy/`（可执行即可）。该目录下的 hook
+由 certbot 在**每次真正续期成功后**自动执行，不需要改 renewal 配置，也不需要另写 cron。
+脚本用 `RENEWED_LINEAGE` 精确限定本域名，避免以后加别的证书时误重启本项目：
+
+```bash
+sudo install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/ragkb-tls-deploy.sh >/dev/null <<'EOF'
+#!/bin/sh
+# 仅在 kb.example.com 这条 lineage 续期成功后执行；RENEWED_LINEAGE 由 certbot 注入。
+set -eu
+[ "${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/kb.example.com" ] || exit 0
+
+install -d -m 755 /srv/ragkb-certs
+cp -L /etc/letsencrypt/live/kb.example.com/fullchain.pem /srv/ragkb-certs/
+cp -L /etc/letsencrypt/live/kb.example.com/privkey.pem   /srv/ragkb-certs/
+chmod 600 /srv/ragkb-certs/privkey.pem
+
+cd /home/ubuntu/enterprise-rag-kb
+docker compose -f docker-compose.yml -f docker-compose.https.yml restart web
+EOF
+sudo chmod 700 /etc/letsencrypt/renewal-hooks/deploy/ragkb-tls-deploy.sh
+```
+
+脚本以 root 运行，需能访问 docker（该用户是否在 `docker` 组、或改为 `sudo -u ubuntu docker compose ...`）。
+项目路径按实际修改。
+
+**3）演练与检查**
+
+`--dry-run` **默认不执行** deploy hook；要连同同步+重启一起演练，加 `--run-deploy-hooks`
+（此时 `RENEWED_LINEAGE` 指向当前有效证书，同步与重启都会真实发生）：
+
+```bash
+sudo certbot renew --cert-name kb.example.com --dry-run --run-deploy-hooks
+sudo certbot certificates                # 看当前有效期
+```
+
+`renew` 只在到期前约 30 天真正续期，未续期时输出 `No renewals were attempted`，hook 不执行，这是正常的。
+后续续期由 certbot 包自带的 systemd timer（`systemctl list-timers | grep certbot`）驱动，无需另配 cron。
+
+**另一种做法**：直接把 certbot 的 live 目录挂进去，避免拷贝——但 `live/` 下全是指向 `archive/` 的软链接，
+只挂 `live` 会导致容器里软链接悬空，必须同时挂载 `archive/`（且容器内路径与软链接目标一致），
+容易出错，本文档不做推荐。若采用，仍需在续期后 `restart web`。
+
+### 哪些改动需要 restart、哪些需要重建
+
+`40-render-ragkb.sh` 只在**容器启动**时读取证书与变量并渲染配置；`nginx` 不会自己重新加载证书。
+
+| 场景 | 命令 | 原因 |
+|---|---|---|
+| 证书/私钥副本已更新（hook 会自动做；手工替换时同理） | `... restart web` | 入口脚本重跑、重新读取证书；副本必须**先**更新 |
+| 改了 `RAGKB_SERVER_NAME` / `RAGKB_HSTS_MAX_AGE` / 挂载目录等 Compose 变量 | `... up -d web` | 环境变量变了要重建容器；compose 发现配置变化会自动重建 |
+| 改了 `frontend/nginx/tls.conf` 或 `snippets/*.conf` | `restart web` | 这两处是**只读挂载**，改仓库文件后 restart 即可，不需要 rebuild |
+
+反例：`nginx -s reload`（在容器里直接发信号）不会重跑入口脚本，也不会重新校验域名/证书；不建议使用。
+单独 `restart web` **不会**让 certbot 的新证书出现在 `/srv/ragkb-certs`——副本没更新时重启只是重读旧证书。
+注意 `restart` 会造成几秒的连接中断，安排在低峰期。
+
+### 验收
+
+```bash
+curl -I http://kb.example.com            # 301，Location 指向 https://kb.example.com/...
+curl -sS https://kb.example.com/health   # {"status":"ok","worker":"idle"}
+curl -sSI https://kb.example.com | grep -i strict-transport-security
+```
+
+证书链有问题时先看 `docker compose ... logs web`：入口脚本会明确报"证书文件不存在/不含 PEM 证书"等错误。
 
 ## 安全清单
 

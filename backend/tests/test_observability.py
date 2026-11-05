@@ -188,6 +188,45 @@ class ChatObservationTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+class AuditFailureMetricTests(unittest.TestCase):
+    """审计失败计数：无标签、初始为 0、reset/snapshot/render 契约一致。"""
+
+    def setUp(self):
+        metrics.reset()
+
+    def tearDown(self):
+        metrics.reset()
+
+    def test_initial_zero_and_snapshot_shape(self):
+        self.assertEqual(metrics.snapshot()["audit"], {"write_failures": 0})
+        text = metrics.render()
+        self.assertIn("# TYPE ragkb_audit_write_failures_total counter", text)
+        self.assertIn("ragkb_audit_write_failures_total 0", text)
+
+    def test_increment_and_reset(self):
+        for _ in range(4):
+            metrics.audit_write_failed()
+        self.assertEqual(metrics.snapshot()["audit"]["write_failures"], 4)
+        metrics.reset()
+        self.assertEqual(metrics.snapshot()["audit"]["write_failures"], 0)
+
+    def test_render_has_exactly_one_unlabeled_series(self):
+        metrics.audit_write_failed()
+        series = [
+            line for line in metrics.render().splitlines()
+            if line.startswith("ragkb_audit_write_failures_total")
+        ]
+        self.assertEqual(series, ["ragkb_audit_write_failures_total 1"])
+        self.assertNotIn("{", series[0])
+
+    def test_metric_is_isolated_from_chat_and_http_state(self):
+        metrics.audit_write_failed()
+        start_chat("rag").finish("completed", first_token_ms=1, total_ms=2)
+        metrics.reset()
+        # reset 必须同时覆盖审计计数，不能因其它指标残留而“看起来有失败”。
+        self.assertEqual(metrics.snapshot()["audit"]["write_failures"], 0)
+
+
 class NormalizationTests(unittest.TestCase):
     def test_route_templates_only(self):
         cases = {

@@ -47,12 +47,55 @@
 
 ## 数据集身份与基线比较
 
-每份报告新增 `identity`：
+每份报告包含 schema 2 的 `identity`，指标口径为 `metrics_version=1`：
 
-- `dataset.sha256`：按 case id 排序后对问题、断言和 `document_ids` 的规范 JSON 取摘要；`dataset.case_count` 为用例数。
-- `dataset.documents.sha256`：对问题集实际引用、且存在于 `documents/` 下的公开文档字节取摘要（`files`、`missing` 为计数）。不会写入文件名或正文。
-- `config`：仅 `mode`、`model`、`embedding_model`、`chunk_size`、`chunk_overlap`、`retrieval_top_k`、`retrieval_rewrite`，可来自 `--config-file`；含未知键（如 `token`、`base_url`）直接拒绝，值含 URL 或账号信息也拒绝。
-- `metrics_version`：指标口径版本；口径变化会递增并让旧基线不可比。
+- `dataset.sha256`：按 case id 排序后对问题、断言和 `document_ids` 等规范 JSON 取摘要；`dataset.case_count` 为用例数。`reviewed`、`stratum`、`verified_by`、`verified_at`、`unknowns` 是核验元数据，不改变数据集摘要。
+- `dataset.documents`：`--documents-dir` 声明的完整本地语料树；未指定时使用问题集同级的 `documents/`，不存在则标记 `kind=none`、摘要为 null。完整快照标为 `kind=declared-local-snapshot`，摘要覆盖所有普通文件的相对路径和内容，包含未被 `expected_sources` 点名的干扰资料与子目录，排除 `.git` 目录。报告只保留计数和摘要。
+- `dataset.index_manifest`：可选的索引清单指纹，由 `--index-manifest` 提供，格式见下文。只在两侧都声明时比较，单侧声明或内容变化判为不可比。
+- `config`：仅接受白名单内的公开模型和检索参数，未知键（如 `token`、`base_url`）直接拒绝；模型名称含 URL 或账号信息也拒绝。CLI 根据 `--responses` / `--live` 写入 `mode`，不从配置文件读取模式。
+- `metrics_version`：指标口径版本；变化后旧基线不可比。旧身份 schema 也保持不可比，不隐式升级。
+
+语料最多 5000 个普通文件、合计 1 GiB；每个文件按 1 MiB 分块读取并计算 SHA-256。根目录、子目录或文件为符号链接，或目录无法完整读取时，拒绝生成身份。显式指定的目录不存在也返回配置错误。
+
+本地快照与索引清单都是调用者声明，不能证明远端服务实际使用了相同语料或索引；运行前须核对真实知识库内容和入库状态。工具不读取实际 `.env`、数据库或远端配置来补全身份。
+
+### 公开配置身份
+
+从 [公开配置样例](config.live.example.json) 复制到受控目录，替换示例模型名称，并填写实际部署参数。该文件不是当前服务配置的自动导出。
+
+| 字段 | 真实评测比较要求 |
+| --- | --- |
+| `model`、`embedding_model` | 必填，公开模型名称 |
+| `chunk_size`、`chunk_overlap` | 必填，整数，`0 <= chunk_overlap < chunk_size` |
+| `retrieval_top_k` | 必填，1–20 |
+| `retrieval_rewrite` | 必填，`on` / `off` |
+| `hybrid_retrieval_enabled`、`rerank_enabled` | 必填，`on` / `off` |
+| `retrieval_min_similarity` | 必填，0–1 的有限数字 |
+| `retrieval_neighbor_chunks` | 必填，0–2 |
+| `retrieval_max_per_doc` | 必填，1–20 |
+| `keyword_candidates` | 混合检索开启时必填，1–200 |
+| `rerank_model`、`rerank_max_chars` | 重排开启时必填；截断长度为 128–8000 |
+
+开关只接受字符串 `on` / `off`。关闭时不要求或比较相应条件参数；开启时两侧都缺少参数也不能视为一致。缺键与显式 null 均不能构成充分身份；导入报告中两侧 `mode` 都缺失/null 也判为不可比。离线回放不经过模型和检索，不强制声明这些参数，但已经声明的可比参数仍须一致。
+
+### 可选索引清单
+
+`--index-manifest` 只接受含 `documents` 数组的 JSON 对象，根数组不接受，例如：
+
+```json
+{
+  "documents": [
+    {
+      "document_id": "00000000-0000-4000-8000-000000000001",
+      "index_version": 1,
+      "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "chunk_count": 12
+    }
+  ]
+}
+```
+
+以上仅演示格式。`document_id` 必须唯一、为 1–128 字符字符串；`index_version` 为非负整数；`content_sha256` 为 64 位小写十六进制；可选 `chunk_count` 为非负整数。顶层仅允许 `documents`，条目仅允许上述四个字段，额外正文、路径或凭据字段直接拒绝。报告只保留格式版本、数量和摘要，不输出文档 ID 原值。
 
 比较使用 `--baseline`（另可用 `--comparison-output` 单独导出比较结果）：
 
@@ -73,7 +116,7 @@
 .\.venv\Scripts\python.exe -m scripts.evaluate_rag --dataset evaluation/cases.example.jsonl --responses evaluation/responses.example.jsonl --output evaluation-results/other.json --baseline evaluation/baseline.platform.example.json
 ```
 
-旧报告没有 `identity` 时比较结论固定为 `incomparable`（退出码 4），不会崩溃，也不会说成“无退步”。
+旧报告没有 `identity`，或仍使用 schema 1 时，保持可读但比较结论固定为 `incomparable`（退出码 4），不会说成“无退步”。应以相同问题集、完整语料快照和公开配置重新生成基线。
 
 基线输入按 fail-closed 校验：`results` 必须是列表且与 `cases` 计数一致，`passed` 与各指标必须是有限的非负数（含超出 float 范围的超大整数，不会被当作有效数字），`*_samples` 必须是 0–cases 且样本为 0 时不得带指标值，`identity` 的摘要必须是 SHA-256、`case_count` 必须与 cases 一致。`identity.config` 的每个可比字段还会按写入时同样的规则校验类型与取值（如 `mode` 必须是 `offline`/`live`，`chunk_overlap < chunk_size`），不会把列表/对象当字典键。任一不符返回退出码 2，不会把字符串/对象拿去做减法而抛栈。两侧都缺 `dataset.sha256` 时不会因 `None == None` 判成同一数据集，而是 `dataset_identity_missing`。
 
@@ -121,7 +164,7 @@
 
 真实模式串行执行，默认最多 20 个 case，不自动上传、删除、重建任何文档，不自动重试模型调用。它会创建会话并产生模型费用。远程 HTTP 明文传输令牌需要额外的 `--allow-insecure-http`，优先使用 HTTPS。脚本的 `--timeout` 是 HTTP 读写超时。
 
-`--live` 必须显式指定，任何离线流程都不会自动回落到真实调用。真实基线比较时建议用 `--config-file` 声明 `model`、`embedding_model`、`chunk_size`、`chunk_overlap`、`retrieval_top_k`、`retrieval_rewrite`；缺少这些身份会被判为 `incomparable`，因为换模型后“无退步”没有意义。费用按实际 token 用量估算，缺用量时保持 null。
+`--live` 必须显式指定，任何离线流程都不会自动回落到真实调用。真实基线比较应使用 `--config-file` 声明上表全部必填项及启用开关所需的条件参数，并用 `--documents-dir` 指向本轮完整本地快照；缺少关键身份会判为 `incomparable`。按需提供 `--index-manifest`，两轮必须使用同一声明方式。配置身份只作记录与比较，不会修改服务端的模型、检索参数或索引状态。费用按实际 token 用量估算，缺用量时保持 null。
 
 ### 扩展合成问题集（`cases.platform.example.jsonl`）
 
@@ -194,12 +237,15 @@
 
 ## 真实业务问题与人工核验
 
-`templates/business-questions.template.jsonl` 与 `templates/README.md` 给出真实业务问题的字段模板和人工核验流程：人工正确性、引用支持性、业务分层、可回答率与拒答正确率。该目录只有模板，不含真实资料。
+[字段模板](templates/business-questions.template.jsonl) 与 [人工核验指南](templates/README.md) 给出真实业务问题的标注流程。该目录只有模板，不含真实资料；原始模板可通过默认结构校验，但不能通过严格核验。
 
-- 现有合成样例**不能**用来宣称真实业务准确率、可回答率或拒答率。
-- 业务分层结果必须同时给出样本量与未核验数量；未核验样本不计入正确率。
-- 增减业务样本会改变数据集身份，比较会判为 `incomparable`，需要重建基线。
-- 含个人信息或密钥的样本不得提交，报告默认不导出问题、答案和引用正文；确需人工核验时显式加 `--include-content` 并自行保护报告。
+为私有业务问题集添加 `--require-reviewed`。它在创建 HTTP 客户端之前拒绝缺少有效 `verified_by` / `verified_at`、显式 `reviewed: false`、仍有 `unknowns`，或含明确模板标记的样本。合法的普通技术文本，如 `str.replace` 或 `TODO`，不会仅因这些词被当成模板。`unknowns` 是正式输入字段，保留未解决问题即可；问题解决后设为空列表，不必删除该字段。
+
+- 每个 case 记录 `stratum` 与 `review_state`。报告增加 `reviewed_cases` / `unreviewed_cases`、各层样本数和固定断言通过率、`review_complete` / `review_incomplete` 及失败原因。
+- 分层与核验元数据不影响数据集身份；修改问题、断言、范围或增减业务样本会改变身份，需要重建基线。
+- 核验元数据齐全只描述问题集的标注状态，固定断言通过不等于模型答案已获人工确认。人工事实正确率、引用支持性、资料可回答率与拒答正确率应按指南另行统计，均须给出样本量和未核验数量。
+- 默认报告不输出核验人原值、问题、答案或引用正文。使用脱敏 case ID 和登记的分层代号；需要正文复核时显式加 `--include-content` 并将产物保存在受控目录。
+- 现有合成样例只验证工具行为，不能用来宣称真实业务质量。
 
 ## 结果脱敏
 

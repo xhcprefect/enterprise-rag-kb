@@ -2,9 +2,11 @@
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import uuid
+from datetime import date
 from pathlib import Path
 
 
@@ -14,7 +16,26 @@ class EvaluationError(ValueError):
 
 # 指标定义或口径变化时必须递增；比较双方不同则拒绝给出退步结论。
 METRICS_VERSION = 1
-IDENTITY_SCHEMA = 1
+# v2：检索开关/重排参数进入身份，本地语料快照覆盖整棵目录，新增分层与核验计数。
+# 旧报告保持可读，但 schema 不同直接判不可比，不做隐式升级。
+IDENTITY_SCHEMA = 2
+
+# 只允许稳定的分层代号；未知值直接拒绝，错误信息不回显原值。
+# 前五项对应 templates/README.md 的抽样指南，后几项保留部门/合成样例分层。
+CASE_STRATA = ("fact", "cross_doc", "process_sla", "access_compliance", "unanswerable",
+               "platform", "hr", "finance", "operations", "security", "compliance", "unclassified")
+STRATUM_UNCLASSIFIED = "unclassified"
+# 人工核验元数据只允许代号与日期；不接收姓名、邮箱等可识别信息。
+_VERIFIED_BY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_VERIFIED_AT_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+# 严格业务模式只拦截模板留下的完整标记，避免把“str.replace 如何用”这类
+# 已核验的技术问题当成占位符。
+_PLACEHOLDER_RE = re.compile(r"REPLACE-[A-Za-z0-9_-]+|在此粘贴|（[^）]*(?:请填写|待填写|真实文档名)[^）]*）|TODO[:：]")
+# 仅用于聚合口径，不参与数据集身份：标注或分层变化不应让基线失去可比性。
+_REVIEW_METADATA_FIELDS = ("verified_by", "verified_at", "unknowns", "stratum", "reviewed")
+_INDEX_MANIFEST_FORMAT = "rag-eval-index-manifest/v1"
+_CORPUS_MAX_FILES = 5000
+_CORPUS_MAX_BYTES = 1024 * 1024 * 1024
 
 # 方向只由指标本身决定，调用方不能把“越高越好”的指标改成越低越好。
 METRIC_DIRECTIONS = {
@@ -64,6 +85,74 @@ def read_jsonl(path):
             if len(rows) > 10000:
                 raise EvaluationError("评测输入超过 10000 条")
     return rows
+
+
+def _validate_review_metadata(case):
+    """核验元数据只接受代号与日期；错误信息不回显任何私有值。"""
+    stratum = case.get("stratum")
+    if stratum is not None and stratum not in CASE_STRATA:
+        raise EvaluationError("stratum 必须是已登记的分层代号")
+    verified_by = case.get("verified_by")
+    if verified_by is not None and (not isinstance(verified_by, str) or not _VERIFIED_BY_RE.fullmatch(verified_by)):
+        raise EvaluationError("verified_by 必须是 1–64 位不含空白的核验人代号")
+    verified_at = case.get("verified_at")
+    if verified_at is not None:
+        match = _VERIFIED_AT_RE.fullmatch(verified_at) if isinstance(verified_at, str) else None
+        if match is None:
+            raise EvaluationError("verified_at 必须是 YYYY-MM-DD")
+        try:
+            date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError as exc:
+            raise EvaluationError("verified_at 不是有效日期") from exc
+    unknowns = case.get("unknowns")
+    if unknowns is not None:
+        if not isinstance(unknowns, list) or len(unknowns) > 50 \
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 500 for item in unknowns):
+            raise EvaluationError("unknowns 必须是不超过 50 条的非空字符串列表")
+    if case.get("reviewed") is not None and type(case.get("reviewed")) is not bool:
+        raise EvaluationError("reviewed 必须是布尔值")
+
+
+def review_state(case):
+    """只描述核验元数据是否齐全，不据此推导语义准确率。
+
+    显式 reviewed=false 表示作者声明未核验，即使残留核验人/日期也不算已核验。
+    """
+    if case.get("reviewed") is False:
+        return "unreviewed"
+    if not (case.get("verified_by") and case.get("verified_at")):
+        return "unreviewed"
+    return "complete" if not case.get("unknowns") else "incomplete"
+
+
+def case_stratum(case):
+    return case.get("stratum") or STRATUM_UNCLASSIFIED
+
+
+def _contains_placeholder(case):
+    """扫描正文与核验元数据两处；核验字段残留模板同样不算完成核验。"""
+    values = [case.get("id"), case.get("question"), *case.get("turns", []), case.get("verified_by")]
+    values.extend(source.get("filename") for source in case.get("expected_sources", []) if isinstance(source, dict))
+    values.extend(case.get("required_phrases", []))
+    values.extend(case.get("forbidden_phrases", []))
+    values.extend(case.get("unknowns", []) if isinstance(case.get("unknowns"), list) else [])
+    return any(isinstance(value, str) and _PLACEHOLDER_RE.search(value) for value in values)
+
+
+def require_reviewed_cases(cases):
+    """严格业务模式：未完成核验或仍含模板占位符的用例一律拒绝。
+
+    报错只带序号和稳定原因码，不回显工单号、问题或答案正文。
+    """
+    problems = []
+    for index, case in enumerate(cases, 1):
+        if _contains_placeholder(case):
+            problems.append(f"placeholder_case:{index}")
+        elif review_state(case) != "complete":
+            problems.append(f"review_incomplete_case:{index}")
+    if problems:
+        raise EvaluationError("严格业务模式拒绝未完成人工核验的用例: " + ", ".join(problems))
+    return cases
 
 
 def validate_cases(cases):
@@ -123,6 +212,7 @@ def validate_cases(cases):
                     uuid.UUID(str(value))
                 except (ValueError, TypeError, AttributeError) as exc:
                     raise EvaluationError("document_ids 必须为 UUID") from exc
+        _validate_review_metadata(case)
     return cases
 
 
@@ -241,6 +331,7 @@ def grade_case(case, response, *, input_price=None, output_price=None, include_c
     else:
         usage = None
     result = {"id": case["id"], "passed": not failures, "failures": list(dict.fromkeys(failures)),
+              "stratum": case_stratum(case), "review_state": review_state(case),
               "expected_outcome": case.get("expected_outcome"), "outcome": outcome,
               "candidate_source_recall": candidate_recall, "supplied_source_recall": supplied_recall,
               "citation_source_recall": citation_recall,
@@ -275,6 +366,37 @@ def _percentile(values, ratio):
     return data[lower] + (data[upper] - data[lower]) * weight
 
 
+def _failure_reasons(results):
+    """按稳定原因码聚合失败次数；不回显正文。"""
+    counts = {}
+    for row in results:
+        for reason in row.get("failures", []):
+            counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def stratum_summary(results):
+    """按 stratum 聚合 n / 断言 / 核验计数；核验元数据不等于语义准确率。"""
+    groups = {}
+    for row in results:
+        stratum = row.get("stratum") or STRATUM_UNCLASSIFIED
+        group = groups.setdefault(stratum, {"cases": 0, "passed": 0, "assertion_pass_rate": None,
+                                            "reviewed": 0, "unreviewed": 0,
+                                            "review_complete": 0, "review_incomplete": 0})
+        group["cases"] += 1
+        group["passed"] += 1 if row.get("passed") else 0
+        group["reviewed" if row.get("review_state") in ("complete", "incomplete") else "unreviewed"] += 1
+        if row.get("review_state") == "complete":
+            group["review_complete"] += 1
+        elif row.get("review_state") == "incomplete":
+            group["review_incomplete"] += 1
+    for name, group in groups.items():
+        group["assertion_pass_rate"] = group["passed"] / group["cases"] if group["cases"] else None
+        group["failure_reasons"] = _failure_reasons(
+            row for row in results if (row.get("stratum") or STRATUM_UNCLASSIFIED) == name)
+    return dict(sorted(groups.items()))
+
+
 def make_report(results, run_id=None, identity=None):
     def values(key):
         return [row[key] for row in results if row.get(key) is not None]
@@ -296,8 +418,13 @@ def make_report(results, run_id=None, identity=None):
             "total_ms_p50": _percentile(totals, 0.50), "total_ms_p95": _percentile(totals, 0.95),
             "first_token_ms_samples": len(first_tokens), "total_ms_samples": len(totals),
             "generation_cost_samples": len(costs),
+            "reviewed_cases": sum(1 for row in results if row.get("review_state") in ("complete", "incomplete")),
+            "unreviewed_cases": sum(1 for row in results if row.get("review_state") not in ("complete", "incomplete")),
+            "strata": stratum_summary(results),
+            "failure_reasons": _failure_reasons(results),
             "notes": ["固定断言和来源匹配不是语义事实正确率。", "费用只包含已返回实际用量的回答生成，不包含追问补全、向量化和重排。", "首字延迟针对最后一轮；总耗时包含 case 的所有准备轮次。",
-                      "p50/p95 只使用实际返回的样本；样本数为 0 时保持 null，不补 0。"], "results": results}
+                      "p50/p95 只使用实际返回的样本；样本数为 0 时保持 null，不补 0。",
+                      "reviewed_cases 只表示核验元数据齐全，不代表语义准确率。"], "results": results}
     if identity is not None:
         report["identity"] = identity
     return report
@@ -324,39 +451,159 @@ def _digest(value):
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def document_identity(cases, documents_dir):
-    """对问题集实际引用的公开文档做内容身份；不记录文件名或正文。"""
+def _hash_file(path):
+    """流式 SHA-256，避免把大文件整体读入内存。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _corpus_files(root):
+    """遍历目录下的规则文件；任何符号链接或不可读目录都 fail closed。
+
+    接受符号链接会得到不完整（或越界）的语料身份，因此根目录、子目录和
+    文件只要出现链接就拒绝，而不是静默跳过。目录与文件都按路径稳定排序，
+    保证同一棵目录得到同一摘要。
+    """
+    if root.is_symlink():
+        raise EvaluationError("语料根目录不能是符号链接")
+    resolved_root = root.resolve()
+
+    def fail(exc):
+        raise EvaluationError("语料目录无法完整读取，拒绝生成身份") from exc
+
+    entries, total_bytes = [], 0
+    for current, dirnames, filenames in os.walk(resolved_root, followlinks=False, onerror=fail):
+        current_path = Path(current)
+        dirnames[:] = sorted(name for name in dirnames if name != ".git")
+        for name in dirnames:
+            if (current_path / name).is_symlink():
+                raise EvaluationError("语料目录含符号链接，拒绝生成身份")
+        for name in sorted(filenames):
+            candidate = current_path / name
+            if candidate.is_symlink():
+                raise EvaluationError("语料目录含符号链接，拒绝生成身份")
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(resolved_root).as_posix()
+            if relative.startswith("../") or ".." in Path(relative).parts:
+                raise EvaluationError("语料目录含越界路径")
+            total_bytes += candidate.stat().st_size
+            if total_bytes > _CORPUS_MAX_BYTES:
+                raise EvaluationError("语料目录超过 1 GiB，拒绝生成身份")
+            if len(entries) >= _CORPUS_MAX_FILES:
+                raise EvaluationError(f"语料目录超过 {_CORPUS_MAX_FILES} 个文件，拒绝生成身份")
+            entries.append((relative, _hash_file(candidate)))
+    entries.sort()
+    return entries
+
+
+def corpus_identity(documents_dir):
+    """声明的本地语料快照：整棵目录（含未点名干扰资料与子目录）。
+
+    这是调用者显式给出的本地快照，不等于远端知识库索引状态；报告只写出
+    计数与摘要，不写文件名或正文。
+    """
     if documents_dir is None:
         return None
     root = Path(documents_dir)
-    names = sorted({source["filename"] for case in cases
-                    for source in case.get("expected_sources", []) if source.get("filename")})
-    entries, missing = [], []
-    for name in names:
-        target = root / name
-        if target.is_file() and target.resolve().parent == root.resolve():
-            entries.append([name, hashlib.sha256(target.read_bytes()).hexdigest()])
-        else:
-            missing.append(name)
-    return {"files": len(entries), "missing": len(missing),
-            "sha256": _digest({"files": entries, "missing": missing})}
+    if not root.is_dir():
+        raise EvaluationError("--documents-dir 不是目录")
+    entries = _corpus_files(root)
+    return {"kind": "declared-local-snapshot", "files": len(entries),
+            "sha256": _digest({"files": entries})}
+
+
+_MANIFEST_ENTRY_KEYS = {"document_id", "index_version", "content_sha256", "chunk_count"}
+
+
+def _validate_manifest_entry(entry, seen):
+    if not isinstance(entry, dict):
+        raise EvaluationError("索引清单条目必须是对象")
+    # 严格白名单：正文、路径、凭据等额外字段一律拒绝，而不是静默丢弃。
+    unknown = sorted(set(entry) - _MANIFEST_ENTRY_KEYS)
+    if unknown:
+        raise EvaluationError("索引清单条目含未知字段: " + ", ".join(unknown))
+    document_id, index_version = entry.get("document_id"), entry.get("index_version")
+    if not isinstance(document_id, str) or not document_id or len(document_id) > 128:
+        raise EvaluationError("索引清单 document_id 必须是 1–128 字符字符串")
+    if document_id in seen:
+        raise EvaluationError("索引清单 document_id 重复")
+    seen.add(document_id)
+    if type(index_version) is not int or index_version < 0:
+        raise EvaluationError("索引清单 index_version 必须是非负整数")
+    content_sha = entry.get("content_sha256")
+    if not isinstance(content_sha, str) or not re.fullmatch(r"[a-f0-9]{64}", content_sha):
+        raise EvaluationError("索引清单 content_sha256 必须是 SHA-256 小写十六进制")
+    chunk_count = entry.get("chunk_count")
+    if chunk_count is not None and (type(chunk_count) is not int or chunk_count < 0):
+        raise EvaluationError("索引清单 chunk_count 必须是非负整数")
+    return {"document_id": document_id, "index_version": index_version,
+            "content_sha256": content_sha,
+            "chunk_count": chunk_count if chunk_count is not None else None}
+
+
+def index_manifest_identity(manifest):
+    """可选的索引结构指纹：只接受显式白名单字段，拒绝任何正文或凭据。
+
+    唯一格式（CLI 与服务共用，顶层对象只允许 documents）：
+      {"documents": [{"document_id": "...", "index_version": 1,
+                      "content_sha256": "<64 hex>", "chunk_count": 12}]}
+    生成的指纹只含结构字段的摘要与计数，不写入 document_id 原值。
+    它描述调用者声明的索引结构，不证明远端服务实际装载了同一索引。
+    """
+    if manifest is None:
+        return None
+    if not isinstance(manifest, dict):
+        raise EvaluationError("索引清单必须是含 documents 数组的对象")
+    unknown = sorted(set(manifest) - {"documents"})
+    if unknown:
+        raise EvaluationError("索引清单含未知字段: " + ", ".join(unknown))
+    documents = manifest.get("documents")
+    if not isinstance(documents, list):
+        raise EvaluationError("索引清单需要 documents 数组")
+    seen, entries = set(), []
+    for entry in documents:
+        clean = _validate_manifest_entry(entry, seen)
+        entries.append([clean["document_id"], clean["index_version"],
+                        clean["content_sha256"], clean["chunk_count"]])
+    entries.sort()
+    return {"format": _INDEX_MANIFEST_FORMAT, "documents": len(entries),
+            "sha256": _digest(entries)}
 
 
 def dataset_identity(cases):
-    """不依赖运行环境的用例身份：只包含按 id 排序后的用例内容。"""
-    ordered = sorted(cases, key=lambda case: case["id"])
+    """不依赖运行环境的用例身份：只包含按 id 排序后的用例内容。
+
+    人工核验元数据（stratum/verified_by/verified_at/unknowns）只影响聚合口径，
+    不进摘要，避免补标注就让基线失去可比性。
+    """
+    stripped = [{key: value for key, value in case.items() if key not in _REVIEW_METADATA_FIELDS} for case in cases]
+    ordered = sorted(stripped, key=lambda case: case["id"])
     return {"schema": IDENTITY_SCHEMA, "case_count": len(ordered), "sha256": _digest(ordered)}
 
 
 # 配置身份只接受这些字段；其余字段由调用方显式登记，避免把凭据写进报告。
 _CRITICAL_CONFIG_FIELDS = ("mode", "model", "embedding_model", "chunk_size", "chunk_overlap",
-                           "retrieval_top_k", "retrieval_rewrite")
+                           "retrieval_top_k", "retrieval_rewrite",
+                           "hybrid_retrieval_enabled", "rerank_enabled", "rerank_model",
+                           "retrieval_min_similarity", "retrieval_neighbor_chunks",
+                           "retrieval_max_per_doc", "rerank_max_chars", "keyword_candidates")
+_BOOLEAN_CONFIG_FIELDS = ("hybrid_retrieval_enabled", "rerank_enabled")
 # 比较必须能证明影响口径的配置一致。离线回放直接用预置响应打分，
 # 不经过分块/检索/模型，因此不强制声明；真实评测缺这些身份就没有可比性。
+# 重排模型只有在 rerank_enabled=on 时才强制，关闭时留空不算缺项。
 _REQUIRED_CONFIG = {
     "offline": (),
-    "live": ("model", "embedding_model", "chunk_size", "chunk_overlap", "retrieval_top_k", "retrieval_rewrite"),
+    "live": ("model", "embedding_model", "chunk_size", "chunk_overlap", "retrieval_top_k",
+             "retrieval_rewrite", "hybrid_retrieval_enabled", "rerank_enabled",
+             "retrieval_min_similarity", "retrieval_neighbor_chunks", "retrieval_max_per_doc"),
 }
+_CONDITIONAL_CONFIG = {"rerank_model": ("rerank_enabled", "on"),
+                       "rerank_max_chars": ("rerank_enabled", "on"),
+                       "keyword_candidates": ("hybrid_retrieval_enabled", "on")}
 
 
 def _config_value(name, value):
@@ -366,14 +613,20 @@ def _config_value(name, value):
         if value not in ("offline", "live"):
             raise EvaluationError("评测模式必须是 offline 或 live")
         return value
-    if name == "retrieval_rewrite":
+    if name in ("retrieval_rewrite", "rerank_enabled", "hybrid_retrieval_enabled"):
+        # 开关只接受 on/off；布尔值会被 True == 1 之类比较误判，一律拒绝。
         if value not in ("on", "off"):
-            raise EvaluationError("retrieval_rewrite 必须是 on 或 off")
+            raise EvaluationError(f"{name} 必须是 on 或 off")
         return value
-    if name in ("chunk_size", "chunk_overlap", "retrieval_top_k"):
+    if name in ("chunk_size", "chunk_overlap", "retrieval_top_k", "retrieval_neighbor_chunks",
+                "retrieval_max_per_doc", "rerank_max_chars", "keyword_candidates"):
         if type(value) is not int or value < 0:
             raise EvaluationError(f"{name} 必须是非负整数")
         return value
+    if name == "retrieval_min_similarity":
+        if isinstance(value, bool) or not _is_finite_number(value) or not 0 <= value <= 1:
+            raise EvaluationError("retrieval_min_similarity 必须是 0–1 之间的有限数字")
+        return float(value)
     if not isinstance(value, str) or not 1 <= len(value) <= 128:
         raise EvaluationError(f"{name} 必须是 1–128 字符的字符串")
     if "://" in value or "@" in value:
@@ -386,32 +639,48 @@ def _check_config_relations(values):
         raise EvaluationError("chunk_overlap 必须大于等于 0 且小于 chunk_size")
     if values["retrieval_top_k"] is not None and not 1 <= values["retrieval_top_k"] <= 20:
         raise EvaluationError("retrieval_top_k 必须为 1–20")
+    if values["retrieval_neighbor_chunks"] is not None and not 0 <= values["retrieval_neighbor_chunks"] <= 2:
+        raise EvaluationError("retrieval_neighbor_chunks 必须为 0–2")
+    if values["retrieval_max_per_doc"] is not None and not 1 <= values["retrieval_max_per_doc"] <= 20:
+        raise EvaluationError("retrieval_max_per_doc 必须为 1–20")
+    if values["rerank_max_chars"] is not None and not 128 <= values["rerank_max_chars"] <= 8000:
+        raise EvaluationError("rerank_max_chars 必须为 128–8000")
+    if values["keyword_candidates"] is not None and not 1 <= values["keyword_candidates"] <= 200:
+        raise EvaluationError("keyword_candidates 必须为 1–200")
 
 
 def config_identity(*, mode, model=None, embedding_model=None, chunk_size=None, chunk_overlap=None,
-                    retrieval_top_k=None, retrieval_rewrite=None):
+                    retrieval_top_k=None, retrieval_rewrite=None, hybrid_retrieval_enabled=None,
+                    rerank_enabled=None, rerank_model=None, retrieval_min_similarity=None,
+                    retrieval_neighbor_chunks=None, retrieval_max_per_doc=None, rerank_max_chars=None,
+                    keyword_candidates=None):
     """可比配置身份；仅记录影响质量口径的公开参数，以及指标版本。"""
-    values = {"mode": _config_value("mode", mode), "model": _config_value("model", model),
-              "embedding_model": _config_value("embedding_model", embedding_model),
-              "chunk_size": _config_value("chunk_size", chunk_size),
-              "chunk_overlap": _config_value("chunk_overlap", chunk_overlap),
-              "retrieval_top_k": _config_value("retrieval_top_k", retrieval_top_k),
-              "retrieval_rewrite": _config_value("retrieval_rewrite", retrieval_rewrite)}
+    supplied = locals()
+    values = {name: _config_value(name, supplied[name]) for name in _CRITICAL_CONFIG_FIELDS}
     _check_config_relations(values)
     if values["mode"] is None:
         raise EvaluationError("配置身份需要评测模式")
+    # 开关关闭时残留的条件参数不进入身份，避免把无关值变成“配置变化”。
+    if values["rerank_enabled"] != "on":
+        values["rerank_model"] = None
+        values["rerank_max_chars"] = None
+    if values["hybrid_retrieval_enabled"] != "on":
+        values["keyword_candidates"] = None
     config = {key: value for key, value in values.items() if value is not None}
     return {**config, "sha256": _digest(config)}
 
 
-def build_identity(cases, *, mode, documents_dir=None, **config):
-    documents = document_identity(cases, documents_dir)
+def build_identity(cases, *, mode, documents_dir=None, index_manifest=None, **config):
+    documents = corpus_identity(documents_dir)
     if documents is None:
         # 没有 documents 目录时显式标记未知，比较阶段据此拒绝“无退步”结论。
-        documents = {"files": 0, "missing": 0, "sha256": None}
+        documents = {"kind": "none", "files": 0, "missing": 0, "sha256": None}
+    dataset = {**dataset_identity(cases), "documents": documents}
+    index = index_manifest_identity(index_manifest)
+    if index is not None:
+        dataset["index_manifest"] = index
     return {"schema": IDENTITY_SCHEMA, "metrics_version": METRICS_VERSION,
-            "dataset": {**dataset_identity(cases), "documents": documents},
-            "config": config_identity(mode=mode, **config)}
+            "dataset": dataset, "config": config_identity(mode=mode, **config)}
 
 
 def _threshold_metric(name):
@@ -586,6 +855,19 @@ def _validate_identity_structure(identity, label, cases):
             docs_sha = documents.get("sha256")
             if docs_sha is not None and not _is_digest(docs_sha):
                 raise EvaluationError(f"{label} 报告的 documents.sha256 必须是 SHA-256")
+            kind = documents.get("kind")
+            if kind is not None and kind not in ("none", "declared-local-snapshot"):
+                raise EvaluationError(f"{label} 报告的 documents.kind 不合法")
+        manifest = dataset.get("index_manifest")
+        if manifest is not None:
+            if not isinstance(manifest, dict):
+                raise EvaluationError(f"{label} 报告的 index_manifest 必须是对象")
+            if manifest.get("documents") is not None and (type(manifest.get("documents")) is not int
+                                                          or manifest["documents"] < 0):
+                raise EvaluationError(f"{label} 报告的 index_manifest.documents 必须是非负整数")
+            manifest_sha = manifest.get("sha256")
+            if manifest_sha is not None and not _is_digest(manifest_sha):
+                raise EvaluationError(f"{label} 报告的 index_manifest.sha256 必须是 SHA-256")
     config = identity.get("config")
     if config is not None:
         if not isinstance(config, dict):
@@ -644,6 +926,7 @@ def _identity_reasons(baseline, current):
     if not isinstance(right, dict):
         return ["current_identity_missing"], unknown
     if left.get("schema") != IDENTITY_SCHEMA or right.get("schema") != IDENTITY_SCHEMA:
+        # 旧 schema（如 v1 只哈希被点名的文档）不可靠；不自动升级、不比较。
         return ["identity_schema_mismatch"], unknown
     if left.get("metrics_version") != METRICS_VERSION or right.get("metrics_version") != METRICS_VERSION:
         reasons.append("metrics_version_mismatch")
@@ -668,14 +951,43 @@ def _identity_reasons(baseline, current):
             reasons.append("documents_changed")
         elif left_docs.get("missing") or right_docs.get("missing"):
             reasons.append("documents_incomplete")
+        # 索引结构是可选身份：只有两侧都声明时才比较，单侧声明无法证明一致。
+        left_index, right_index = left_dataset.get("index_manifest"), right_dataset.get("index_manifest")
+        if left_index is not None or right_index is not None:
+            if not isinstance(left_index, dict) or not isinstance(right_index, dict) \
+                    or not left_index.get("sha256") or not right_index.get("sha256"):
+                reasons.append("index_manifest_unverifiable")
+            elif left_index.get("sha256") != right_index.get("sha256"):
+                reasons.append("index_manifest_changed")
     left_config, right_config = left.get("config"), right.get("config")
     if not isinstance(left_config, dict) or not isinstance(right_config, dict):
         reasons.append("config_identity_missing")
     else:
-        mode = left_config.get("mode") if left_config.get("mode") in _REQUIRED_CONFIG else "live"
-        required = set(_REQUIRED_CONFIG[mode])
+        left_mode, right_mode = left_config.get("mode"), right_config.get("mode")
+        if left_mode is None or right_mode is None:
+            # 模式本身是关键身份：缺失或 null 都不证明两次评测口径一致。
+            reasons.append("config_unverifiable:mode")
+        elif left_mode != right_mode:
+            reasons.append("config_changed:mode")
+        mode = left_mode if left_mode in _REQUIRED_CONFIG else "live"
+        required = {"mode", *_REQUIRED_CONFIG[mode]}
         for name in _CRITICAL_CONFIG_FIELDS:
-            in_left, in_right = name in left_config, name in right_config
+            # 显式 null 与缺键一样无法证明可比；导入的报告可能带 "field": null。
+            in_left = left_config.get(name) is not None
+            in_right = right_config.get(name) is not None
+            if name in _CONDITIONAL_CONFIG:
+                # 条件字段：开关关闭时缺失是正常的，也不列为未知阻断项；
+                # 开关开启时等同必填——两侧都缺也算不可比，不能因“一致地缺”放过。
+                gate, gate_value = _CONDITIONAL_CONFIG[name]
+                if {left_config.get(gate), right_config.get(gate)} != {gate_value}:
+                    if not in_left and not in_right:
+                        continue
+                    if gate_value in (left_config.get(gate), right_config.get(gate)):
+                        reasons.append(f"config_unverifiable:{name}")
+                    continue
+                if not in_left and not in_right:
+                    reasons.append(f"config_unverifiable:{name}")
+                    continue
             if in_left and in_right:
                 if left_config[name] != right_config[name]:
                     reasons.append(f"config_changed:{name}")

@@ -35,7 +35,9 @@ class BaselineIdentityTests(unittest.TestCase):
         first = ev.build_identity(cases, mode="offline", documents_dir=ROOT / "documents")
         second = ev.build_identity(cases, mode="offline", documents_dir=ROOT / "documents")
         self.assertEqual(first["dataset"]["sha256"], second["dataset"]["sha256"])
-        self.assertEqual(first["dataset"]["documents"]["files"], 3)
+        # 语料身份覆盖整棵声明目录：被点名 3 份 + 未点名干扰资料 3 份。
+        self.assertEqual(first["dataset"]["documents"]["files"], 6)
+        self.assertEqual(first["dataset"]["documents"]["kind"], "declared-local-snapshot")
         changed = [dict(case) for case in cases]
         changed[0] = {**changed[0], "required_phrases": ["绝对不存在的短语"]}
         other = ev.build_identity(changed, mode="offline", documents_dir=ROOT / "documents")
