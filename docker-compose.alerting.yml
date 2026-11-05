@@ -1,0 +1,63 @@
+# 可选告警投递覆盖（默认关闭）：Prometheus -> Alertmanager -> generic webhook。
+#
+# 这是**叠加**文件，必须同时带 docker-compose.yml 与 docker-compose.monitoring.yml：
+#
+#   # 1) 仓库外准备 webhook URL（宿主机 0600，仅属主可读）：
+#   #    install -m 600 /dev/null /srv/ragkb-secrets/alert_webhook_url
+#   #    printf '%s' 'https://receiver.example.internal/hooks/ragkb' \
+#   #      > /srv/ragkb-secrets/alert_webhook_url
+#   # 2) 渲染 Prometheus（带告警目标）+ Alertmanager：
+#   ENV_FILE=/dev/null \
+#   RAGKB_METRICS_TOKEN_FILE=/srv/ragkb-secrets/metrics_token \
+#   RAGKB_ALERTMANAGER_TARGET=alertmanager:9093 \
+#   OUT_DIR=/srv/ragkb-monitoring ./deploy/monitoring/render-prometheus.sh
+#   ENV_FILE=/dev/null \
+#   RAGKB_ALERT_WEBHOOK_FILE=/srv/ragkb-secrets/alert_webhook_url \
+#   OUT_DIR=/srv/ragkb-monitoring ./deploy/monitoring/render-alertmanager.sh
+#   # 3) 起服务（四个目录变量都是必填）：
+#   RAGKB_METRICS_TOKEN_FILE=/srv/ragkb-secrets/metrics_token \
+#   RAGKB_PROMETHEUS_CONFIG_DIR=/srv/ragkb-monitoring/prometheus \
+#   RAGKB_PROMETHEUS_SECRET_DIR=/srv/ragkb-monitoring/secrets \
+#   RAGKB_ALERTMANAGER_CONFIG_DIR=/srv/ragkb-monitoring/alertmanager \
+#   RAGKB_ALERTMANAGER_SECRET_DIR=/srv/ragkb-monitoring/alertmanager/secrets \
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml \
+#     -f docker-compose.alerting.yml up -d
+#
+# 关闭告警：先带全部覆盖文件 stop alertmanager，再清空 RAGKB_ALERTMANAGER_TARGET
+# 重新渲染并 restart prometheus。去掉覆盖文件再 up 不会停止已存在的 Alertmanager。
+# 配置文件内容变更不会保证 Compose 重建容器；完整启用/更新/关闭命令见
+# deploy/monitoring/README.md。
+#
+# 网络：base 的 internal 网络是普通 bridge（未设 internal: true），容器本来就能
+# 出网，因此不额外建 egress 网络；Alertmanager 与 Prometheus 同在 internal 上，
+# 互相用服务名解析，业务 api/db 的网络与端口不受影响。
+#
+# 管理 API（9093）默认仅发布到宿主回环 127.0.0.1:19093；可执行 silences 等
+# 管理操作。若调整 RAGKB_ALERTMANAGER_PUBLISH，需自行限制访问范围。
+services:
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    # 镜像默认以 nobody(65534) 运行；显式写出，与 Prometheus 覆盖保持一致。
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      # 单机部署不需要 HA 集群：显式空地址禁用 gossip，避免监听 9094/绑定失败。
+      - --cluster.listen-address=
+      # external-url 只用于生成外部链接，不会关闭 silences 或其它管理 API。
+      - --web.external-url=${RAGKB_ALERTMANAGER_EXTERNAL_URL:-http://alertmanager:9093}
+    volumes:
+      - ${RAGKB_ALERTMANAGER_CONFIG_DIR:?告警覆盖需要 RAGKB_ALERTMANAGER_CONFIG_DIR 指向 render-alertmanager.sh 输出的 alertmanager 目录}:/etc/alertmanager:ro
+      # URL 副本（0444）与宿主机 0600 原件分离，Alertmanager 只从 url_file 读。
+      - ${RAGKB_ALERTMANAGER_SECRET_DIR:?告警覆盖需要 RAGKB_ALERTMANAGER_SECRET_DIR（render-alertmanager.sh 输出的 secrets 目录）}:/etc/alertmanager-secrets:ro
+      - alertmanager_data:/alertmanager
+    networks: [internal]
+    # 管理 API 只绑回环：默认 127.0.0.1:19093，仅供宿主机 amtool/curl 调试。
+    # 需要换机内私网地址时用 RAGKB_ALERTMANAGER_PUBLISH，绝不能写 0.0.0.0。
+    # 不在宿主机调试的话，这行端口映射可以直接删掉（容器间仍用 alertmanager:9093）。
+    ports:
+      - "${RAGKB_ALERTMANAGER_PUBLISH:-127.0.0.1}:${RAGKB_ALERTMANAGER_PORT:-19093}:9093"
+
+volumes:
+  alertmanager_data:

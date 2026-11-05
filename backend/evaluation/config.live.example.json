@@ -1,0 +1,14 @@
+{
+  "model": "example-chat-model",
+  "embedding_model": "example-embedding-model",
+  "chunk_size": 800,
+  "chunk_overlap": 120,
+  "retrieval_top_k": 6,
+  "retrieval_rewrite": "on",
+  "hybrid_retrieval_enabled": "on",
+  "keyword_candidates": 60,
+  "rerank_enabled": "off",
+  "retrieval_min_similarity": 0.0,
+  "retrieval_neighbor_chunks": 1,
+  "retrieval_max_per_doc": 3
+}

@@ -1,0 +1,48 @@
+# 公共审计写入失败告警：基于 backend 进程内指标 ragkb_audit_write_failures_total。
+#
+# 指标语义（单 API 进程，进程重启后计数归零）：
+#   ragkb_audit_write_failures_total   审计记录写入失败次数，**无任何标签**。
+#     构造 AuditLog / db.add / db.commit 任一步失败都会 +1；审计失败不阻断业务，
+#     所以这里只从指标发现，不依赖接口报错。rollback 自身失败也计入同一次失败，
+#     不会重复计数，因此该值不是"rollback 失败数"。
+#
+# 指标刻意不含 action / 用户名 / target / IP / 详情等标签，规则与 annotations
+# 也不引用任何业务字段；告警文本只描述"审计写入失败"这一事实。
+#
+# 阈值写死为固定表达式（不引入新的渲染占位符）：渲染器只放行已登记的白名单
+# 变量，新增占位符会让 render-prometheus.sh 直接报错。需要按环境调节时，
+# 应由监控负责方统一登记变量后再改这里。
+#
+# 说明：计数只在进程内累计，副本重启会归零；短窗口 increase 仍可用于发现
+# 持续失败，但不要用它做跨副本的年度审计结论。
+groups:
+  - name: ragkb-audit
+    interval: 30s
+    rules:
+      # 故意不设 for：孤立的单次失败在 5m 窗口内只存在很短时间，
+      # 任何 >= 评估间隔的 for 都可能让它先退出窗口，导致告警永远不触发。
+      # 窗口结束后 increase 归零，告警随之自行恢复。
+      - alert: RagkbAuditWriteFailures
+        expr: increase(ragkb_audit_write_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "最近 5 分钟出现审计写入失败"
+          description: >-
+            审计日志写入（构造 / add / commit）有失败但被 best-effort 吞掉，
+            业务请求本身仍然成功。对应 ERROR 日志事件 audit_write_failed
+            只带安全异常类型，不含业务数据。
+            先检查数据库可用性、连接池与审计表写入权限。
+
+      - alert: RagkbAuditWriteFailuresPersistent
+        expr: increase(ragkb_audit_write_failures_total[30m]) > 10
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "审计写入持续失败（30 分钟超过 10 次）"
+          description: >-
+            长时间、成规模的审计写入失败意味着操作留痕不可信，属于合规风险。
+            同时出现 audit_rollback_failed 日志时，说明会话可能已无法恢复，
+            需要先处理数据库故障再重启 api。

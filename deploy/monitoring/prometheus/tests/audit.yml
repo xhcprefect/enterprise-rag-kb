@@ -1,0 +1,102 @@
+# promtool rule tests for ragkb-audit.yml.in (rendered as ragkb-audit.yml).
+#
+# 覆盖两个关键性质：
+#   1. 孤立的单次审计写入失败（无 for 的 warning）必须 firing —— 这是本规则
+#      存在的意义，5m 窗口结束后必须自动恢复；
+#   2. 持续失败超过 30m 阈值时 critical 触发。
+#
+# promtool 要求 exp_annotations 与规则 annotations 完全一致，因此这里逐字
+# 复制渲染后的 description（`>-` 折叠后换行会变成空格）。改规则文案时
+# 必须同步本文件，否则 promtool 会明确报差异。
+#
+# 时间点全部用相对时间（1m 前 … 31m 前），避免依赖时钟。
+# 规则路径相对本测试文件：目录结构需为
+#   tests/audit.yml  +  rules/ragkb-audit.yml
+# 运行（需 prom/prometheus:v3.1.0 镜像）：
+#   docker run --rm --network none --entrypoint promtool \
+#     -v "$PWD/deploy/monitoring/prometheus/tests:/t:ro" \
+#     -v "$PWD/<rendered-rules-dir>:/rules:ro" \
+#     prom/prometheus:v3.1.0 test rules /t/audit.yml
+rule_files:
+  - ../rules/ragkb-audit.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---- 1. 孤立失败：立即 firing，窗口结束后恢复 ----
+  - name: single isolated audit write failure fires then recovers
+    interval: 1m
+    input_series:
+      - series: 'ragkb_audit_write_failures_total'
+        values: '0+0x10 1+0x10'
+    promql_expr_test:
+      - expr: increase(ragkb_audit_write_failures_total[5m])
+        eval_time: 11m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+    alert_rule_test:
+      # 失败发生在 t=10m，下一次评估立刻 firing，而不是等 10m。
+      - eval_time: 11m
+        alertname: RagkbAuditWriteFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "最近 5 分钟出现审计写入失败"
+              description: >-
+                审计日志写入（构造 / add / commit）有失败但被 best-effort 吞掉，
+                业务请求本身仍然成功。对应 ERROR 日志事件 audit_write_failed
+                只带安全异常类型，不含业务数据。
+                先检查数据库可用性、连接池与审计表写入权限。
+      # 窗口滑过之后 increase 归零，告警恢复（exp_alerts 为空）。
+      - eval_time: 18m
+        alertname: RagkbAuditWriteFailures
+        exp_alerts: []
+
+  # ---- 2. 持续失败：warning 与 critical 同时成立 ----
+  - name: sustained failures raise critical
+    interval: 1m
+    input_series:
+      # 每分钟 +1，共 40 分钟。
+      - series: 'ragkb_audit_write_failures_total'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: RagkbAuditWriteFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "最近 5 分钟出现审计写入失败"
+              description: >-
+                审计日志写入（构造 / add / commit）有失败但被 best-effort 吞掉，
+                业务请求本身仍然成功。对应 ERROR 日志事件 audit_write_failed
+                只带安全异常类型，不含业务数据。
+                先检查数据库可用性、连接池与审计表写入权限。
+      - eval_time: 35m
+        alertname: RagkbAuditWriteFailuresPersistent
+        exp_alerts:
+          # 30m 内增加 30 次 > 10，critical 成立。
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "审计写入持续失败（30 分钟超过 10 次）"
+              description: >-
+                长时间、成规模的审计写入失败意味着操作留痕不可信，属于合规风险。
+                同时出现 audit_rollback_failed 日志时，说明会话可能已无法恢复，
+                需要先处理数据库故障再重启 api。
+
+  # ---- 3. 无失败：两个告警都不出现 ----
+  - name: no failures no alerts
+    interval: 1m
+    input_series:
+      - series: 'ragkb_audit_write_failures_total'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: RagkbAuditWriteFailures
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: RagkbAuditWriteFailuresPersistent
+        exp_alerts: []

@@ -1,0 +1,42 @@
+# Alertmanager 配置模板（可选告警投递链）。
+#
+# 这是**模板**：请用 deploy/monitoring/render-alertmanager.sh 在宿主机渲染成
+# $DATA_DIR/monitoring/alertmanager/alertmanager.yml，再只读挂进容器。
+# 占位符只能是 ${RAGKB_*}，渲染脚本会拒绝未知占位符与非法取值。
+#
+# webhook URL 永不写进本文件：Alertmanager 的 webhook_configs 支持 url_file，
+# 脚本把 URL 单独写成容器可读副本（/etc/alertmanager-secrets/webhook_url），
+# 这样配置正文、compose 参数与渲染输出不包含 URL；上游通知失败日志的行为
+# 由隔离回归实测，url_file 本身不能保证所有运行时错误日志都脱敏。
+#
+# generic webhook 收到的是 Alertmanager 自己的 v4 JSON
+# （{version, groupKey, status, receiver, groupLabels, commonLabels,
+#   commonAnnotations, externalURL, alerts:[...]}），不是飞书/钉钉/企业微信
+# 机器人的消息协议。要接这些平台，请在 webhook 端自建适配器（或改用对应
+# 专用 receiver），不要把机器人 URL 直接填到 RAGKB_ALERT_WEBHOOK_FILE。
+
+global:
+  resolve_timeout: ${RAGKB_AM_RESOLVE_TIMEOUT:-5m}
+
+route:
+  receiver: ragkb-webhook
+  # 只有 alertname + instance 参与分组：同一批告警合并成一条通知，
+  # 不会因为 annotation 里的细节被拆散。
+  group_by: ["alertname", "instance"]
+  group_wait: ${RAGKB_AM_GROUP_WAIT:-30s}
+  group_interval: ${RAGKB_AM_GROUP_INTERVAL:-5m}
+  repeat_interval: ${RAGKB_AM_REPEAT_INTERVAL:-4h}
+
+receivers:
+  - name: ragkb-webhook
+    webhook_configs:
+      # url_file 与 url 互斥；这里只用 url_file。
+      - url_file: /etc/alertmanager-secrets/webhook_url
+        # 恢复通知同样投递，便于接收端关闭告警工单。
+        send_resolved: true
+        # 单次通知的 HTTP 超时；实际生效值还会被 group_interval 截断。
+        timeout: ${RAGKB_AM_WEBHOOK_TIMEOUT:-10s}
+        # 0 = 不截断，一次投递包含组内全部告警。
+        max_alerts: ${RAGKB_AM_MAX_ALERTS:-0}
+
+inhibit_rules: []
