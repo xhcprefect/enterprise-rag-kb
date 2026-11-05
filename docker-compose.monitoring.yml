@@ -1,0 +1,52 @@
+# 可选监控覆盖（默认关闭）：Prometheus 采集 /api/v1/operations/metrics。
+#
+# 用法：
+#   1) backend/.env 里设置 METRICS_TOKEN（未设置时采集接口返回 503）
+#   2) 把同一个值写到仓库外的 secret 文件（宿主机 0600，只有 root/管理员可读）：
+#        install -m 600 /dev/null /srv/ragkb-secrets/metrics_token
+#        printf '%s' "$METRICS_TOKEN_VALUE" > /srv/ragkb-secrets/metrics_token
+#   3) 渲染配置与容器可读的令牌副本（Prometheus 不展开环境变量，镜像也没有 envsubst）：
+#        RAGKB_METRICS_TOKEN_FILE=/srv/ragkb-secrets/metrics_token \
+#        OUT_DIR=/srv/ragkb-monitoring ./deploy/monitoring/render-prometheus.sh
+#   4) 起服务（CONFIG_DIR 与 SECRET_DIR 都是必填，缺任一项 compose 直接报错）：
+#        RAGKB_METRICS_TOKEN_FILE=/srv/ragkb-secrets/metrics_token \
+#        RAGKB_PROMETHEUS_CONFIG_DIR=/srv/ragkb-monitoring/prometheus \
+#        RAGKB_PROMETHEUS_SECRET_DIR=/srv/ragkb-monitoring/secrets \
+#        docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#
+# 为什么不用 compose `secrets:`：
+#   prom/prometheus 镜像以 nobody(65534) 运行，compose 的 file secret 在非 Swarm 下
+#   会以 root 属主、0600 权限 bind 挂进容器（long syntax 的 uid/gid/mode 只在 Swarm
+#   生效，会被忽略）。宿主机 secret 保持 0600 时，nobody 读不到，采集直接失败。
+#   这里改为：宿主机令牌 0600 -> render-prometheus.sh 复制一份 0444 到**仓库外**的
+#   运行目录（$OUT_DIR/secrets/metrics_token，目录 0755）-> 整目录只读 bind 到
+#   /etc/prometheus-secrets。容器内权限由宿主机决定，不依赖镜像内 chown/init 进程。
+#   注意目录必须可被 nobody 遍历（0755），否则即使文件 0444 也读不到。
+#
+# 默认不向公网暴露 Prometheus：端口绑定在 127.0.0.1（可用 RAGKB_PROMETHEUS_PUBLISH
+# 改绑其它**私网**地址，绝不能写成 0.0.0.0）。
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    # 显式以镜像默认的 nobody 运行：令牌副本是 0444，数据卷由 Docker 初始化后
+    # 归 root，Prometheus 以 nobody 写入 /prometheus 已实测可用（TSDB 正常）。
+    user: "65534:65534"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${RAGKB_PROMETHEUS_RETENTION:-15d}
+      # lifecycle 默认关闭，保持 /-/reload 不可用；不传不受支持的 =false 参数。
+    volumes:
+      # 挂渲染产物（不是模板）。目录必须由 render-prometheus.sh 生成；缺变量时
+      # compose 直接报错，避免把空目录/模板文件当配置挂进去。
+      - ${RAGKB_PROMETHEUS_CONFIG_DIR:?监控覆盖需要 RAGKB_PROMETHEUS_CONFIG_DIR 指向 render-prometheus.sh 的输出目录}:/etc/prometheus:ro
+      # 仅容器可读的令牌副本（0444），与宿主机 0600 原件分离。
+      - ${RAGKB_PROMETHEUS_SECRET_DIR:?监控覆盖需要 RAGKB_PROMETHEUS_SECRET_DIR（render-prometheus.sh 输出的 secrets 目录）}:/etc/prometheus-secrets:ro
+      - prometheus_data:/prometheus
+    networks: [internal]
+    ports:
+      - "${RAGKB_PROMETHEUS_PUBLISH:-127.0.0.1}:${RAGKB_PROMETHEUS_PORT:-9090}:9090"
+
+volumes:
+  prometheus_data:

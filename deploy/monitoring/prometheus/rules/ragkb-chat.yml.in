@@ -1,0 +1,107 @@
+# 问答链路告警：基于 backend 观测 helper 实际暴露的 ragkb_* 指标。
+#
+# 指标语义（单 API 进程，进程重启后计数归零）：
+#   ragkb_chat_started_total{mode}                  发起的新生成（重放不计新增）
+#   ragkb_chat_finished_total{mode,status}          status ∈ completed/failed/cancelled/unknown
+#   ragkb_chat_first_token_seconds_bucket{mode}     首字延迟（秒）
+#   ragkb_chat_total_seconds_bucket{mode}           端到端时长（秒）
+#   ragkb_chat_stage_seconds_bucket{mode,stage}     stage ∈ rewrite/retrieval/prompt/first_token/generation/persistence/other
+#   ragkb_chat_in_flight{mode}                      当前进行中的生成
+#   ragkb_metrics_process_local                      恒为 1，用于确认采集到的是进程内指标
+#
+# 取消（cancelled）不算故障：用户主动停止是正常操作，所有失败率都只算 failed。
+
+groups:
+  - name: ragkb-chat
+    interval: 30s
+    rules:
+      # ---------- 首字延迟 ----------
+      - alert: RagkbChatFirstTokenSlow
+        expr: |
+          histogram_quantile(
+            ${RAGKB_ALERT_FIRST_TOKEN_QUANTILE:-0.95},
+            sum without (mode) (rate(ragkb_chat_first_token_seconds_bucket[10m]))
+          ) > ${RAGKB_ALERT_FIRST_TOKEN_SECONDS:-20}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "问答首字延迟 P95 超过 {{ $value }}s"
+          description: >-
+            单 API 进程统计：最近 10 分钟首字延迟 P95 高于阈值
+            （${RAGKB_ALERT_FIRST_TOKEN_SECONDS:-20}s）。检查上游模型延迟、检索耗时
+            与队列积压；取消的请求不计入失败，但会拉长端到端时长。
+
+      - alert: RagkbChatFirstTokenMissing
+        expr: |
+          sum without (mode) (increase(ragkb_chat_started_total[15m])) > 0
+          and
+          sum without (mode) (increase(ragkb_chat_first_token_seconds_count[15m])) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "有生成启动但 15 分钟内没有任何首字记录"
+          description: >-
+            可能存在所有请求都在首字前失败或卡住；也可能只是重启后计数窗口不完整。
+            结合 ragkb_chat_finished_total{status="failed"} 与日志判断。
+
+      # ---------- 失败率 ----------
+      - alert: RagkbChatFailureRateHigh
+        expr: |
+          (
+            sum without (mode) (rate(ragkb_chat_finished_total{status="failed"}[10m]))
+            /
+            clamp_min(sum without (mode) (rate(ragkb_chat_finished_total[10m])), 0.001)
+          ) > ${RAGKB_ALERT_FAILURE_RATIO:-0.2}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "问答失败率高于 {{ $value | humanizePercentage }}"
+          description: >-
+            分母包含 completed/failed/cancelled/unknown；取消是用户主动行为，
+            会稀释失败率，因此阈值按实际业务调整。持续偏高时检查模型服务与数据库连接。
+
+      - alert: RagkbChatAllFailures
+        expr: |
+          sum without (mode) (increase(ragkb_chat_finished_total{status="failed"}[10m])) >=
+          ${RAGKB_ALERT_FAILURE_MIN_COUNT:-5}
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "最近 10 分钟出现 {{ $value }} 次问答失败"
+          description: >-
+            小流量下比例告警可能永远不触发，这里用绝对次数兜底；
+            阈值由 RAGKB_ALERT_FAILURE_MIN_COUNT 调整。
+
+      # ---------- 进行中卡住 ----------
+      - alert: RagkbChatStuck
+        expr: |
+          sum without (mode) (ragkb_chat_in_flight) >
+          ${RAGKB_ALERT_IN_FLIGHT_MAX:-20}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "进行中的生成数持续高于 {{ $value }}"
+          description: >-
+            单进程 in-flight 长时间不回落，可能是上游流未结束或客户端断开未被回收。
+            注意：这是单 API 统计，不代表集群总并发，也不是压测容量结论。
+
+      # ---------- 阶段耗时 ----------
+      - alert: RagkbChatStageSlow
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum without (mode, stage) (rate(ragkb_chat_stage_seconds_bucket[10m]))
+          ) > ${RAGKB_ALERT_STAGE_SECONDS:-30}
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "问答某阶段 P95 超过 {{ $value }}s"
+          description: >-
+            阶段包括 rewrite/retrieval/prompt/first_token/generation/persistence/other。
+            用 ragkb_chat_stage_seconds_*{stage="..."} 进一步定位。

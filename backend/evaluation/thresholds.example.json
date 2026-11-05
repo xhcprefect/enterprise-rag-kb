@@ -1,0 +1,5 @@
+{
+  "first_token_ms_p95": {"max_relative_change": 0.25},
+  "total_ms_p95": {"max_relative_change": 0.25},
+  "generation_cost_estimate": {"max_relative_change": 0.1}
+}

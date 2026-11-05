@@ -1,0 +1,100 @@
+# 入库队列 / worker / 数据库告警。
+#
+# 这些指标**不是**进程内计数，而是每次采集时按需查询数据库后导出的快照
+# （见 backend/app/api/v1/operations.py），因此：
+#   - 数据库查询失败/超时时，除 ragkb_db_available 之外的队列指标整体缺失，
+#     绝不能把“采集不到”当成“队列为空”；
+#   - 数值反映采集瞬间的真实队列状态，与 API 进程重启无关。
+#
+# 真实指标名与语义：
+#   ragkb_db_available                                 1/0，本次采集的数据库摘要查询是否成功
+#   ragkb_ingest_documents{status}                     pending/processing/ready/failed/cancelled 五个状态恒输出
+#   ragkb_ingest_queued_documents                      pending + processing 总数
+#   ragkb_ingest_stale_processing_documents            processing 且心跳缺失/超过 INGEST_STALE_SECONDS
+#   ragkb_ingest_oldest_pending_age_seconds            最老 pending 文档的年龄（无 pending 时不输出）
+#   ragkb_db_pool_{size,checked_in,checked_out,overflow,total,capacity}  SQLAlchemy 连接池
+#
+# 注意：项目里**没有**“worker 最近一次成功处理时间”指标，因此这里用
+# “队列堆积 + 陈旧 processing + 最老 pending 年龄”组合判断 worker 是否停摆，
+# 不虚构一个不存在的 last_success 指标。
+groups:
+  - name: ragkb-ingest
+    interval: 30s
+    rules:
+      # ---------- 采集自身 ----------
+      - alert: RagkbDatabaseUnavailable
+        expr: ragkb_db_available == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "运维指标无法读取数据库"
+          description: >-
+            采集接口本身可达，但队列摘要查询失败或超时（OPERATIONS_DB_TIMEOUT_SECONDS）。
+            此时队列指标整体缺失，不能据此判断队列为空；先检查 db 容器与连接池。
+
+      # ---------- 积压 ----------
+      - alert: RagkbIngestQueueBacklog
+        expr: ragkb_ingest_queued_documents > ${RAGKB_ALERT_QUEUE_BACKLOG:-50}
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: "入库队列积压 {{ $value }} 篇"
+          description: >-
+            pending + processing 持续高于阈值（RAGKB_ALERT_QUEUE_BACKLOG）。
+            常见原因：worker 未运行、上游模型限流或单篇文档过大。
+
+      - alert: RagkbIngestOldestPendingStale
+        expr: ragkb_ingest_oldest_pending_age_seconds > ${RAGKB_ALERT_PENDING_AGE_SECONDS:-1800}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "最老 pending 文档已等待 {{ $value }}s"
+          description: >-
+            队列里最老的 pending 文档超过 RAGKB_ALERT_PENDING_AGE_SECONDS 仍未开始处理，
+            说明消费几乎停滞；结合 RagkbIngestQueueBacklog 与 worker 日志定位。
+
+      # ---------- worker 停摆 ----------
+      - alert: RagkbWorkerProcessingStuck
+        expr: ragkb_ingest_stale_processing_documents > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "有 {{ $value }} 篇文档心跳超时仍停留在 processing"
+          description: >-
+            正常应被 worker 的 recover_stale 退回 pending 续传。持续存在说明
+            worker 没有在跑、或无法写回心跳（数据库/租约问题）。
+
+      - alert: RagkbIngestFailuresRising
+        # and on() 是必要的：三个条件分别带 status="failed"/"processing"/"pending"，
+        # 默认按完整标签集匹配会让它们永远对不上，告警静默失效。
+        expr: |
+          increase(ragkb_ingest_documents{status="failed"}[30m]) > 0
+          and on() (ragkb_ingest_documents{status="processing"} == 0)
+          and on() (ragkb_ingest_documents{status="pending"} > 0)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "队列有待处理文档但持续出现入库失败"
+          description: >-
+            没有 processing、只有 pending，且 failed 在增长：worker 可能在反复重试
+            并失败（模型不可达、解析器报错、向量维度不匹配等）。
+
+      # ---------- 连接池 ----------
+      - alert: RagkbDbPoolSaturated
+        expr: |
+          ragkb_db_pool_checked_out
+          /
+          clamp_min(ragkb_db_pool_capacity, 1) > ${RAGKB_ALERT_POOL_SATURATION:-0.9}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "数据库连接池使用率超过 {{ $value | humanizePercentage }}"
+          description: >-
+            checked_out / (size + overflow) 持续偏高。可能是有慢查询或长事务占着连接；
+            先看日志与数据库侧，不要直接调大池子掩盖问题。

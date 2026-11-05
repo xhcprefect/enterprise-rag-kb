@@ -1,0 +1,40 @@
+# 恢复演练专用编排：只有一个隔离的 PostgreSQL 容器。
+#
+# 刻意不复用仓库根的 docker-compose.yml —— 根文件带 `env_file: ./backend/.env`，
+# 演练一旦使用它就会把真实应用配置暴露给临时容器。这里只用 drill.env（测试凭据）。
+#
+# 所有资源都带 ragkb.drill.owner 标签；restore-drill.sh 清理前逐项核对。
+# 不写顶层 name：项目名一律由脚本的 -p ragkb-drill-<owner> 决定，
+# 避免漏传 -p 时落到一个固定的公共项目名上。
+services:
+  db:
+    image: pgvector/pgvector:pg18
+    labels:
+      ragkb.drill.owner: ${DRILL_OWNER:?演练必须显式传入 owner}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      PGDATA: /var/lib/postgresql/data
+    # 只绑回环地址，不对外暴露；与生产 5432 不冲突。
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55999}:5432"
+    volumes:
+      - drill_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    networks: [drill]
+
+volumes:
+  drill_pgdata:
+    labels:
+      ragkb.drill.owner: ${DRILL_OWNER:?演练必须显式传入 owner}
+
+networks:
+  drill:
+    labels:
+      ragkb.drill.owner: ${DRILL_OWNER:?演练必须显式传入 owner}

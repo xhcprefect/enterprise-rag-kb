@@ -1,0 +1,42 @@
+# Prometheus 采集配置模板（可选监控覆盖使用）。
+#
+# 这是**模板**，不是可直接挂载的配置：Prometheus 本身不展开环境变量，
+# 官方镜像里也没有 envsubst。请先用 deploy/monitoring/render-prometheus.sh
+# 在宿主机渲染成 $DATA_DIR/monitoring/prometheus/prometheus.yml，再把渲染产物
+# 只读挂进容器。占位符只能是 ${RAGKB_*}，渲染脚本会拒绝未知占位符。
+#
+# 采集目标只有 api 容器，且接口受独立 METRICS_TOKEN 保护：
+#   GET /api/v1/operations/metrics   Authorization: Bearer <METRICS_TOKEN>
+# 未配置 METRICS_TOKEN 时该接口返回 503（采集关闭），此时采集失败——
+# 这正是期望行为：要么显式开启并给 Prometheus 配令牌，要么不要启用监控覆盖。
+
+global:
+  scrape_interval: ${RAGKB_SCRAPE_INTERVAL:-30s}
+  scrape_timeout: ${RAGKB_SCRAPE_TIMEOUT:-10s}
+  evaluation_interval: ${RAGKB_SCRAPE_INTERVAL:-30s}
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: ragkb-api
+    metrics_path: /api/v1/operations/metrics
+    scheme: http
+    # 令牌来自仓库外、由 render-prometheus.sh 生成的容器可读副本（0444），整目录
+    # 只读挂载到 /etc/prometheus-secrets。不要放到 /etc/prometheus 下：那里整目录
+    # 被渲染产物只读挂载覆盖。镜像以 nobody(65534) 运行，故宿主目录必须可遍历。
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus-secrets/metrics_token
+    static_configs:
+      - targets:
+          - api:8000
+        labels:
+          # 当前部署是单 uvicorn 进程，指标不带实例维度，因此所有 ragkb_* 指标
+          # 只描述“这一个 API 进程”，不能当作集群总量。这里把 instance 固定成
+          # 可读别名，方便在 Grafana/告警里一眼看出语义；只有一个目标，不会冲突。
+          instance: ${RAGKB_INSTANCE_LABEL:-ragkb-single-api}
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

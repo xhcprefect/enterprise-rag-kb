@@ -1,0 +1,75 @@
+# HTTP 告警：基于 ragkb_http_* 指标（单 API 进程统计）。
+#
+#   ragkb_http_requests_total{method,route,status,stream}
+#     status 是数字字符串（"200"/"500"…），stream 为 "true"/"false"
+#   ragkb_http_request_duration_seconds_bucket{method,route,status}
+#     只覆盖非 SSE 请求；SSE 的时长看 ragkb_chat_total_seconds
+#   ragkb_http_in_flight_requests
+#   ragkb_metrics_process_local == 1 表示确实采集到了本进程的指标
+groups:
+  - name: ragkb-http
+    interval: 30s
+    rules:
+      - alert: RagkbMetricsMissing
+        expr: absent(ragkb_metrics_process_local)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "采集不到 ragkb 指标"
+          description: >-
+            METRICS_TOKEN 未配置（接口关闭）、令牌不匹配或 API 不可达都会触发。
+            监控覆盖启用前必须先在 backend/.env 设置 METRICS_TOKEN 并重启 api。
+
+      - alert: RagkbHttpServerErrorRateHigh
+        expr: |
+          (
+            sum without (route, status, stream) (rate(ragkb_http_requests_total{status=~"5.."}[10m]))
+            /
+            clamp_min(sum without (route, status, stream) (rate(ragkb_http_requests_total[10m])), 0.001)
+          ) > ${RAGKB_ALERT_HTTP_5XX_RATIO:-0.05}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTP 5xx 比例高于 {{ $value | humanizePercentage }}"
+          description: >-
+            单 API 进程统计；SSE 流在头部发出后出错通常记为 stream=true 的最终状态，
+            个别中断可能落在 4xx/连接关闭，需要结合日志判断。
+
+      - alert: RagkbHttpServerErrors
+        expr: |
+          sum without (route, status, stream) (increase(ragkb_http_requests_total{status=~"5.."}[10m])) >=
+          ${RAGKB_ALERT_HTTP_5XX_MIN_COUNT:-5}
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "最近 10 分钟出现 {{ $value }} 个 5xx 响应"
+          description: "低流量兜底告警，阈值 RAGKB_ALERT_HTTP_5XX_MIN_COUNT。"
+
+      - alert: RagkbHttpLatencySlow
+        expr: |
+          histogram_quantile(
+            ${RAGKB_ALERT_HTTP_QUANTILE:-0.95},
+            sum without (method, route, status) (rate(ragkb_http_request_duration_seconds_bucket[10m]))
+          ) > ${RAGKB_ALERT_HTTP_SECONDS:-5}
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "非流式 HTTP 请求 P95 超过 {{ $value }}s"
+          description: >-
+            只统计非 SSE 请求（stream=false）。流式问答的长连接不计入这个直方图，
+            要看 ragkb_chat_total_seconds_*。
+
+      - alert: RagkbHttpInFlightSaturated
+        expr: ragkb_http_in_flight_requests > ${RAGKB_ALERT_HTTP_IN_FLIGHT_MAX:-100}
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "单进程 in-flight 请求数持续高于 {{ $value }}"
+          description: >-
+            这是观测值，不是容量承诺；本项目的入口准入、异步 HTTP 池和上游额度
+            才是实际瓶颈。不要把该数值当作压测结论。
