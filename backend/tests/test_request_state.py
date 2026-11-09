@@ -2,7 +2,7 @@
 import asyncio
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -124,7 +124,8 @@ class RequestStateTests(unittest.TestCase):
         self.user.is_admin = True
         reservation = chat_turns.Reservation(self.turn_id, self.request_id, self.conv_id,
             self.turn.user_message_id, self.user.id, replay_answer="saved" * 1800,
-            replay_trace={"finish_reason": "stop", "large_diagnostic": "x" * 20000}, assistant_message_id=self.answer.id)
+            replay_trace={"finish_reason": "stop", "large_diagnostic": "x" * 20000}, assistant_message_id=self.answer.id,
+            auth_token_version=7, mode="chat")
         async def consume(response):
             return [frame async for frame in response.body_iterator]
         with patch.object(chat_turns, "claim_turn", return_value=reservation), \
@@ -138,27 +139,55 @@ class RequestStateTests(unittest.TestCase):
         model.assert_not_called()
 
     def test_lease_check_uses_owner_current_access_and_unexpired_processing_token(self):
+        from app.services import answer_sources as sources
         reservation = chat_turns.Reservation(self.turn_id, self.request_id, self.conv_id,
-                                             self.turn.user_message_id, self.user.id)
+                                             self.turn.user_message_id, self.user.id,
+                                             auth_token_version=7, mode="chat")
         db = MagicMock()
-        db.scalar.return_value = self.turn_id
-        db.execute.return_value.rowcount = 1
-        with patch.object(chat_turns, "SessionLocal") as sessions:
+        conv = SimpleNamespace(id=self.conv_id, user_id=self.user.id, mode="chat", kb_id=None,
+                               active_turn_id=self.turn_id,
+                               lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                               project_snapshot_id=None, scope_revision=0, document_scope=[])
+        turn = SimpleNamespace(id=self.turn_id, user_id=self.user.id, request_id=self.request_id,
+                               conversation_id=self.conv_id, user_message_id=self.turn.user_message_id,
+                               status="processing", project_snapshot_id=None, heartbeat_at=None)
+        db.scalar.side_effect = [conv, turn]
+        root = sources.SourceRoot(
+            user=SimpleNamespace(id=self.user.id, is_active=True, token_version=7, is_admin=False),
+            knowledge_base=None)
+        with patch.object(sources, "lock_root", return_value=root), \
+             patch.object(chat_turns, "SessionLocal") as sessions:
             sessions.return_value.__enter__.return_value = db
             self.assertTrue(chat_turns.check_lease(reservation, True))
-        statement = str(db.scalar.call_args.args[0])
-        for clause in ("conversations.active_turn_id =", "conversations.lease_expires_at >", "chat_turns.status =",
-                       "users.is_active IS true", "knowledge_bases.is_public IS true"):
-            self.assertIn(clause, statement)
+        # 根锁复核锁定后的当前用户令牌与 ACL；会话/轮次锁后复核身份与租约。
+        self.assertEqual(root.user.token_version, reservation.auth_token_version)
+        for statement, clause in [(db.scalar.call_args_list[0].args[0], "conversations.id ="),
+                                  (db.scalar.call_args_list[1].args[0], "chat_turns.id =")]:
+            self.assertIn(clause, str(statement))
+            self.assertIn("FOR UPDATE", str(statement))
+        self.assertEqual(conv.lease_expires_at - datetime.now(timezone.utc) > timedelta(seconds=0), True)
         db.commit.assert_called_once()
 
     def test_lease_renewal_partial_match_rolls_back(self):
+        from app.services import answer_sources as sources
         reservation = chat_turns.Reservation(self.turn_id, self.request_id, self.conv_id,
-                                             self.turn.user_message_id, self.user.id)
+                                             self.turn.user_message_id, self.user.id,
+                                             auth_token_version=7, mode="chat")
         db = MagicMock()
-        db.scalar.return_value = self.turn_id
-        db.execute.side_effect = [SimpleNamespace(rowcount=1), SimpleNamespace(rowcount=0)]
-        with patch.object(chat_turns, "SessionLocal") as sessions:
+        # 活跃轮次与租约正确，但轮次身份漂移（request_id 错）→ 复核失败 → 回滚。
+        conv = SimpleNamespace(id=self.conv_id, user_id=self.user.id, mode="chat", kb_id=None,
+                               active_turn_id=self.turn_id,
+                               lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                               project_snapshot_id=None, scope_revision=0, document_scope=[])
+        turn = SimpleNamespace(id=self.turn_id, user_id=self.user.id, request_id=uuid.uuid4(),
+                               conversation_id=self.conv_id, user_message_id=self.turn.user_message_id,
+                               status="processing", project_snapshot_id=None, heartbeat_at=None)
+        db.scalar.side_effect = [conv, turn]
+        root = sources.SourceRoot(
+            user=SimpleNamespace(id=self.user.id, is_active=True, token_version=7, is_admin=False),
+            knowledge_base=None)
+        with patch.object(sources, "lock_root", return_value=root), \
+             patch.object(chat_turns, "SessionLocal") as sessions:
             sessions.return_value.__enter__.return_value = db
             self.assertFalse(chat_turns.check_lease(reservation, True))
         db.commit.assert_not_called()

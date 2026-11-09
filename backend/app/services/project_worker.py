@@ -23,6 +23,9 @@ from app.core.config import settings
 logger = logging.getLogger("project_worker")
 
 RECOVER_INTERVAL_SECONDS = 30
+# 到期自动同步源的最多轮询频率（秒）：每轮最多入队 1 个源；扫描/解析仍完全在
+# project worker 既有同步路径内完成，绝不在 API 请求路径触发目录扫描。
+AUTO_SYNC_POLL_SECONDS = 5
 
 
 def _poll_seconds() -> float:
@@ -33,13 +36,14 @@ def _poll_seconds() -> float:
 
 
 def run(stop_event: threading.Event) -> None:
-    """project 角色 supervisor 循环：恢复 -> 领取 -> 处理，协作停机。"""
+    """project 角色 supervisor 循环：恢复 -> 自动调度 -> 领取 -> 处理，协作停机。"""
     # 动态 import 放在函数内：只在选中本项目角色时才 import project_index，
     # worker.py 的启动路径保证本模块只在 project 角色被加载，缺依赖不影响其他角色。
-    from app.services import project_index
+    from app.services import project_auto_sync, project_index
 
     logger.info("project worker 启动")
     last_recover = 0.0
+    last_auto_sync = float("-inf")
     poll = _poll_seconds()
     while not stop_event.is_set():
         now = time.monotonic()
@@ -49,6 +53,14 @@ def run(stop_event: threading.Event) -> None:
                 project_index.recover_stale_jobs()
             except Exception:  # noqa: BLE001
                 logger.exception("项目任务恢复扫描失败")
+
+        # 到期自动同步入队：每轮最多一次（≤ 每 5 秒），异常只记录不杀 supervisor。
+        if now - last_auto_sync >= AUTO_SYNC_POLL_SECONDS:
+            last_auto_sync = now
+            try:
+                project_auto_sync.enqueue_due_sources(limit=1)
+            except Exception:  # noqa: BLE001 - 调度异常不得中断 worker
+                logger.exception("自动同步调度异常")
 
         snap = None
         try:

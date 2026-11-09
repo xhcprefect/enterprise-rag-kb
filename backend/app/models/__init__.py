@@ -8,6 +8,16 @@ from app.models.conversation import (
     Message,
 )
 from app.models.document import Document, DocumentChunk, DocumentStatus, KnowledgeBase
+from app.models.feedback import (
+    FEEDBACK_CATEGORIES,
+    FEEDBACK_STATUSES,
+    AnswerFeedback,
+)
+from app.models.feedback_regression import (
+    REGRESSION_PROTOCOL_VERSION,
+    FeedbackRegression,
+    FeedbackRegressionRun,
+)
 from app.models.memory import ConversationMemory, SummaryJob, SummaryJobStatus
 from app.models.project import (
     ProjectChunk,
@@ -38,9 +48,15 @@ __all__ = [
     "ConversationMemory",
     "SummaryJob",
     "SummaryJobStatus",
+    "AnswerFeedback",
+    "FeedbackRegression",
+    "FeedbackRegressionRun",
+    "REGRESSION_PROTOCOL_VERSION",
     "Document",
     "DocumentChunk",
     "DocumentStatus",
+    "FEEDBACK_CATEGORIES",
+    "FEEDBACK_STATUSES",
     "KnowledgeBase",
     "KNOWLEDGE_BASE_KIND_UPLOAD",
     "KNOWLEDGE_BASE_KIND_PROJECT",

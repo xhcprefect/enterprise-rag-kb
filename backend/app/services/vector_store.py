@@ -11,7 +11,8 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 from langchain_core.documents import Document as LCDocument
 
-from app.models import Document, DocumentStatus, KnowledgeBase
+from app.models import Document, KnowledgeBase
+from app.services.document_lifecycle import retrievable_conditions
 
 from app.core.config import settings
 from app.db.session import engine as app_engine
@@ -156,6 +157,10 @@ def load_ready_citations(collection_name: str, citations: list[dict]) -> list[tu
             end = citation.get("chunk_end") if citation.get("chunk_end") is not None else chunk_index
             if any(not isinstance(value, int) or isinstance(value, bool) for value in (start, end)) or not 0 <= start <= chunk_index <= end or end - start > 4:
                 continue
+            # 只有键缺省才按上传文档兼容（旧引用没有该字段）；显式 None/非 document
+            # （如项目来源或不认识的类型）一律拒绝，绝不当 uploaded document。
+            if "source_kind" in citation and citation["source_kind"] != "document":
+                continue
             requests.append((document_id, chunk_index, version or 0, citation, start, end))
         except (ValueError, TypeError, AttributeError):
             continue
@@ -174,8 +179,7 @@ def load_ready_citations(collection_name: str, citations: list[dict]) -> list[tu
             .where(
                 rows.collection_id == collection.uuid,
                 KnowledgeBase.collection_name == collection_name,
-                Document.status == DocumentStatus.READY.value,
-                Document.cancel_requested.is_(False),
+                *retrievable_conditions(),
                 func.coalesce(rows.cmetadata["index_version"].astext, "0") == cast(Document.index_version, String),
                 or_(*(and_(rows.cmetadata["document_id"].astext == document_id,
                            rows.cmetadata["chunk_index"].astext.in_([str(index) for index in range(start, end + 1)]),
@@ -212,6 +216,17 @@ def load_ready_citations(collection_name: str, citations: list[dict]) -> list[tu
     return result
 
 
+def _with_current_version(metadata: dict | None, version: int) -> dict:
+    """旧向量的 cmetadata 可能没有 index_version；用已核对的文档行补齐权威代次。
+
+    只补键缺省的情况：显式存在的元数据值已由 SQL 与本行代次等值核对过。
+    """
+    meta = dict(metadata or {})
+    if meta.get("index_version") is None:
+        meta["index_version"] = version
+    return meta
+
+
 def search_ready_vectors(store: PGVector, vector: list[float], k: int, *,
                          document_scope: list[dict] | None = None) -> list[tuple[LCDocument, float]]:
     """在 SQL 中过滤无效文档和旧代次；兼容旧向量缺少 index_version 的情况。"""
@@ -224,14 +239,13 @@ def search_ready_vectors(store: PGVector, vector: list[float], k: int, *,
         if collection is None:
             return []
         statement = (
-            select(rows.document, rows.cmetadata, distance)
+            select(rows.document, rows.cmetadata, distance, Document.index_version)
             .join(Document, cast(Document.id, String) == rows.cmetadata["document_id"].astext)
             .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
             .where(
                 rows.collection_id == collection.uuid,
                 KnowledgeBase.collection_name == store.collection_name,
-                Document.status == DocumentStatus.READY.value,
-                Document.cancel_requested.is_(False),
+                *retrievable_conditions(),
                 func.coalesce(rows.cmetadata["index_version"].astext, "0") == cast(Document.index_version, String),
             )
         )
@@ -241,4 +255,5 @@ def search_ready_vectors(store: PGVector, vector: list[float], k: int, *,
         if settings.RETRIEVAL_MIN_SIMILARITY > 0:
             statement = statement.where(distance <= 1.0 - settings.RETRIEVAL_MIN_SIMILARITY)
         result = db.execute(statement.order_by(distance).limit(k)).all()
-        return [(LCDocument(page_content=text, metadata=meta or {}), float(score)) for text, meta, score in result]
+        return [(LCDocument(page_content=text, metadata=_with_current_version(meta, version)), float(score))
+                for text, meta, score, version in result]

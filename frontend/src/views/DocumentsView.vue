@@ -254,7 +254,7 @@
       </div>
 
       <el-table v-loading="loading" :data="docs" class="table">
-        <el-table-column :label="t('documents.table.filename')" min-width="280">
+        <el-table-column :label="t('documents.table.filename')" min-width="220">
           <template #default="{ row }">
             <div class="file-cell">
               <span class="file-ext" :class="extClass(row.file_ext)">{{ extLabel(row.file_ext) }}</span>
@@ -263,14 +263,14 @@
           </template>
         </el-table-column>
 
-        <el-table-column :label="t('documents.table.size')" width="100">
+        <el-table-column :label="t('documents.table.size')" width="80">
           <template #default="{ row }">
             <span class="num">{{ formatSize(row.file_size) }}</span>
           </template>
         </el-table-column>
 
         <!-- 状态与进度合并：就绪/失败/取消显示标签，排队与处理中直接显示进度条 -->
-        <el-table-column :label="t('documents.table.status')" width="180">
+        <el-table-column :label="t('documents.table.status')" width="160">
           <template #default="{ row }">
             <el-progress
               v-if="row.status === 'pending' || (row.status === 'processing' && !row.progress)"
@@ -312,19 +312,51 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="chunk_count" :label="t('documents.table.chunks')" width="80" align="center">
+        <el-table-column prop="chunk_count" :label="t('documents.table.chunks')" width="70" align="center">
           <template #default="{ row }">
             <span class="num">{{ formatNumber(row.chunk_count) }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column :label="t('documents.table.chars')" width="100" align="right">
+        <el-table-column :label="t('documents.table.chars')" width="90" align="right">
           <template #default="{ row }">
             <span class="num">{{ formatNumber(row.char_count) }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column :label="t('documents.table.uploadedAt')" width="190">
+        <el-table-column :label="t('documents.table.lifecycle')" width="110">
+          <template #default="{ row }">
+            <el-tooltip
+              :content="lifecycleTooltip(row)"
+              placement="top"
+              :disabled="!lifecycleTooltip(row)"
+            >
+              <el-tag :type="lifecycleType(row.lifecycle_state)" size="small" effect="light">
+                {{ lifecycleText(row.lifecycle_state) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+
+        <el-table-column :label="t('documents.table.maintainer')" min-width="100">
+          <template #default="{ row }">
+            <span v-if="row.maintainer" class="maintainer-text" :title="row.maintainer">
+              {{ row.maintainer }}
+            </span>
+            <span v-else class="time">—</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column :label="t('documents.table.validity')" width="180" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="row.valid_from || row.valid_until" class="time">
+              {{ formatValidityWindow(row) }}
+            </span>
+            <span v-else class="time">—</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column :label="t('documents.table.uploadedAt')" width="170">
           <template #default="{ row }">
             <span class="time">{{ formatDateTime(row.created_at) }}</span>
           </template>
@@ -333,7 +365,7 @@
         <el-table-column
           v-if="userStore.isAdmin"
           :label="t('documents.table.actions')"
-          width="210"
+          width="290"
           fixed="right"
         >
           <template #default="{ row }">
@@ -349,6 +381,21 @@
               </el-button>
               <el-button link type="primary" size="small" @click="reindex(row)">
                 {{ t('documents.rebuild') }}
+              </el-button>
+              <el-button link type="primary" size="small" @click="openQuality(row)">
+                {{ t('documents.quality.button') }}
+              </el-button>
+              <el-button link type="primary" size="small" @click="openGovernance(row)">
+                {{ t('documents.governance.edit') }}
+              </el-button>
+              <el-button
+                v-if="row.status === 'ready'"
+                link
+                type="primary"
+                size="small"
+                @click="openComparison(row)"
+              >
+                {{ t('documents.comparison.action') }}
               </el-button>
               <el-button link type="danger" size="small" @click="remove(row)">
                 {{ t('common.delete') }}
@@ -377,6 +424,22 @@
         />
       </div>
     </div>
+
+    <DocumentGovernanceDialog
+      v-model="governanceOpen"
+      :kb-id="kbId"
+      :doc="governanceDoc"
+      @saved="onGovernanceSaved"
+      @refreshed="onGovernanceRefreshed"
+      @supersede-request="openComparison"
+    />
+    <DocumentComparisonDialog
+      v-model="comparisonOpen"
+      :kb-id="kbId"
+      :doc="comparisonDoc"
+      @superseded="onComparisonSuperseded"
+    />
+    <DocumentQualityDrawer v-model="qualityOpen" :kb-id="kbId" :doc="qualityDoc" />
   </div>
 </template>
 
@@ -395,6 +458,9 @@ import {
   type UploadCompleteResult,
   type UploadSession
 } from '@/api'
+import DocumentGovernanceDialog from '@/components/DocumentGovernanceDialog.vue'
+import DocumentComparisonDialog from '@/components/DocumentComparisonDialog.vue'
+import DocumentQualityDrawer from '@/components/DocumentQualityDrawer.vue'
 import { useUserStore } from '@/stores/user'
 import { hashFile, isIngestQueued } from '@/utils/upload'
 import { formatDateTime, formatNumber } from '@/i18n/format'
@@ -421,6 +487,13 @@ import {
 } from '@/utils/documentIdentity'
 import { isLatestResponse, isStalePoll, makeQuery, queryParams, shouldPoll } from '@/utils/documentList'
 import { runWorkerGroup } from '@/utils/documentChunks'
+import {
+  belongsToGovernanceSession,
+  lifecycleTagType,
+  normalizeLifecycleState,
+  replaceGovernanceRow,
+  type GovernanceRequestIdentity
+} from '@/utils/documentGovernance'
 import {
   canApplyRestoredResume,
   clearResumeRecord,
@@ -577,6 +650,103 @@ let pollInFlight = false
 const listEpoch = ref(0)
 // 最近一次"用户操作触发的加载"序号，仅用于收掉 loading
 const loadEpoch = ref(0)
+
+// ---------- 治理（admin 编辑 / 替代 / 重新启用） ----------
+
+const governanceOpen = ref(false)
+const governanceDoc = ref<DocumentItem | null>(null)
+const qualityOpen = ref(false)
+const qualityDoc = ref<DocumentItem | null>(null)
+const comparisonOpen = ref(false)
+const comparisonDoc = ref<DocumentItem | null>(null)
+// 治理写请求代次：切库、关窗、卸载都会 +1，迟到的响应不再落地
+let governanceEpoch = 0
+// 最近一次打开的请求身份：只有它发出的 saved/refreshed 才能改行、关窗
+let governanceRequest: GovernanceRequestIdentity | null = null
+
+function lifecycleText(state: string) {
+  return t(`documents.lifecycle.${normalizeLifecycleState(state)}`)
+}
+
+function lifecycleType(state: string) {
+  return lifecycleTagType(normalizeLifecycleState(state))
+}
+
+/** 生命周期标签的悬浮说明：说明谁在什么时候不再可检索，不含任何权限语义。 */
+function lifecycleTooltip(row: DocumentItem) {  const parts: string[] = []
+  if (row.superseded_at) parts.push(t('documents.governance.tip.superseded'))
+  else if (!row.enabled) parts.push(t('documents.governance.tip.disabled'))
+  else if (row.lifecycle_state === 'scheduled') parts.push(t('documents.governance.tip.scheduled'))
+  else if (row.lifecycle_state === 'expired') parts.push(t('documents.governance.tip.expired'))
+  if (row.status !== 'ready') parts.push(t('documents.governance.tip.notReady'))
+  return parts.join('；') || ''
+}
+
+function formatValidityWindow(row: DocumentItem) {
+  if (row.valid_from && row.valid_until) {
+    return `${formatDateTime(row.valid_from)} → ${formatDateTime(row.valid_until)}`
+  }
+  if (row.valid_from) return `${formatDateTime(row.valid_from)} →`
+  return `→ ${formatDateTime(row.valid_until as string)}`
+}
+
+/** 管理员行操作：打开治理表单（快照在弹窗内持有 expected_revision）。 */
+function openGovernance(row: DocumentItem) {
+  governanceEpoch += 1
+  governanceRequest = { kbId, docId: row.id, epoch: governanceEpoch }
+  governanceDoc.value = row
+  governanceOpen.value = true
+}
+
+/** 管理员行操作/治理弹窗入口：打开同一套“版本对比”弹窗。 */
+function openComparison(row: DocumentItem) {
+  comparisonDoc.value = row
+  comparisonOpen.value = true
+}
+
+/** 管理员行操作：打开该文档的入库质量抽屉（组件内部自行加载并处理竞态）。 */
+function openQuality(row: DocumentItem) {
+  qualityDoc.value = row
+  qualityOpen.value = true
+}
+
+/** 响应是否仍属于当前打开会话（KB/文档/代次/开窗状态全部一致）。 */
+function isCurrentGovernance(response: DocumentItem): boolean {
+  return belongsToGovernanceSession(governanceRequest, {
+    kbId,
+    epoch: governanceEpoch,
+    open: governanceOpen.value,
+    disposed,
+    docId: governanceDoc.value?.id ?? null
+  }, response)
+}
+
+/** 治理写回成功：只接受"这次弹窗发出"的响应，绝不覆盖别的行。 */
+function onGovernanceSaved(updated: DocumentItem) {
+  if (!isCurrentGovernance(updated)) return
+  governanceOpen.value = false
+  governanceRequest = null
+  replaceGovernanceRow(docs.value, updated)
+  void load()
+}
+
+/** 409 后弹窗拉到了新鲜详情：更新行、保持开窗，由用户重审后再提交。 */
+function onGovernanceRefreshed(updated: DocumentItem) {
+  if (!isCurrentGovernance(updated)) return
+  // 同步 doc 属性，让替代标记/启用状态与最新详情一致（不会重开表单）
+  governanceDoc.value = updated
+  replaceGovernanceRow(docs.value, updated)
+}
+
+/** 对比弹窗完成替代：只替换同 id 行；同一文档的治理弹窗同时关闭。 */
+function onComparisonSuperseded(updated: DocumentItem) {
+  replaceGovernanceRow(docs.value, updated)
+  if (governanceOpen.value && governanceDoc.value?.id === updated.id) {
+    governanceOpen.value = false
+  }
+  ElMessage.success(t('documents.comparison.toast.superseded'))
+  void load()
+}
 
 function statusType(status: string) {
   if (status === 'ready') return 'success'
@@ -1436,6 +1606,12 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   disposed = true
+  // 卸载后任何治理/对比响应都不能再关窗、改行或提示
+  governanceEpoch += 1
+  governanceRequest = null
+  governanceOpen.value = false
+  comparisonOpen.value = false
+  comparisonDoc.value = null
   stopPolling()
   if (searchTimer) window.clearTimeout(searchTimer)
   // 离开页面：在途上传转为暂停并保留会话，回来后（或刷新后）可续传

@@ -41,7 +41,7 @@ function snap(id: string, status: ProjectSnapshot['status']): ProjectSnapshot {
     id, source_id: 'ignored', status, base_snapshot_id: null, progress: 0,
     file_count: 0, total_bytes: 0, manifest_fingerprint: null, config_fingerprint: null,
     error_code: null, error_message: null, cancel_requested: false,
-    started_at: null, finished_at: null, created_at: ''
+    started_at: null, finished_at: null, created_at: '', trigger_source: 'manual'
   }
 }
 
@@ -418,4 +418,105 @@ test('requestSync returns null on failure instead of pretending success', async 
   assert.equal(result, null, '失败应返回 null 而非伪成功')
   assert.equal(h.snapCount(), before, '失败后不重读快照')
   assert.deepEqual(h.syncCalls, ['A'])
+})
+
+// ---------------- refreshSnapshots：不重载视图、不覆盖显式旧快照 ----------------
+test('refreshSnapshots updates the snapshot list without reloading the view or overriding an explicit snapshot', async () => {
+  const h = makeHarness()
+  h.controller.selectSource('A')
+  await flush()
+  // 初始有 S1/S2，自动落到最新 ready S2；用户随后显式切回旧快照 S1。
+  h.resolveSnapshots(0, [snap('S2', 'ready'), snap('S1', 'ready')])
+  await flush()
+  h.resolveFiles(0, 1, [file('new.ts', 'F2')])
+  await flush()
+  h.controller.selectSnapshot('S1', true)
+  await flush()
+  h.resolveFiles(1, 1, [file('old.ts', 'F1')])
+  await flush()
+  assert.equal(h.lastView().snapshotId, 'S1')
+  assert.equal(h.lastView().items[0].file_version_id, 'F1')
+  const filesBefore = h.fileCount()
+
+  // 15 秒空闲刷新：服务端出现更新的 ready S3。
+  const refreshing = h.controller.refreshSnapshots()
+  await flush()
+  assert.equal(h.snapCount(), 2)
+  h.resolveSnapshots(1, [snap('S3', 'ready'), snap('S2', 'ready'), snap('S1', 'ready')])
+  await refreshing
+  await flush()
+
+  assert.equal(h.fileCount(), filesBefore, '轻量刷新不得重载当前文件视图')
+  assert.equal(h.lastView().snapshotId, 'S1', '不得覆盖用户显式选择的旧快照')
+  assert.equal(h.lastView().ready, true)
+  assert.equal(h.lastView().latestReadySnapshotId, 'S3', '页面应通过 latestReadySnapshotId 得知新版本')
+  assert.equal(h.lastView().status, 'ok')
+  assert.equal(h.lastView().items.length, 1, '轻量刷新必须保留当前已展示内容')
+  assert.equal(h.lastView().items[0].file_version_id, 'F1')
+  assert.equal(h.availablePolls(), 0, '无活动同步时不应开始轮询')
+})
+
+// ---------------- refreshSnapshots：发现活动任务后开始有界轮询 ----------------
+test('refreshSnapshots starts the bounded poll when it discovers an active sync', async () => {
+  const h = makeHarness()
+  h.controller.selectSource('A')
+  await flush()
+  h.resolveSnapshots(0, [snap('S1', 'ready')])
+  await flush()
+  h.resolveFiles(0, 1, [file('a.ts', 'F1')])
+  await flush()
+  assert.equal(h.availablePolls(), 0)
+  const filesBefore = h.fileCount()
+
+  const refreshing = h.controller.refreshSnapshots()
+  await flush()
+  h.resolveSnapshots(1, [snap('S1', 'ready'), snap('SP', 'processing')])
+  await refreshing
+  await flush()
+  assert.equal(h.availablePolls(), 1, '发现活动同步应立即开始有界轮询')
+  assert.equal(h.lastView().hasActiveSync, true)
+  assert.equal(h.fileCount(), filesBefore, '开始轮询不得重载当前视图')
+  assert.equal(h.lastView().items.length, 1, '发现活动同步后必须保留当前文件列表')
+  assert.equal(h.lastView().items[0].file_version_id, 'F1')
+
+  h.advance(2500)
+  assert.ok(h.tickPoll())
+  await flush()
+  h.resolveSnapshots(2, [snap('S2', 'ready'), snap('S1', 'ready')])
+  await flush()
+  assert.equal(h.fileCount(), filesBefore, '轮询发现新 ready 也不得重载显式/当前视图')
+  assert.equal(h.lastView().snapshotId, 'S1')
+  assert.equal(h.lastView().latestReadySnapshotId, 'S2')
+  assert.equal(h.lastView().hasActiveSync, false)
+  assert.equal(h.lastView().status, 'ok', '轮询更新快照状态不得把已加载视图打回 loading')
+  assert.equal(h.lastView().total, 1, '轮询后必须保留当前分页 total')
+  assert.equal(h.lastView().items.length, 1, '轮询后必须保留当前文件列表')
+  assert.equal(h.lastView().items[0].file_version_id, 'F1')
+  assert.equal(h.availablePolls(), 0, '活动同步结束后停止轮询')
+})
+
+// ---------------- refreshSnapshots：迟到/切源不落界面 ----------------
+test('a late refreshSnapshots response after switching source never reaches the new view', async () => {
+  const h = makeHarness()
+  h.controller.selectSource('A')
+  await flush()
+  h.resolveSnapshots(0, [snap('SA', 'ready')])
+  await flush()
+  h.resolveFiles(0, 1, [file('a.ts', 'FA')])
+  await flush()
+  const filesBefore = h.fileCount()
+
+  const lateRefresh = h.controller.refreshSnapshots()
+  await flush()
+  // A 的快照请求尚未返回就切到 B。
+  h.controller.selectSource('B')
+  await flush()
+  const snapCallsAfterSwitch = h.snapCalls.length
+
+  h.resolveSnapshots(1, [snap('SA2', 'ready')])
+  await lateRefresh
+  await flush()
+  assert.equal(h.snapCalls.length, snapCallsAfterSwitch, '切源后迟到的 A 快照不得投给页面')
+  assert.equal(h.lastView().sourceId, 'B', '仍停留在新源')
+  assert.equal(h.fileCount(), filesBefore, '迟到响应不得触发文件加载')
 })

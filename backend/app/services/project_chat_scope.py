@@ -23,7 +23,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session as DBSession
 
 from app.models import KnowledgeBase, ProjectSource, User
-from app.services import project_retrieval
+from app.services import answer_sources, project_retrieval
+from app.services.answer_sources import SourceVerificationError
 from app.services.project_retrieval import ProjectSnapshotNotReady
 from app.services.project_sources import ProjectSourceNotFound, ProjectSourceRevoked
 
@@ -121,6 +122,87 @@ def replay_project_check(db: DBSession, user_id, snapshot_id) -> None:
         raise HTTPException(404, "项目源不存在或无权访问") from None
     except ProjectSnapshotNotReady:
         raise HTTPException(409, "项目快照不再可用，请刷新会话") from None
+
+
+def plan_claim_project(db: DBSession, *, kb, user: User, peek_conv, explicit_sid,
+                       document_ids, new_conv: bool) -> uuid.UUID:
+    """认领第一阶段（**不取会话锁**）：只决定本次要绑定并锁定哪个快照 id。
+
+    真正的 ready / revoked / ACL / 同源校验发生在 ``lock_claim_binding``（ProjectSource ->
+    ProjectSnapshot 行锁），随后由 ``verify_claim_binding`` 在会话锁内复核探读值未漂移。
+    这样项目绑定锁一定先于 Conversation 锁。
+    """
+    if document_ids is not None:
+        raise HTTPException(400, "项目知识库不使用文档范围")
+    if kb is None or kb.kind != "project":
+        raise HTTPException(400, "仅项目知识库会话支持项目快照")
+    if new_conv:
+        if explicit_sid is not None:
+            return explicit_sid
+        source = db.scalar(select(ProjectSource).where(ProjectSource.kb_id == kb.id))
+        if source is None or source.active_snapshot_id is None:
+            raise HTTPException(409, "项目快照尚未就绪或不存在，请刷新后重试")
+        return source.active_snapshot_id
+    bound = getattr(peek_conv, "project_snapshot_id", None)
+    if bound is None:
+        raise HTTPException(409, "会话未绑定项目快照，请刷新或新建会话")
+    if explicit_sid is not None and explicit_sid != bound:
+        raise HTTPException(409, "已有会话请通过快照切换接口更新项目快照")
+    return bound
+
+
+def lock_claim_binding(db: DBSession, *, kb, user: User, snapshot_id: uuid.UUID):
+    """项目绑定第二段：``ProjectSource -> ProjectSnapshot`` 行锁 + ready/ACL/撤销校验。
+
+    必须在会话锁之前调用；失败映射为面向 API 的 HTTP 错误（410/404/409）。
+    """
+    try:
+        binding = answer_sources.lock_project_binding(db, [snapshot_id], kb=kb, user=user)
+    except SourceVerificationError as exc:
+        if "项目源已撤销" in str(exc):
+            raise HTTPException(410, "项目源已删除或撤销，无法继续检索") from exc
+        raise HTTPException(409, "项目快照尚未就绪或不存在，请刷新后重试") from exc
+    return binding
+
+
+def verify_claim_binding(db: DBSession, *, conv, binding, snapshot_id: uuid.UUID,
+                         new_conv: bool, require_active: bool = True) -> None:
+    """会话锁内复核：锁定后的绑定确实是该 KB 的源、会话绑定就是本快照。
+
+    新会话且未显式指定 sid 时，还要求该源当前 ``active_snapshot_id`` 仍等于本快照
+    （锁等待期间被切换则拒绝，绝不悄悄绑定刚切走/切来的快照）。
+    """
+    snapshot = binding.snapshots.get(snapshot_id) if binding is not None else None
+    if snapshot is None:
+        raise HTTPException(409, "项目快照尚未就绪或不存在，请刷新后重试")
+    owner = binding.sources.get(snapshot.source_id)
+    if owner is None or owner.kb_id != conv.kb_id or owner.revoked_at is not None:
+        raise HTTPException(410, "项目源已删除或撤销，无法继续检索")
+    if getattr(conv, "project_snapshot_id", None) != snapshot_id:
+        raise HTTPException(409, "会话项目快照已改变，请刷新后重试")
+    if new_conv and require_active and owner.active_snapshot_id != snapshot_id:
+        raise HTTPException(409, "项目快照已切换，请刷新后重试")
+
+
+def lock_publication_binding(db: DBSession, *, kb, user: User, reservation, sources):
+    """发布阶段：在会话锁之前锁住全部项目来源的 ``ProjectSource -> ProjectSnapshot``。
+
+    所有项目来源必须属于当次请求固定的快照；缺少固定 sid 或跨快照一律拒绝。
+    """
+    snapshot_id = reservation.project_snapshot_id
+    if snapshot_id is None:
+        raise SourceVerificationError("项目请求缺少固定的项目快照")
+    ids = {uuid.UUID(str(source["snapshot_id"])) for source in sources
+           if source.get("source_kind") == answer_sources.SOURCE_KIND_PROJECT}
+    ids.add(snapshot_id)
+    if len(ids) != 1:
+        raise SourceVerificationError("项目来源跨快照")
+    return answer_sources.lock_project_binding(db, [snapshot_id], kb=kb, user=user)
+
+
+def lock_lease_binding(db: DBSession, *, kb, user: User, snapshot_id: uuid.UUID):
+    """租约检查阶段：在会话锁前锁定 Source/Snapshot 并核对当前授权。"""
+    return answer_sources.lock_project_binding(db, [snapshot_id], kb=kb, user=user)
 
 
 def verify_active_project(db: DBSession, conv, reservation) -> None:

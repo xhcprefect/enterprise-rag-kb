@@ -28,7 +28,7 @@
   模式按会话固定，两种会话历史分开；知识库为空时自动进入普通对话
 - **会话管理**：多轮对话上下文、历史会话切换与删除、并发租约与断流结果恢复
 - **普通对话摘要**：可选后台压缩完整历史轮次，查看覆盖水位、摘要来源与重置状态
-- **本地项目索引**：授权目录手动同步、不可变快照、内容搜索、固定快照问答与历史引用预览
+- **本地项目索引**：授权目录手动/可选定时自动同步、不可变快照、内容搜索、固定快照问答与历史引用预览
 - **用量与费用**：实际 Token 与人民币预估费用总览、按小时/天/月趋势、日期/模型/调用类型筛选；管理员全站统计与模型单价设置，普通用户仅查看本人
 - **用户管理**：管理员可创建/编辑/禁用/删除用户、重置密码
 - **批量导入用户**：上传 Excel / CSV 批量建号，每人生成随机初始密码；
@@ -343,9 +343,9 @@ npm --prefix frontend run test:e2e
 python -I backend/scripts/e2e_env.py down --out /tmp/ragkb-browser-run
 ```
 
-每轮测试独占数据库、端口、合成项目与上传目录；API 和模型替身必须通过 owner/nonce 校验。`down` 只清理已核实归属的进程和容器，`--keep` 保留诊断目录。用例覆盖项目登记/同步/搜索、固定快照与并发切换、旧引用预览、摘要发布/重置、断流恢复锁以及合并阶段取消上传后的队列推进。替身输出只验证系统链路，不代表真实模型质量。
+每轮测试独占数据库、端口、合成项目与上传目录；API 和模型替身必须通过 owner/nonce 校验。`down` 只清理已核实归属的进程和容器，`--keep` 保留诊断目录。用例覆盖项目登记/同步/搜索、固定快照与并发切换、旧引用预览、摘要发布/重置、断流恢复锁、合并阶段取消上传后的队列推进，以及 `frontend/e2e/answer-feedback.spec.ts` 的答案反馈流程。替身输出只验证系统链路，不代表真实模型质量。
 
-CI 分别运行后端、前端、浏览器和维护检查。维护回归包括 `deploy/tests/test-maintenance.sh`、`test-remote-backup.sh`、`test-drill-guard.sh` 和 `test-monitoring.sh`；前三者使用合成数据与命令替身，监控检查使用独占 Prometheus 测试容器与合成令牌，验证权限、规则、启动和关闭热重载。它们不恢复业务数据或上传远端备份。
+CI 分别运行后端、前端、浏览器和维护检查。维护回归包括 `deploy/tests/test-maintenance.sh`、`test-remote-backup.sh`、`test-drill-guard.sh`、`test-monitoring.sh` 和 `test-alerting.sh`；前四者使用合成数据、命令替身或独占监控容器，告警检查使用合成指标驱动真实 Prometheus → Alertmanager → 本地 webhook fixture。它们验证权限、规则、启动/关闭热重载及合成 firing/resolved 投递，不恢复业务数据、不向真实接收器发送通知，也不代表生产验收。
 
 固定问题集、离线回放、显式真实服务评测、模型连通性检查和费用估算边界见 [评测说明](backend/evaluation/README.md)。`include_trace=true` 仅管理员可用；普通问答不公开检索诊断。短追问补全与主问答一样通过 SSE 请求云端，兼容返回完整 JSON 的服务，避免某些网关在非流式模式只返回用量而丢失正文。
 
@@ -482,6 +482,13 @@ worker 相互独立，可单独启动。
   生成物与密钥索引进去。
 - **解析与同步**：支持常见源码与文档格式，`PROJECT_PARSE_BATCH` 控制批次；同步为手动
   触发、后台增量执行，增量只处理变更。项目页面可查看同步进度/状态并触发展开或全量重建。
+- **可选自动同步**：管理员可在项目源上开启定时检查（默认关闭，间隔 60 秒–24 小时）。
+  到期源由 project worker 原子领取；内容与当前活动快照一致时只记录检查、不发布新版本；
+  扫描为空或失败时保留旧版本继续可检索。纳入索引的文件在最近
+  `PROJECT_AUTO_SYNC_QUIET_SECONDS`（默认 10 秒，0 表示关闭）内仍被写入时，本次自动同步
+  延后重试，避免编辑器分步保存的半成品被立即发布；手动同步不受安静窗口影响。
+  自动发布成功后页面提示「新版本已可检索」，
+  由用户显式切换；已有会话继续固定原快照，新会话使用新版本。
 - **访问控制**：登记的项目带可访问者范围；用户在对话中选择项目（`kind='project'` 的知识
   库）时，只会检索并引用其有权访问的项目内容，来源预览会路由到项目内文件与行号/符号。
 
@@ -497,7 +504,7 @@ worker 相互独立，可单独启动。
   `/health` 的 `worker` 有三种取值：`alive`（正在处理且有新鲜心跳）、
   `stale`（有排队文档但无人领取，通常是 worker 没启动）、`idle`（队列为空，无法观测）。
 - worker 支持 `--role` 参数三种角色：`ingest`（文档入库，默认，即 `start-worker.bat` 的行为）、
-  `summary`（普通对话摘要压缩）、`project`（项目源码/文档索引与手动同步）。
+  `summary`（普通对话摘要压缩）、`project`（项目源码/文档索引与手动/自动同步）。
   **三种角色相互独立，需各自单独启动**，没有单一脚本能一次拉起全部：
   ```bash
   python worker.py                              # 入库（默认）
@@ -513,6 +520,7 @@ worker 相互独立，可单独启动。
 - **从零开始**（买服务器 → 配安全组 → 装 Docker → 上线验收）：
   [DEPLOY-FROM-SCRATCH.md](DEPLOY-FROM-SCRATCH.md)
 - **已有服务器、只想更新代码**：[DEPLOY.md](DEPLOY.md)
+- **部署验收（只读检查 + 人工证据）**：[deploy/acceptance/README.md](deploy/acceptance/README.md)
 
 一条命令拉起全部组件：
 
@@ -522,10 +530,28 @@ cp .env.example .env && cp backend/.env.example backend/.env   # 填密钥
 docker compose up -d --build
 ```
 
-编排包含 4 个服务：`db`（pgvector）、`api`（uvicorn）、`worker`（入库）、
-`web`（Nginx 静态托管 + 反代）。`api` 与 `worker` 是**同一个镜像**
-（`rag-kb-backend`，只差启动命令），构建一次、两个容器共用，不会出现版本漂移。
+编排默认启动 4 个服务：`db`（pgvector）、`api`（uvicorn）、`worker`（入库）、
+`web`（Nginx 静态托管 + 反代）；另有 2 个按 profile 启用的角色服务：
+`worker-summary`（`--profile summary`）与 `worker-project`（`--profile project`）。
+`api`、`worker` 和两个角色 worker 是**同一个镜像**（`rag-kb-backend`，只差启动命令），
+构建一次、多个容器共用；`web` 单独构建，不会出现后端版本漂移。
 数据统一落在 `${DATA_DIR}`，附备份/恢复脚本，适配可能被回收的竞价实例。
+
+部署验收使用只读 CLI，默认 dry-run（零网络），`--live` 才做有限只读 GET；令牌只从环境变量读取：
+
+```bash
+python backend/scripts/verify_deployment.py --base-url https://rag.example.com --json
+
+export RAG_DEPLOY_ADMIN_TOKEN='<在终端中设置>'
+export RAG_DEPLOY_METRICS_TOKEN='<在终端中设置>'
+python backend/scripts/verify_deployment.py \
+  --base-url https://rag.example.com \
+  --confirm-target https://rag.example.com \
+  --live --out /srv/ragkb-acceptance/verification.json
+```
+
+工具通过不等于业务/生产验收通过；缺失真实证据的项保持 `unknown`，详见
+[部署验收指南](deploy/acceptance/README.md)。
 
 备份产出同一 stamp 的 `ragdb`、`uploads`、`projects` 三份归档和最后发布的 `manifest-*.sha256` 清单；
 恢复按清单校验后覆盖，旧的两件套备份仍兼容（不改动现有 `projects/`）。日常维护入口见

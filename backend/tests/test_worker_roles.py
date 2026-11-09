@@ -94,5 +94,31 @@ class WorkerRoleDispatchTests(unittest.TestCase):
         self.assertTrue(callable(worker._ingest_main))
 
 
+class ProjectWorkerAutoSyncTests(unittest.TestCase):
+    def test_auto_sync_runs_each_round_and_error_does_not_kill_worker(self):
+        # project worker 每轮（≤ AUTO_SYNC_POLL_SECONDS）尝试一次到期自动同步；
+        # 调度异常只记录，supervisor 继续走到领取/空闲等待并可按 stop_event 退出。
+        from app.services import project_auto_sync, project_index, project_worker
+
+        stop = threading.Event()
+        calls = []
+
+        def boom(limit=1):
+            calls.append(limit)
+            raise RuntimeError("scheduler unavailable")
+
+        def stop_after_first_wait(_timeout):
+            stop.set()
+            return True
+
+        with patch.object(project_index, "recover_stale_jobs", return_value=0), \
+             patch.object(project_index, "claim_next_project_snapshot", return_value=None), \
+             patch.object(project_auto_sync, "enqueue_due_sources", side_effect=boom), \
+             patch.object(stop, "wait", side_effect=stop_after_first_wait):
+            project_worker.run(stop)
+
+        self.assertEqual(calls, [1])
+
+
 if __name__ == "__main__":
     unittest.main()

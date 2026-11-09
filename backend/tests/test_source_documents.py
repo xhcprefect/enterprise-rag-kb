@@ -19,7 +19,10 @@ class SourceDocumentTests(unittest.TestCase):
     def setUp(self):
         self.kb_id, self.doc_id = uuid.uuid4(), uuid.uuid4()
         self.doc = SimpleNamespace(id=self.doc_id, kb_id=self.kb_id, status="ready", cancel_requested=False,
-                                   index_version=2, filename="law.pdf", file_ext=".pdf", stored_path="unused")
+                                   index_version=2, filename="law.pdf", file_ext=".pdf", stored_path="unused",
+                                   # 统一可检索判定所需的治理字段
+                                   enabled=True, superseded_at=None, superseded_by_id=None,
+                                   valid_from=None, valid_until=None)
         self.db = MagicMock()
         self.db.scalar.return_value = self.doc
         self.rows = [SimpleNamespace(chunk_index=index, content=f"原文{index}", source_metadata={
@@ -37,8 +40,35 @@ class SourceDocumentTests(unittest.TestCase):
         query = self.db.scalars.call_args.args[0]
         sql = str(query.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
         for condition in ["documents.status = 'ready'", "documents.cancel_requested IS false", "documents.index_version = 2",
-                          "document_chunks.embedded IS true", str(self.kb_id)]:
+                          "document_chunks.embedded IS true", str(self.kb_id),
+                          "documents.superseded_at IS NULL", "documents.superseded_by_id IS NULL",
+                          "documents.enabled IS true", "documents.valid_from IS NULL", "documents.valid_until IS NULL"]:
             self.assertIn(condition, sql)
+
+    def test_governed_documents_cannot_read_original_text(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        for changes in [dict(enabled=False), dict(superseded_at=now), dict(superseded_by_id=self.doc_id),
+                        dict(valid_from=now + timedelta(days=1)), dict(valid_until=now - timedelta(seconds=1)),
+                        dict(status="processing"), dict(cancel_requested=True), dict(index_version=3)]:
+            before = vars(self.doc).copy()
+            self.doc.__dict__.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(HTTPException) as error:
+                sources.read_source(self.db, self.kb_id, self.doc_id, 2, 2)
+            self.assertEqual(error.exception.status_code, 409)
+            self.db.scalars.assert_not_called()
+            self.doc.__dict__.update(before)
+
+    def test_invalid_governance_field_types_fail_closed(self):
+        from datetime import datetime, timezone
+        for changes in [dict(enabled=None), dict(enabled="yes"), dict(valid_until=datetime(2030, 1, 1)),
+                        dict(superseded_at=datetime(2020, 1, 1)), dict(index_version=True)]:
+            before = vars(self.doc).copy()
+            self.doc.__dict__.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(HTTPException) as error:
+                sources.read_source(self.db, self.kb_id, self.doc_id, 2, 2)
+            self.assertEqual(error.exception.status_code, 409)
+            self.doc.__dict__.update(before)
 
     def test_stale_cancelled_processing_and_missing_sources_are_rejected(self):
         for status, cancelled, version in [("ready", False, 3), ("ready", True, 2), ("processing", False, 2), ("failed", False, 2)]:

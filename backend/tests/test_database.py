@@ -57,7 +57,7 @@ from app.models import ChatTurn, Conversation, Document, DocumentChunk, Knowledg
 from app.schemas.auth import LoginRequest
 from app.schemas.chat import ChatRequest
 from app.schemas.user import ChangePassword, UserUpdate
-from app.services import chat_turns, ingest, rag, upload, vector_store
+from app.services import answer_sources, chat_turns, ingest, rag, upload, vector_store
 
 
 class FakeEmbeddings(Embeddings):
@@ -111,6 +111,8 @@ class DatabaseTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         vector_store._store.cache_clear()
         self.request = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "client": ("127.0.0.1", 1)})
+        # 认领事务要求认证时刻的原始令牌版本快照（测试用户 token_version 默认 0）。
+        self.request.state.auth_token_version = 0
         with SessionLocal() as db:
             self.admin = User(username="admin_test", role="admin", is_active=True, password_hash=hash_password("Original123"))
             db.add(self.admin)
@@ -384,15 +386,24 @@ class DatabaseTests(unittest.TestCase):
             conv = Conversation(user_id=self.admin.id, kb_id=self.kb.id, mode="rag", title="文档选择追问")
             db.add(conv)
             db.flush()
-            beginning = datetime.now(timezone.utc) - timedelta(minutes=1)
-            for index, (role, content, sources) in enumerate([
-                ("user", "数据安全分几级", None),
-                ("assistant", "《数据安全指南》分三级[1]。\n《星海科技内部管理手册（2026版）》分四级[2]。", citations),
-                ("user", "具体点呢", None),
-                ("assistant", "您想了解《数据安全指南》还是《星海科技内部管理手册（2026版）》？", None),
-            ]):
-                db.add(Message(conversation_id=conv.id, role=role, content=content, citations=sources,
-                               created_at=beginning + timedelta(seconds=index)))
+            # T3 历史边界只认"已发布轮"：每条历史必须有 ChatTurn + v1 快照 + 复核通过的
+            # 来源。这里按真实发布契约落两个完整轮（来源轮 + 澄清轮），不再手插裸消息。
+            empty_snapshot = {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION,
+                              "supplied_sources": [], "history_sources": []}
+            supplied = answer_sources.build_source_snapshot(citations, [], mode="rag")
+            for question, reply, sources in [
+                ("数据安全分几级",
+                 "《数据安全指南》分三级[1]。\n《星海科技内部管理手册（2026版）》分四级[2]。",
+                 supplied),
+                ("具体点呢", "您想了解《数据安全指南》还是《星海科技内部管理手册（2026版）》？", empty_snapshot),
+            ]:
+                reservation = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=conv.id,
+                                                    kb_id=self.kb.id, mode="rag", question=question, top_k=6,
+                                                    scope_revision=0, auth_token_version=0)
+                trace = {"status": "original", "retrieval_query": question, **sources}
+                chat_turns.complete_turn(db, reservation, reply,
+                                         list(citations) if question == "数据安全分几级" else [],
+                                         12, trace)
             db.commit()
             conversation_id = conv.id
 
@@ -406,7 +417,9 @@ class DatabaseTests(unittest.TestCase):
                                             self.request, db, self.admin)
                 self.assertIn("event: done", asyncio.run(consume(response)))
             with SessionLocal() as db:
-                previous = db.scalar(select(ChatTurn).where(ChatTurn.conversation_id == conversation_id))
+                # fixture 已按发布契约写入两条 ChatTurn，追问轮取最新一条。
+                previous = db.scalar(select(ChatTurn).where(ChatTurn.conversation_id == conversation_id)
+                                     .order_by(ChatTurn.created_at.desc(), ChatTurn.id.desc()))
                 self.assertEqual(previous.trace["status"], "document_followup")
                 self.assertIn("数据安全分几级", previous.trace["followup_topic"])
             # 新请求只载入最近一轮，原问题已不在 Message 历史窗口内。
@@ -423,8 +436,14 @@ class DatabaseTests(unittest.TestCase):
             self.assertIn(definitions[1][1], prompt)
             self.assertNotIn(definitions[0][1], prompt)
         with SessionLocal() as db:
-            answers = db.scalars(select(Message).where(Message.conversation_id == conversation_id,
-                                                       Message.role == "assistant", Message.turn_id.is_not(None))).all()
+            # fixture 自身发布的两条回答不计入：断言只覆盖两次新流式请求的落库结果。
+            fixture_replies = [
+                "《数据安全指南》分三级[1]。\n《星海科技内部管理手册（2026版）》分四级[2]。",
+                "您想了解《数据安全指南》还是《星海科技内部管理手册（2026版）》？",
+            ]
+            answers = db.scalars(select(Message).where(
+                Message.conversation_id == conversation_id, Message.role == "assistant",
+                Message.turn_id.is_not(None), Message.content.notin_(fixture_replies))).all()
             self.assertEqual(len(answers), 2)
             for answer in answers:
                 self.assertEqual([item["document_id"] for item in answer.citations], [str(pairs[1][0].metadata["document_id"])])
@@ -478,8 +497,22 @@ class DatabaseTests(unittest.TestCase):
         import asyncio
         from langchain_core.documents import Document as LCDocument
         from app.models import Message
+        # 发布契约要求引用的上传文档行可锁、chunk 覆盖且 embedded；add_doc 的默认
+        # 文档不满足该契约（status 默认、chunk 未嵌入），这里按真实可核验来源落库。
+        doc_ids = []
+        with SessionLocal() as db:
+            for index in range(1, 4):
+                row = Document(kb_id=self.kb.id, filename=f"law-{index}.txt", file_ext=".txt",
+                               file_size=8, stored_path=f"law-{index}.txt", status="ready",
+                               index_version=0, parse_done=True)
+                db.add(row)
+                db.flush()
+                db.add(DocumentChunk(document_id=row.id, chunk_index=0, embedded=True, content=f"条文 {index}"))
+                db.commit()
+                doc_ids.append(row.id)
         docs = [(LCDocument(page_content=f"条文 {index}", metadata={
-            "document_id": str(self.add_doc()), "filename": f"law-{index}.txt", "chunk_index": 0,
+            "document_id": str(doc_ids[index - 1]), "filename": f"law-{index}.txt", "chunk_index": 0,
+            "index_version": 0,
         }), 0.1) for index in range(1, 4)]
         async def consume(response):
             return [frame async for frame in response.body_iterator]
@@ -550,7 +583,7 @@ class DatabaseTests(unittest.TestCase):
     def _claim_chat(self, db, *, conversation_id=None, request_id=None, question="question"):
         return chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=conversation_id,
                                      kb_id=None, mode="chat", question=question, top_k=6,
-                                     request_id=request_id or uuid.uuid4())
+                                     request_id=request_id or uuid.uuid4(), auth_token_version=0)
 
     def test_parallel_duplicate_request_creates_one_conversation_and_one_question(self):
         key, barrier = uuid.uuid4(), Barrier(2)
@@ -591,9 +624,9 @@ class DatabaseTests(unittest.TestCase):
             self.assertTrue(chat_turns.cancel_request(db, active.request_id, self.admin.id))
             replacement = self._claim_chat(db, conversation_id=conv.id)
         with SessionLocal() as db, self.assertRaises(chat_turns.ChatLeaseLost):
-            chat_turns.complete_turn(db, active, "stale answer", [], 1, {})
+            chat_turns.complete_turn(db, active, "stale answer", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
         with SessionLocal() as db:
-            chat_turns.complete_turn(db, replacement, "new answer", [], 1, {})
+            chat_turns.complete_turn(db, replacement, "new answer", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
             answers = db.scalars(select(Message).where(Message.role == "assistant")).all()
             self.assertEqual(len(answers), 1)
             self.assertEqual(answers[0].reply_to_id, replacement.user_message_id)
@@ -602,7 +635,7 @@ class DatabaseTests(unittest.TestCase):
         key = uuid.uuid4()
         with SessionLocal() as db:
             first = self._claim_chat(db, request_id=key)
-            chat_turns.complete_turn(db, first, "saved answer", [], 12, {"status": "original"})
+            chat_turns.complete_turn(db, first, "saved answer", [], 12, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
         with SessionLocal() as db:
             replay = self._claim_chat(db, request_id=key)
             self.assertEqual(replay.replay_answer, "saved answer")
@@ -656,7 +689,7 @@ class DatabaseTests(unittest.TestCase):
         with SessionLocal() as db:
             self.assertEqual(db.get(ChatTurn, active.turn_id).status, "cancelled")
         with SessionLocal() as db, self.assertRaises(chat_turns.ChatLeaseLost):
-            chat_turns.complete_turn(db, active, "late answer", [], 1, {})
+            chat_turns.complete_turn(db, active, "late answer", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
         with SessionLocal() as db, self.assertRaises(HTTPException) as error:
             self._claim_chat(db, request_id=active.request_id)
         self.assertEqual(error.exception.status_code, 410)
@@ -665,9 +698,9 @@ class DatabaseTests(unittest.TestCase):
         with SessionLocal() as db:
             kwargs = dict(user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
                           mode="rag", question="private question", top_k=6)
-            finished = chat_turns.claim_turn(db, request_id=uuid.uuid4(), **kwargs)
-            chat_turns.complete_turn(db, finished, "private answer", [], 1, {"retrieval_query": "private query"})
-            active = chat_turns.claim_turn(db, request_id=uuid.uuid4(), **kwargs)
+            finished = chat_turns.claim_turn(db, request_id=uuid.uuid4(), **kwargs, auth_token_version=0)
+            chat_turns.complete_turn(db, finished, "private answer", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
+            active = chat_turns.claim_turn(db, request_id=uuid.uuid4(), **kwargs, auth_token_version=0)
             knowledge.delete_kb(self.kb.id, self.request, db, self.admin)
         with SessionLocal() as db:
             for turn_id in [finished.turn_id, active.turn_id]:
@@ -677,7 +710,7 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(db.get(ChatTurn, active.turn_id).status, "cancelled")
             self.assertEqual(db.scalar(select(func.count()).select_from(Message)), 0)
             with self.assertRaises(chat_turns.ChatLeaseLost):
-                chat_turns.complete_turn(db, active, "late private answer", [], 1, {})
+                chat_turns.complete_turn(db, active, "late private answer", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
 
     def test_startup_reclaims_turns_whose_lease_expired_unattended(self):
         """进程在生成中途退出时，没有后续请求触发 _expire_active，只能靠启动回收。"""
@@ -759,10 +792,10 @@ class DatabaseTests(unittest.TestCase):
                 chat_turns.cancel_request(db, key, other.id)
             self.assertEqual(error.exception.status_code, 404)
             second = chat_turns.claim_turn(db, user_id=other.id, conversation_id=None, kb_id=None,
-                                          mode="chat", question="other question", top_k=6, request_id=key)
+                                          mode="chat", question="other question", top_k=6, request_id=key, auth_token_version=0)
             self.assertNotEqual(first.conversation_id, second.conversation_id)
             self.assertTrue(chat_turns.cancel_request(db, key, other.id))
-            chat_turns.complete_turn(db, first, "first answer", [], 1, {})
+            chat_turns.complete_turn(db, first, "first answer", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
             self.assertEqual(db.get(ChatTurn, second.turn_id).status, "cancelled")
             self.assertEqual(db.get(ChatTurn, first.turn_id).status, "completed")
 
@@ -774,9 +807,9 @@ class DatabaseTests(unittest.TestCase):
             db.commit()
             second = self._claim_chat(db, conversation_id=first.conversation_id)
         with SessionLocal() as db, self.assertRaises(chat_turns.ChatLeaseLost):
-            chat_turns.complete_turn(db, first, "wrong", [], 1, {})
+            chat_turns.complete_turn(db, first, "wrong", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
         with SessionLocal() as db:
-            chat_turns.complete_turn(db, second, "right", [], 1, {})
+            chat_turns.complete_turn(db, second, "right", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
             self.assertEqual(db.get(ChatTurn, first.turn_id).status, "failed")
             self.assertEqual(db.get(Message, first.user_message_id).status, "failed")
             answer = db.scalar(select(Message).where(Message.role == "assistant"))
@@ -894,16 +927,16 @@ class DatabaseTests(unittest.TestCase):
         identifier = self._ready_scope_document("限定手册.txt", ["仅限内部使用。"])
         with SessionLocal() as db:
             first = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
-                                         mode="rag", question="未规定事项", top_k=6, document_ids=[identifier])
+                                         mode="rag", question="未规定事项", top_k=6, document_ids=[identifier], auth_token_version=0)
             self.assertEqual(first.scope_revision, 1)
-            chat_turns.complete_turn(db, first, "根据现有知识库无法回答。", [], 1, {})
+            chat_turns.complete_turn(db, first, "根据现有知识库无法回答。", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
         with SessionLocal() as db:
             detail = chat.get_conversation(first.conversation_id, db, self.admin).data
             self.assertEqual(detail.document_scope[0].document_id, str(identifier))
             self.assertEqual(detail.scope_revision, 1)
             next_turn = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=first.conversation_id,
                                              kb_id=self.kb.id, mode="rag", question="内部级能否外发", top_k=6,
-                                             scope_revision=1)
+                                             scope_revision=1, auth_token_version=0)
             self.assertEqual(next_turn.document_scope, first.document_scope)
             with self.assertRaises(HTTPException) as error:
                 chat_turns.set_document_scope(db, first.conversation_id, [], 1)
@@ -913,7 +946,7 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(chat_turns.set_document_scope(db, first.conversation_id, [], 1), ([], 2))
         with SessionLocal() as db, self.assertRaises(HTTPException) as error:
             chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=first.conversation_id,
-                                 kb_id=self.kb.id, mode="rag", question="旧页面提问", top_k=6, scope_revision=1)
+                                 kb_id=self.kb.id, mode="rag", question="旧页面提问", top_k=6, scope_revision=1, auth_token_version=0)
         self.assertEqual(error.exception.status_code, 409)
 
     def test_replay_reports_current_scope_without_reverting_a_later_switch(self):
@@ -923,8 +956,8 @@ class DatabaseTests(unittest.TestCase):
         key = uuid.uuid4()
         with SessionLocal() as db:
             turn = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
-                                        mode="rag", question="原问题", top_k=6, request_id=key, document_ids=[first_doc])
-            chat_turns.complete_turn(db, turn, "原结果", [], 1, {})
+                                        mode="rag", question="原问题", top_k=6, request_id=key, document_ids=[first_doc], auth_token_version=0)
+            chat_turns.complete_turn(db, turn, "原结果", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
             selected, revision = chat_turns.set_document_scope(db, turn.conversation_id, [second_doc], 1)
         async def consume(response):
             return [json.loads(frame.split("data: ", 1)[1]) async for frame in response.body_iterator]
@@ -942,15 +975,15 @@ class DatabaseTests(unittest.TestCase):
         identifier = self._ready_scope_document("可失效手册.txt", ["仅限内部。"])
         with SessionLocal() as db:
             first = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
-                                         mode="rag", question="q", top_k=6, document_ids=[identifier])
-            chat_turns.complete_turn(db, first, "answer", [], 1, {})
+                                         mode="rag", question="q", top_k=6, document_ids=[identifier], auth_token_version=0)
+            chat_turns.complete_turn(db, first, "answer", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
         for changes in [dict(status="processing"), dict(cancel_requested=True), dict(index_version=1)]:
             with SessionLocal() as db:
                 db.execute(update(Document).where(Document.id == identifier).values(**changes))
                 db.commit()
             with self.subTest(changes=changes), SessionLocal() as db, self.assertRaises(HTTPException):
                 chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=first.conversation_id,
-                                     kb_id=self.kb.id, mode="rag", question="不得扩大范围", top_k=6)
+                                     kb_id=self.kb.id, mode="rag", question="不得扩大范围", top_k=6, auth_token_version=0)
             with SessionLocal() as db:
                 self.assertEqual(db.scalar(select(func.count()).select_from(Message)), 2)
                 db.execute(update(Document).where(Document.id == identifier)
@@ -961,7 +994,7 @@ class DatabaseTests(unittest.TestCase):
             db.commit()
         with SessionLocal() as db, self.assertRaises(HTTPException) as error:
             chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=first.conversation_id,
-                                 kb_id=self.kb.id, mode="rag", question="deleted", top_k=6)
+                                 kb_id=self.kb.id, mode="rag", question="deleted", top_k=6, auth_token_version=0)
         self.assertEqual(error.exception.status_code, 404)
         with SessionLocal() as db:
             self.assertEqual(chat_turns.set_document_scope(db, first.conversation_id, [], 1), ([], 2))
@@ -970,12 +1003,12 @@ class DatabaseTests(unittest.TestCase):
         identifier = self._ready_scope_document("代次隔离.txt", ["旧正文"])
         with SessionLocal() as db:
             turn = chat_turns.claim_turn(db, user_id=self.admin.id, conversation_id=None, kb_id=self.kb.id,
-                                        mode="rag", question="q", top_k=6, document_ids=[identifier])
+                                        mode="rag", question="q", top_k=6, document_ids=[identifier], auth_token_version=0)
         with SessionLocal() as db:
             db.execute(update(Document).where(Document.id == identifier).values(index_version=1))
             db.commit()
         with SessionLocal() as db, self.assertRaises(HTTPException) as error:
-            chat_turns.complete_turn(db, turn, "旧代次回答", [], 1, {})
+            chat_turns.complete_turn(db, turn, "旧代次回答", [], 1, {"source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION, "supplied_sources": [], "history_sources": []})
         self.assertEqual(error.exception.status_code, 409)
         with SessionLocal() as db:
             self.assertEqual(db.scalar(select(func.count()).select_from(Message).where(Message.role == "assistant")), 0)

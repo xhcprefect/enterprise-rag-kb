@@ -16,7 +16,7 @@ from langchain_core.documents import Document as LCDocument
 from app.api.v1 import chat
 from app.core.config import settings
 from app.schemas.chat import ChatRequest
-from app.services import chat_turns, followup, rag
+from app.services import answer_sources, chat_turns, followup, rag
 
 
 def source(content="盗窃罪的未成年人量刑规定", **metadata):
@@ -31,6 +31,8 @@ class FollowupApiTests(unittest.TestCase):
         self.user = SimpleNamespace(id=uuid.uuid4(), username="context_test")
         self.kb = SimpleNamespace(id=uuid.uuid4(), collection_name="context_test", name="法律资料")
         self.request = Request({"type": "http", "method": "POST", "path": "/api/v1/chat/stream", "headers": []})
+        # 认领事务要求认证时刻的原始令牌版本快照；个别用例按自身契约覆盖。
+        self.request.state.auth_token_version = 0
         self.previous_source = source()
         citation = {**rag.to_citations([self.previous_source])[0], "source_index": 3}
         self.history = [
@@ -39,25 +41,44 @@ class FollowupApiTests(unittest.TestCase):
         ]
 
     def stream(self, question, *, history=None, mode="rag", docs=None, patches=(), real_answer=False,
-               verified_docs=None, topic_rows=(), document_scope=None, scope_revision=0):
+               verified_docs=None, topic_rows=(), document_scope=None, scope_revision=0, parts=None):
         conv = SimpleNamespace(id=uuid.uuid4(), kb_id=self.kb.id if mode == "rag" else None, mode=mode)
         db, writer = MagicMock(), MagicMock()
-        db.scalars.return_value.all.return_value = list(reversed(self.history if history is None else history))
+        rows = self.history if history is None else history
+        if mode == "chat":
+            rows = [SimpleNamespace(**{**vars(row), "citations": []}) for row in rows]
+        db.scalars.return_value.all.return_value = list(reversed(rows))
         db.execute.return_value.all.return_value = list(topic_rows)
         writer.get.return_value = self.user
 
         async def consume(response):
             return [frame async for frame in response.body_iterator]
 
+        # 这里替代数据库历史加载边界；来源有效性由真实 PG 的历史套件验证。
+        fixture_history = []
+        topics = dict(topic_rows)
+        for row in self.history if history is None else history:
+            item = dict(vars(row))
+            item["id"] = str(row.id)
+            item["citations"] = item.get("citations") or []
+            if item["role"] == "assistant":
+                item["source_provenance"] = {
+                    "source_snapshot_version": 1,
+                    "supplied_sources": [dict(source) for source in answer_sources.parse_sources(item["citations"])],
+                    "history_sources": [],
+                } if mode == "rag" else {"source_snapshot_version": 1, "supplied_sources": [], "history_sources": []}
+                item["followup_topic"] = topics.get(item.get("turn_id"), {}).get("followup_topic")
+            fixture_history.append(item)
         with ExitStack() as stack:
-            mock_turns(stack, conv.id, writer, document_scope=document_scope, scope_revision=scope_revision)
+            claimed, completed = mock_turns(stack, conv.id, writer, document_scope=document_scope,
+                                            scope_revision=scope_revision, history=fixture_history)
             for patcher in patches:
                 stack.enter_context(patcher)
             stack.enter_context(patch.object(chat, "_get_conversation", return_value=conv))
             stack.enter_context(patch.object(chat, "_get_kb", return_value=self.kb))
             retrieve = stack.enter_context(patch.object(rag, "retrieve", return_value=[source()] if docs is None else docs))
             load_sources = stack.enter_context(patch.object(chat, "load_ready_citations", return_value=[self.previous_source] if verified_docs is None else verified_docs))
-            answer = None if real_answer else stack.enter_context(patch.object(rag, "answer_astream", side_effect=async_items(["本轮说明[1]。"])))
+            answer = None if real_answer else stack.enter_context(patch.object(rag, "answer_astream", side_effect=async_items(["本轮说明[1]。"] if parts is None else parts)))
             stack.enter_context(patch.object(chat, "SessionLocal", return_value=writer))
             audit = stack.enter_context(patch.object(chat, "write_audit"))
             stack.enter_context(patch.object(chat.logger, "exception"))
@@ -66,7 +87,100 @@ class FollowupApiTests(unittest.TestCase):
         events = [(frame.split("\n", 1)[0].removeprefix("event: "),
                    json.loads(frame.split("data: ", 1)[1])) for frame in frames]
         return SimpleNamespace(events=events, db=db, writer=writer, retrieve=retrieve,
-                               load_sources=load_sources, answer=answer, audit=audit)
+                               load_sources=load_sources, answer=answer, audit=audit,
+                               claimed=claimed, completed=completed)
+
+    def test_claim_receives_the_original_authentication_snapshot(self):
+        self.request.state.auth_token_version = 7
+        self.user.token_version = 8
+        result = self.stream("独立问题", history=[])
+        self.assertEqual(result.claimed.call_args.kwargs["auth_token_version"], 7)
+        self.assertEqual(result.events[-1][0], "done")
+        del self.request.state.auth_token_version
+        result = self.stream("独立问题", history=[])
+        self.assertIsNone(result.claimed.call_args.kwargs["auth_token_version"])
+
+    def test_trace_uses_actual_budgeted_sources_even_when_final_citations_are_empty(self):
+        docs = [source("资料" * 10000, filename=f"law-{index}.txt") for index in range(6)]
+        with patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 4096), \
+             patch.object(settings, "LLM_MAX_OUTPUT_TOKENS", 128), patch.object(settings, "CONTEXT_TOKEN_SAFETY_MARGIN", 64):
+            result = self.stream("独立问题", docs=docs, history=[], parts=["资料不足，无法得出结论。"])
+        trace = result.completed.call_args.args[-1]
+        prepared = result.answer.call_args.kwargs["prepared"]
+        self.assertEqual(trace["source_snapshot_version"], 1)
+        self.assertEqual(len(trace["candidate_sources"]), 6)
+        self.assertEqual(trace["supplied_sources"], list(answer_sources.sources_from_pairs(prepared.pairs)))
+        self.assertLess(len(trace["supplied_sources"]), len(trace["candidate_sources"]))
+        self.assertTrue(trace["supplied_sources"])
+        self.assertEqual(trace["history_sources"], prepared.history_sources)
+        self.assertEqual(result.completed.call_args.args[3], [])
+
+    def test_rewritten_trace_unions_planning_sources_with_generation_history_sources(self):
+        """旧轮被生成预算裁掉后，改写仍依赖它的传递来源必须进入最终 trace 并集。"""
+        old_source = source("OLDER_SOURCE_DEPENDENCY " + "x" * 650, filename="old-b.txt")
+        citation = {**rag.to_citations([old_source])[0], "source_index": 1}
+        old_assistant = SimpleNamespace(id=uuid.uuid4(), role="assistant",
+                                        content="OLDER_SOURCE_DEPENDENCY " + "x" * 650, citations=[citation])
+        turns = [SimpleNamespace(id=uuid.uuid4(), role="user", content="旧主题问题", citations=None),
+                 old_assistant,
+                 SimpleNamespace(id=uuid.uuid4(), role="user", content="同一主题的补充条件", citations=None),
+                 SimpleNamespace(id=uuid.uuid4(), role="assistant", content="NEWER_CONTEXT " + "y" * 750, citations=[])]
+        old_id = old_source[0].metadata["document_id"]
+        with patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 4096), \
+             patch.object(settings, "LLM_MAX_OUTPUT_TOKENS", 256), patch.object(settings, "CONTEXT_TOKEN_SAFETY_MARGIN", 64), \
+             patch.object(followup, "complete_short_chat",
+                          return_value=json.dumps({"action": "search", "query": "inherited subject from the older source"})):
+            # 当前检索只给新资料；旧 B 已被生成预算裁出最终 bounded_history，但仍参与了改写。
+            result = self.stream("那种情况呢？", history=turns, docs=[source("当前可用资料" * 10000)],
+                                 parts=["仅使用本轮资料。"])
+        trace = result.completed.call_args.args[-1]
+        prepared = result.answer.call_args.kwargs["prepared"]
+        self.assertEqual(result.events[-1][0], "done")
+        self.assertEqual(trace["status"], "rewritten")
+        # 规划依赖：改写实际收到旧 B（模型边界契约已在 followup 单测覆盖），这里验证传递结果。
+        self.assertEqual([item["document_id"] for item in trace["history_sources"]], [old_id])
+        # 旧 B 已不在最终生成历史（prepared.history_sources 只代表 bounded_history）。
+        self.assertNotIn(old_id, [item.get("document_id") for item in prepared.history_sources])
+        # supplied 与 planning 区分：supplied 只有本轮实际送入 prompt 的当前资料。
+        self.assertNotIn(old_id, [item["document_id"] for item in trace["supplied_sources"]])
+        self.assertEqual(trace["supplied_sources"], list(answer_sources.sources_from_pairs(prepared.pairs)))
+
+    def test_original_question_replay_adds_no_planning_sources_to_trace(self):
+        """模型只复述原问题（未用派生内容）时不虚加规划依赖；保留 bounded_history 既有语义。"""
+        with patch.object(followup, "complete_short_chat",
+                          return_value=json.dumps({"action": "search", "query": "那未成年人呢？"})):
+            result = self.stream("那未成年人呢？")
+        trace = result.completed.call_args.args[-1]
+        prepared = result.answer.call_args.kwargs["prepared"]
+        self.assertEqual(trace["status"], "original")
+        # 规划依赖为空（模型未用派生内容）；并集仍如实保留最终生成历史里的旧来源。
+        self.assertEqual(trace["history_sources"], list(answer_sources.parse_sources(prepared.history_sources)))
+        self.assertEqual(result.events[-1][0], "done")
+
+    def test_reference_plan_rebuild_carries_source_dependency_into_trace(self):
+        result = self.stream("解释刚才第3条来源")
+        trace = result.completed.call_args.args[-1]
+        self.assertEqual(trace["status"], "reference")
+        # 规划依赖是被明确核验引用的旧来源；快照只保留身份字段，不保留展示编号。
+        self.assertEqual([item["document_id"] for item in trace["history_sources"]],
+                         [self.previous_source[0].metadata["document_id"]])
+
+    def test_empty_retrieval_publishes_an_explicit_empty_snapshot(self):
+        result = self.stream("独立问题", docs=[], history=[], real_answer=True)
+        trace = result.completed.call_args.args[-1]
+        self.assertEqual(trace["source_snapshot_version"], 1)
+        self.assertEqual(trace["supplied_sources"], [])
+        self.assertEqual(trace["history_sources"], [])
+
+    def test_clarification_retains_provenance_from_the_verified_history(self):
+        with patch.object(followup, "complete_short_chat", return_value='{"action":"clarify","question":"您指哪一种？"}'):
+            result = self.stream("那种情况呢？")
+        trace = result.completed.call_args.args[-1]
+        self.assertEqual(trace["source_snapshot_version"], 1)
+        self.assertEqual(trace["supplied_sources"], [])
+        self.assertEqual({item["document_id"] for item in trace["history_sources"]},
+                         {self.previous_source[0].metadata["document_id"]})
+        self.assertEqual(result.events[-1][1]["citations"], [])
 
     def security_context(self, clarification=True):
         items = security_history(clarification=clarification)
@@ -147,10 +261,7 @@ class FollowupApiTests(unittest.TestCase):
         self.history[1].reply_to_id = self.history[0].id
         saved = "未成年人盗窃罪的量刑规定"
         result = self.stream("具体点呢", topic_rows=[(turn_id, {"followup_topic": saved, "private_diagnostic": "never-pass-this-to-model"})])
-        result.db.execute.assert_called_once()
-        statement = str(result.db.execute.call_args.args[0])
-        self.assertIn("chat_turns.conversation_id =", statement)
-        self.assertIn("chat_turns.status =", statement)
+        result.db.execute.assert_not_called()
         current = result.answer.call_args.kwargs["prepared"].messages[-1].content
         self.assertIn(saved, current)
         self.assertNotIn("never-pass-this-to-model", current)

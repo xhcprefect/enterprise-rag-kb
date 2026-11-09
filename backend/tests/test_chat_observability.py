@@ -34,7 +34,7 @@ from app.core.observability import CHAT_STAGES, metrics
 from app.core.security import create_access_token
 from app.db.init_db import init_db
 from app.db.session import SessionLocal, engine
-from app.models import ChatTurn, Conversation, KnowledgeBase, Message, User
+from app.models import ChatTurn, Conversation, Document, DocumentChunk, KnowledgeBase, Message, User
 from app.schemas.chat import ChatRequest
 from app.services import chat_turns, followup, rag
 
@@ -139,6 +139,8 @@ class ChatObservabilityTests(unittest.TestCase):
             self.user_id, self.kb_id = self.user.id, self.kb.id
         self.headers = {"Authorization": "Bearer " + create_access_token(str(self.user_id), "user")}
         self.request = Request({"type": "http", "method": "POST", "path": "/api/v1/chat/stream", "headers": []})
+        # 认领事务要求认证时刻的原始令牌版本快照；与 create_access_token 的 ver 一致。
+        self.request.state.auth_token_version = 0
         self.request_id = uuid.uuid4()
 
     def tearDown(self):
@@ -176,7 +178,7 @@ class ChatObservabilityTests(unittest.TestCase):
             yield "合成回答正文"
 
         with patch.object(rag, "answer_astream", side_effect=generate), \
-             patch.object(rag, "prepare_answer", return_value=SimpleNamespace(pairs=[], input_tokens=1, input_budget=10)):
+             patch.object(rag, "prepare_answer", return_value=SimpleNamespace(pairs=[], input_tokens=1, input_budget=10, history_sources=[])):
             first = self.post()
             self.assertIn("event: done", first.text)
             started_after_generation = dict(metrics.snapshot()["chat"]["started"])
@@ -254,7 +256,7 @@ class ChatObservabilityTests(unittest.TestCase):
         async def disconnect():
             with SessionLocal() as db, patch.object(rag, "answer_astream", side_effect=generator.generate), \
                  patch.object(rag, "prepare_answer",
-                              return_value=SimpleNamespace(pairs=[], input_tokens=1, input_budget=10)):
+                              return_value=SimpleNamespace(pairs=[], input_tokens=1, input_budget=10, history_sources=[])):
                 response = chat.chat_stream(ChatRequest(**self.payload()), self.request, db, self.user)
                 # 默认 scope 没有 asgi 扩展 → spec_version 2.0 的断连检测路径。
                 await response({"type": "http", "method": "POST", "path": "/api/v1/chat/stream",
@@ -283,7 +285,7 @@ class ChatObservabilityTests(unittest.TestCase):
         async def exercise():
             with SessionLocal() as db, patch.object(rag, "answer_astream", side_effect=generator.generate), \
                  patch.object(rag, "prepare_answer",
-                              return_value=SimpleNamespace(pairs=[], input_tokens=1, input_budget=10)), \
+                              return_value=SimpleNamespace(pairs=[], input_tokens=1, input_budget=10, history_sources=[])), \
                  patch.object(settings, "CHAT_STREAM_CANCEL_POLL_SECONDS", 0.01):
                 response = chat.chat_stream(ChatRequest(**self.payload()), self.request, db, self.user)
 
@@ -322,7 +324,7 @@ class ChatObservabilityTests(unittest.TestCase):
             yield "合成回答正文"
 
         with patch.object(rag, "answer_astream", side_effect=generate), \
-             patch.object(rag, "prepare_answer", return_value=SimpleNamespace(pairs=[], input_tokens=3, input_budget=10)):
+             patch.object(rag, "prepare_answer", return_value=SimpleNamespace(pairs=[], input_tokens=3, input_budget=10, history_sources=[])):
             result = self.post()
         self.assertIn("event: done", result.text)
         self.assertEqual(metrics.snapshot()["chat"]["started"], {"chat": 1})
@@ -340,7 +342,19 @@ class ChatObservabilityTests(unittest.TestCase):
         self.assertEqual(metrics.snapshot()["chat"]["finished"], {"chat:completed": 1})
 
     def test_rag_stages_use_the_fixed_vocabulary_and_map_retrieval(self):
-        docs = [_source("合成资料正文[1]")]
+        # 发布契约要求 supplied_sources 的上传文档行真实可锁，且对应 chunk 存在并
+        # embedded；用真实 Document+DocumentChunk 而不是 patch 锁定边界，生产校验
+        # 不被 mock 豁免。chunk_index=0 与 _source() 的 metadata 保持一致。
+        with SessionLocal() as db:
+            row = Document(kb_id=self.kb_id, filename="observability.md", file_ext=".md",
+                           file_size=1, stored_path="test-only", status="ready", index_version=1,
+                           parse_done=True)
+            db.add(row)
+            db.flush()
+            db.add(DocumentChunk(document_id=row.id, chunk_index=0, embedded=True, content="合成资料正文[1]"))
+            db.commit()
+            identifier = row.id
+        docs = [_source("合成资料正文[1]", document_id=str(identifier))]
 
         async def generate(*_args, **_kwargs):
             yield "依据资料，结论如下[1]。"
@@ -348,7 +362,7 @@ class ChatObservabilityTests(unittest.TestCase):
         with patch.object(followup, "plan_retrieval", return_value=followup.RetrievalPlan("合成问题")), \
              patch.object(rag, "retrieve", return_value=docs) as retrieve, \
              patch.object(rag, "prepare_answer",
-                          return_value=SimpleNamespace(pairs=docs, input_tokens=7, input_budget=100)), \
+                          return_value=SimpleNamespace(pairs=docs, input_tokens=7, input_budget=100, history_sources=[])), \
              patch.object(rag, "answer_astream", side_effect=generate):
             result = self.post(mode="rag", kb_id=str(self.kb_id))
         self.assertIn("event: done", result.text)

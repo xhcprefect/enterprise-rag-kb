@@ -26,7 +26,7 @@ from app.schemas.chat import (
 )
 from app.schemas.common import ApiResponse, PageResult
 from app.services import (
-    chat_turns, document_scopes, followup, memory_service, project_chat_scope,
+    answer_history, answer_sources, chat_turns, document_scopes, followup, memory_service, project_chat_scope,
     project_retrieval, project_sources, rag, usage_tracking,
 )
 from app.services.cloud_models import CloudModelError
@@ -348,8 +348,7 @@ class ManagedChatResponse(StreamingResponse):
 
 
 def _source_identities(pairs):
-    return [{key: value for key, value in citation.items() if key not in {"snippet", "score"}}
-            for citation in rag.to_citations(pairs)]
+    return [dict(source) for source in answer_sources.sources_from_pairs(pairs)]
 
 
 def _retrieve_plan(collection, plan, top_k, active_scope, *, reset_scope=False):
@@ -359,17 +358,18 @@ def _retrieve_plan(collection, plan, top_k, active_scope, *, reset_scope=False):
     if plan.status in {"reference", "document_followup", "elaboration"}:
         requested = plan.citations
         if selected and plan.status == "reference" and any(not document_scopes.contains(selected, item) for item in requested):
-            return [], followup.RetrievalPlan(plan.query, "clarify", "该历史来源不在当前文档范围内，请先切换或取消范围后再核验。", topic=plan.topic), None
+            # 重建只改状态文案；规划依赖保留计划的完整既有集合，不因 scope 缩窄丢失。
+            return [], plan.with_fields(status="clarify",
+                clarification="该历史来源不在当前文档范围内，请先切换或取消范围后再核验。"), None
         if selected and plan.status == "elaboration":
             requested = [item for item in requested if document_scopes.contains(selected, item)]
             names = "、".join("《" + item["filename"] + "》" for item in selected)
-            plan = followup.RetrievalPlan(
-                f"围绕原问题和后续要求：\n{plan.topic}\n请仅在当前限定文件中继续展开：{names}。",
-                plan.status, citations=requested, topic=plan.topic,
-            )
+            plan = plan.with_fields(citations=requested,
+                query=f"围绕原问题和后续要求：\n{plan.topic}\n请仅在当前限定文件中继续展开：{names}。")
         anchors = load_ready_citations(collection, requested) if requested else []
         if len(anchors) != len(requested):
-            return [], followup.RetrievalPlan(plan.query, "clarify", "您指定的历史来源已不可用、被更新或无法核验，请重新选择文档或确认来源。", topic=plan.topic), None
+            return [], plan.with_fields(status="clarify",
+                clarification="您指定的历史来源已不可用、被更新或无法核验，请重新选择文档或确认来源。"), None
         if plan.status == "reference":
             return anchors, plan, scope_update
         if plan.status == "document_followup":
@@ -397,15 +397,15 @@ def _retrieve_project_plan(snapshot_id, user_id, plan, top_k):
                 requested = plan.citations
                 if any(item.get("source_kind") != "project" or
                        item.get("snapshot_id") != str(snapshot_id) for item in requested):
-                    return [], followup.RetrievalPlan(
-                        plan.query, "clarify", "该历史来源不属于当前项目快照，请先切换到原快照或重新提问。",
-                        topic=plan.topic,
+                    return [], plan.with_fields(
+                        status="clarify",
+                        clarification="该历史来源不属于当前项目快照，请先切换到原快照或重新提问。",
                     ), None
                 anchors = project_retrieval.load_project_citations(session, snapshot_id, requested, user)
                 if len(anchors) != len(requested):
-                    return [], followup.RetrievalPlan(
-                        plan.query, "clarify", "您指定的项目来源已不可用或无法核验，请重新选择文件或快照。",
-                        topic=plan.topic,
+                    return [], plan.with_fields(
+                        status="clarify",
+                        clarification="您指定的项目来源已不可用或无法核验，请重新选择文件或快照。",
                     ), None
                 for (doc, _score), citation in zip(anchors, requested):
                     doc.metadata["historical_source_index"] = citation.get("source_index")
@@ -467,6 +467,7 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         mode=mode, question=payload.question, top_k=top_k, request_id=payload.request_id,
         document_ids=payload.document_ids, scope_revision=payload.scope_revision,
         project_snapshot_id=payload.project_snapshot_id,
+        auth_token_version=getattr(request.state, "auth_token_version", None),
         reset_scope=mode == CONVERSATION_MODE_RAG and followup.is_topic_switch(payload.question),
     )
     conv_id = str(reservation.conversation_id)
@@ -573,26 +574,19 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         if mode == CONVERSATION_MODE_CHAT and memory_service.memory_enabled(memory_conv):
             history, mem_lag, mem_truncated = memory_service.build_chat_history(db, memory_conv, payload.question)
             memory_meta = {"mode": "memory", "lag": mem_lag, "truncated": mem_truncated}
+        elif mode == CONVERSATION_MODE_RAG:
+            history = answer_history.load_rag_history(db, reservation)
+            for item in history:
+                if item["role"] == "assistant":
+                    item["citations"] = rag.finalize_citations(item["content"], item["citations"])
         else:
             history_rows = db.scalars(select(Message).where(
                 Message.conversation_id == reservation.conversation_id, Message.status == "completed",
             ).order_by(Message.created_at.desc(), Message.id.desc()).limit(settings.HISTORY_MAX_TURNS * 2)).all()
-            # 主题随已完成请求保存，刷新页面、跨进程或历史窗口缩短后也能继续澄清。
-            # 只读取当前会话的内部主题字段，不把诊断明细或旧答案变成本轮证据。
-            turn_ids = {m.turn_id for m in history_rows if isinstance(getattr(m, "turn_id", None), uuid.UUID)}
-            topics = {}
-            if mode == CONVERSATION_MODE_RAG and turn_ids:
-                traces = db.execute(select(ChatTurn.id, ChatTurn.trace).where(
-                    ChatTurn.id.in_(turn_ids), ChatTurn.conversation_id == reservation.conversation_id,
-                    ChatTurn.status == "completed",
-                )).all()
-                topics = {identifier: trace["followup_topic"] for identifier, trace in traces
-                          if isinstance(trace, dict) and isinstance(trace.get("followup_topic"), str)
-                          and 0 < len(trace["followup_topic"]) <= settings.HISTORY_MAX_CHARS}
             history = [{"id": str(m.id), "role": m.role, "content": m.content,
                         "reply_to_id": str(m.reply_to_id) if getattr(m, "reply_to_id", None) else None,
                         "turn_id": str(m.turn_id) if getattr(m, "turn_id", None) else None, "status": getattr(m, "status", "completed"),
-                        "followup_topic": topics.get(getattr(m, "turn_id", None)) if m.role == "assistant" else None,
+                        "followup_topic": None,
                         "citations": rag.finalize_citations(m.content, m.citations or []) if m.role == "assistant" else []}
                        for m in reversed(history_rows)]
         db.commit()  # 流式等待期间不占请求会话的连接。
@@ -654,11 +648,17 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
                 # trace 中的 retrieve_ms 对应固定阶段 retrieval；不能把整份 trace 当阶段表。
                 record_stage("retrieval", retrieve_ms)
         candidate_sources = _source_identities(docs)
+        # 发布契约的 history_sources 在生成前合并（规划依赖 ∪ 最终有界历史来源）：
+        # 超限/坏源在进入模型前整轮拒绝，不会生成后再被发布门禁兜底。
+        history_sources = list(plan.planning_sources)
         if not plan.clarification and (mode == CONVERSATION_MODE_CHAT or docs):
             t_prompt = time.monotonic()
             prepared = await in_worker(lambda: rag.prepare_answer(question, docs, history, mode=mode, retrieval_query=plan.query))
             record_stage("prompt", (time.monotonic() - t_prompt) * 1000)
             docs = prepared.pairs
+            history_sources = list(answer_sources.parse_sources(
+                [*plan.planning_sources, *prepared.history_sources],
+                default_kind=answer_sources.SOURCE_KIND_DOCUMENT))
         candidates = rag.to_citations(docs)
         yield StreamEvent("status", {"phase": "generating"})
         t_llm = time.monotonic()
@@ -698,7 +698,10 @@ def chat_stream(payload: ChatRequest, request: Request, db: DBSession = Depends(
         truncated = reason == "length"
         actual_usage = {key: usage[key] for key in ("input_tokens", "output_tokens") if key in usage}
         trace = {"retrieval_query": plan.query, "status": plan.status, "followup_topic": plan.topic,
-                 "candidate_sources": candidate_sources, "supplied_sources": _source_identities(docs),
+                 "candidate_sources": candidate_sources,
+                 "source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION,
+                 "supplied_sources": _source_identities(prepared.pairs) if prepared else [],
+                 "history_sources": history_sources,
                  "rewrite_ms": round(rewrite_ms, 2), "retrieve_ms": round(retrieve_ms, 2),
                  "generation_ms": round(generation_ms, 2), "first_token_ms": state.first_token_ms,
                  "finish_reason": reason, "truncated": truncated,

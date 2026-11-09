@@ -19,6 +19,10 @@ METRICS_VERSION = 1
 # v2：检索开关/重排参数进入身份，本地语料快照覆盖整棵目录，新增分层与核验计数。
 # 旧报告保持可读，但 schema 不同直接判不可比，不做隐式升级。
 IDENTITY_SCHEMA = 2
+# 结果指纹版本：只覆盖可复核的实际结果内容，不覆盖时间、耗时或环境状态。
+RESULT_FINGERPRINT_VERSION = 1
+# 独立的机器断言绑定：无正文报告也能校验核验结论所依赖的字段。
+MACHINE_FINGERPRINT_VERSION = 1
 
 # 只允许稳定的分层代号；未知值直接拒绝，错误信息不回显原值。
 # 前五项对应 templates/README.md 的抽样指南，后几项保留部门/合成样例分层。
@@ -285,7 +289,94 @@ def _number(value):
         return None
 
 
-def grade_case(case, response, *, input_price=None, output_price=None, include_content=False):
+def _result_http_status(response):
+    """实际状态码：缺省视为 200；非 100–599 的非法值保持 None，不伪造成功。"""
+    status = response.get("http_status", 200)
+    return status if type(status) is int and 100 <= status <= 599 else None
+
+
+def _result_error_code(response):
+    """只保留稳定异常类型名；未知形态记为 upstream_error，绝不回显正文。"""
+    if not response.get("error"):
+        return None
+    error_type = str(response["error"])
+    return error_type if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", error_type) else "upstream_error"
+
+
+# 引用中的评分属于运行期排序信号，不是引用身份或支持性正文；其余字段（含 snippet、
+# 索引代次、片段范围）都进入结果指纹。时间/耗时字段同样排除。
+_FINGERPRINT_VOLATILE_CITATION_KEYS = frozenset({
+    "score", "rerank_score", "latency_ms", "elapsed_ms", "retrieved_at", "created_at", "updated_at",
+})
+
+
+def _citation_fingerprint(citation):
+    if not isinstance(citation, dict):
+        raise EvaluationError("引用结构不合法，无法生成结果指纹")
+    clean = {}
+    for key, value in citation.items():
+        if key in _FINGERPRINT_VOLATILE_CITATION_KEYS or key.endswith("_ms"):
+            continue
+        clean[key] = value
+    return clean
+
+
+def result_fingerprint_payload(answer, citations, http_status, error_code=None,
+                               *, version=RESULT_FINGERPRINT_VERSION):
+    """结果指纹的规范内容：完整答案、引用身份/代次/snippet、实际 HTTP 状态与稳定错误码。
+
+    不包含 run_id、时间、耗时或环境信息；同一逻辑结果重复计算必须得到同一摘要。
+    """
+    if type(version) is not int or version != RESULT_FINGERPRINT_VERSION:
+        raise EvaluationError("不支持的结果指纹版本")
+    if not isinstance(citations, list):
+        raise EvaluationError("引用结构不合法，无法生成结果指纹")
+    if http_status is not None and (type(http_status) is not int or not 100 <= http_status <= 599):
+        raise EvaluationError("HTTP 状态不合法，无法生成结果指纹")
+    return {"version": version, "answer": answer if isinstance(answer, str) else "",
+            "citations": [_citation_fingerprint(citation) for citation in citations],
+            "http_status": http_status, "error": error_code}
+
+
+def result_sha256(result):
+    """从已导出的结果（含 --include-content 的 content）重算指纹；无正文时返回 None。"""
+    if not isinstance(result, dict):
+        return None
+    content = result.get("content")
+    if not isinstance(content, dict) or not isinstance(content.get("citations"), list):
+        return None
+    try:
+        payload = result_fingerprint_payload(content.get("answer"), content["citations"],
+                                            result.get("http_status"), result.get("error_type"))
+    except EvaluationError:
+        return None
+    return _digest(payload)
+
+
+def machine_fingerprint_payload(result, *, version=MACHINE_FINGERPRINT_VERSION):
+    """独立绑定机器断言与结果上下文；不依赖正文，不包含时间、耗时或摘要自身。
+
+    id 与 result_sha256 防止在不同 case 或实际结果间移植摘要；error_type 缺省与
+    显式 None 等价。此无密钥摘要只检查一致性，不证明报告真实性。
+    """
+    if type(version) is not int or version != MACHINE_FINGERPRINT_VERSION:
+        raise EvaluationError("不支持的机器断言指纹版本")
+    if not isinstance(result, dict):
+        raise EvaluationError("结果结构不合法，无法生成机器断言指纹")
+    return {"version": version, "id": result.get("id"), "result_sha256": result.get("result_sha256"),
+            "passed": result.get("passed"), "failures": result.get("failures"),
+            "outcome": result.get("outcome"), "expected_outcome": result.get("expected_outcome"),
+            "expected_http_status": result.get("expected_http_status"), "http_status": result.get("http_status"),
+            "error_type": result.get("error_type"), "citation_count": result.get("citation_count")}
+
+
+def machine_sha256(result):
+    """对机器断言的规范 JSON 取独立 SHA-256；保持 result_sha256 的 v1 语义不变。"""
+    return _digest(machine_fingerprint_payload(result))
+
+
+def grade_case(case, response, *, input_price=None, output_price=None, include_content=False,
+               result_fingerprint_version=RESULT_FINGERPRINT_VERSION):
     _validate_sources(response)
     trace = response.get("trace") if isinstance(response.get("trace"), dict) else {}
     answer = response.get("answer") if isinstance(response.get("answer"), str) else ""
@@ -330,9 +421,13 @@ def grade_case(case, response, *, input_price=None, output_price=None, include_c
             cost = (usage["input_tokens"] * input_price + usage["output_tokens"] * output_price) / 1000000
     else:
         usage = None
+    actual_status = _result_http_status(response)
+    error_code = _result_error_code(response)
     result = {"id": case["id"], "passed": not failures, "failures": list(dict.fromkeys(failures)),
               "stratum": case_stratum(case), "review_state": review_state(case),
               "expected_outcome": case.get("expected_outcome"), "outcome": outcome,
+              "expected_http_status": expected_status, "http_status": actual_status,
+              "citation_count": len(citations),
               "candidate_source_recall": candidate_recall, "supplied_source_recall": supplied_recall,
               "citation_source_recall": citation_recall,
               "rewrite_ms": _number(trace.get("rewrite_ms")), "retrieve_ms": _number(trace.get("retrieve_ms")),
@@ -340,15 +435,16 @@ def grade_case(case, response, *, input_price=None, output_price=None, include_c
               "refusal_match": (outcome == "refuse") == (case["expected_outcome"] == "refuse") if case.get("expected_outcome") in {"answer", "refuse"} else None,
               "first_token_ms": _number(response.get("first_token_ms")), "total_ms": _number(response.get("total_ms")),
               "generation_usage": usage, "generation_cost_estimate": cost}
-    if response.get("error"):
-        error_type = str(response["error"])
-        result["error_type"] = error_type if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", error_type) else "upstream_error"
-    status = response.get("http_status")
-    if type(status) is int and 100 <= status <= 599:
-        result["http_status"] = status
+    if error_code:
+        result["error_type"] = error_code
+    result["result_fingerprint_version"] = result_fingerprint_version
+    result["result_sha256"] = _digest(result_fingerprint_payload(
+        answer, citations, actual_status, error_code, version=result_fingerprint_version))
     if include_content:
         result["content"] = {"questions": case.get("turns", [case.get("question")]), "answer": answer,
                              "citations": citations, "trace": trace}
+    result["machine_fingerprint_version"] = MACHINE_FINGERPRINT_VERSION
+    result["machine_sha256"] = machine_sha256(result)
     return result
 
 
@@ -422,8 +518,10 @@ def make_report(results, run_id=None, identity=None):
             "unreviewed_cases": sum(1 for row in results if row.get("review_state") not in ("complete", "incomplete")),
             "strata": stratum_summary(results),
             "failure_reasons": _failure_reasons(results),
+            "result_fingerprint_version": RESULT_FINGERPRINT_VERSION,
             "notes": ["固定断言和来源匹配不是语义事实正确率。", "费用只包含已返回实际用量的回答生成，不包含追问补全、向量化和重排。", "首字延迟针对最后一轮；总耗时包含 case 的所有准备轮次。",
                       "p50/p95 只使用实际返回的样本；样本数为 0 时保持 null，不补 0。",
+                      "result_sha256 覆盖完整答案、引用身份/索引代次/实际片段内容和实际 HTTP 状态，不含时间或耗时；默认报告只导出摘要，不导出正文。",
                       "reviewed_cases 只表示核验元数据齐全，不代表语义准确率。"], "results": results}
     if identity is not None:
         report["identity"] = identity

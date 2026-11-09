@@ -139,6 +139,8 @@ export class ProjectController {
   private hasActiveSync = false
   private lastLoadedQuery: ProjectViewQuery | null = null
   private lastLoadedError: string | null = null
+  /** 最近一次发给页面的完整视图；轻量刷新据此保留文件/搜索结果。 */
+  private lastEmittedView: ProjectViewState | null = null
 
   // 请求/轮询
   private viewController: AbortController | null = null
@@ -191,7 +193,7 @@ export class ProjectController {
     this.abortSnapshots()
     this.pendingConfirm = null
     this.sourceId = null
-    this.deps.onView?.(EMPTY_VIEW())
+    this.emit(EMPTY_VIEW())
     this.deps.onPreview?.(null)
   }
 
@@ -304,6 +306,44 @@ export class ProjectController {
     this.loadSnapshotsAndMaybePoll(mySourceEpoch, sourceId)
   }
 
+  /**
+   * 轻量刷新快照列表（自动同步的空闲轮询用）：只更新快照/最新 ready/活动同步状态，
+   * 不推进 viewEpoch、不清 lastLoadedQuery，因此既不重载当前文件/搜索视图，
+   * 也不覆盖用户显式选择的旧快照（新 ready 只体现在 latestReadySnapshotId）。
+   * 仍用 sourceEpoch + sourceId 守卫迟到响应；读取失败保持既有展示，绝不当作空完成。
+   * 若发现活动任务且当前没有轮询在排，则启动现有的有界轮询。
+   */
+  async refreshSnapshots(): Promise<void> {
+    const sourceId = this.sourceId
+    if (!this.alive || !sourceId) return
+    const sourceEpoch = this.sourceEpoch
+    this.abortSnapshots()
+    const controller = new AbortController()
+    this.snapshotsController = controller
+    let snaps: ProjectSnapshot[] | null = null
+    try { snaps = await this.deps.listSnapshots(sourceId, controller.signal) }
+    catch { snaps = null }
+    if (controller.signal.aborted || !this.currentSource(sourceEpoch, sourceId)) return
+    if (this.snapshotsController === controller) this.snapshotsController = null
+    if (snaps === null) return
+
+    const previousReady = this.ready
+    const previousSnapshotId = this.snapshotId
+    this.applySnapshots(sourceId, snaps)
+    if (!this.currentSource(sourceEpoch, sourceId)) return
+    if (this.ready !== previousReady || this.snapshotId !== previousSnapshotId) this.emitView()
+    else this.emitRefreshedView()
+    if (this.ready && !this.sameAsLoaded() && this.viewController === null) {
+      this.loadView(sourceEpoch, sourceId, this.viewEpoch, this.snapshotId, this.q, this.page)
+    }
+    if (!this.currentSource(sourceEpoch, sourceId)) return
+    if (this.hasActiveSync) {
+      if (!this.pollScheduled) this.beginPolling(sourceEpoch, sourceId)
+    } else {
+      this.clearPoll()
+    }
+  }
+
   /** 打开固定 fileVersionId 的原文预览（带 AbortController，迟到自动丢弃）。 */
   openPreview(fileVersionId: string): void {
     if (!this.sourceId) return
@@ -338,6 +378,11 @@ export class ProjectController {
     return this.q === '' ? 'files' : 'search'
   }
 
+  private emit(view: ProjectViewState): void {
+    this.lastEmittedView = view
+    this.deps.onView?.(view)
+  }
+
   private emitView(): void {
     let status: ProjectViewStatus
     if (!this.ready) status = 'no-ready'
@@ -360,7 +405,26 @@ export class ProjectController {
       hasActiveSync: this.hasActiveSync,
       latestReadySnapshotId: this.latestReadySnapshotId
     }
-    this.deps.onView?.(view)
+    this.emit(view)
+  }
+
+  /**
+   * 轻量刷新只更新与当前内容无关的快照字段（最新 ready / 活动同步），
+   * 保留已加载的文件/搜索结果与分页，避免 15 秒刷新清空用户视图。
+   */
+  private emitRefreshedView(): void {
+    const previous = this.lastEmittedView
+    if (!previous || previous.sourceId !== this.sourceId) {
+      this.emitView()
+      return
+    }
+    this.emit({
+      ...previous,
+      snapshotId: this.snapshotId,
+      ready: this.ready,
+      hasActiveSync: this.hasActiveSync,
+      latestReadySnapshotId: this.latestReadySnapshotId
+    })
   }
 
   private sameAsLoaded(): boolean {
@@ -410,7 +474,15 @@ export class ProjectController {
   /** 快照应用后的公共后续：发状态并按需加载视图（轮询由各调用点决定）。 */
   private afterSnapshots(sourceEpoch: number, sourceId: string): void {
     if (!this.currentSource(sourceEpoch, sourceId)) return
-    this.emitView()
+    // 快照身份（源/快照/ready）没变时只做轻量发射，保留当前文件/搜索内容；
+    // 身份变化（no-ready→ready、快照被降级、切源）才发完整视图。
+    const previous = this.lastEmittedView
+    const sameIdentity = !!previous &&
+      previous.sourceId === this.sourceId &&
+      previous.snapshotId === this.snapshotId &&
+      previous.ready === this.ready
+    if (sameIdentity) this.emitRefreshedView()
+    else this.emitView()
     if (this.ready && !this.sameAsLoaded()) {
       this.loadView(sourceEpoch, sourceId, this.viewEpoch, this.snapshotId, this.q, this.page)
     }
@@ -429,6 +501,8 @@ export class ProjectController {
   }
 
   private async runPoll(sourceEpoch: number, sourceId: string): Promise<void> {
+    // 本轮定时器已经触发，不再处于"有下一轮在排"状态；轻量刷新可据此恢复轮询。
+    this.pollTimer = undefined
     if (isStalePoll({ requestEpoch: sourceEpoch, latestEpoch: this.sourceEpoch, requestSourceId: sourceId, currentSourceId: this.sourceId })) return
     this.abortSnapshots()
     const controller = new AbortController()
@@ -476,7 +550,7 @@ export class ProjectController {
     const requestQuery = makeProjectQuery({ sourceId, snapshotId, page, pageSize: size, q, maxPageSize: PROJECT_PAGE_SIZE_MAX })
     if (!this.currentView(sourceEpoch, sourceId, viewEpoch)) return
 
-    this.deps.onView?.({
+    this.emit({
       sourceId, snapshotId, ready: true, page, pageSize: size, q,
       kind: q === '' ? 'files' : 'search',
       status: 'loading', total: 0, items: [], error: null,
@@ -488,7 +562,7 @@ export class ProjectController {
       if (!this.currentView(sourceEpoch, sourceId, viewEpoch)) return
       this.lastLoadedQuery = requestQuery
       this.lastLoadedError = err
-      this.deps.onView?.({
+      this.emit({
         sourceId, snapshotId, ready: true, page, pageSize: size, q,
         kind: q === '' ? 'files' : 'search', status: 'error', total: 0, items: [], error: err,
         hasActiveSync: this.hasActiveSync, latestReadySnapshotId: this.latestReadySnapshotId
@@ -503,7 +577,7 @@ export class ProjectController {
         if (!this.currentView(sourceEpoch, sourceId, viewEpoch)) return
         this.lastLoadedQuery = requestQuery
         this.lastLoadedError = null
-        this.deps.onView?.({
+        this.emit({
           sourceId, snapshotId, ready: true, page, pageSize: size, q,
           kind: 'files', status: 'ok', total: result.total, items: result.items, error: null,
           hasActiveSync: this.hasActiveSync, latestReadySnapshotId: this.latestReadySnapshotId
@@ -520,7 +594,7 @@ export class ProjectController {
         if (!this.currentView(sourceEpoch, sourceId, viewEpoch)) return
         this.lastLoadedQuery = requestQuery
         this.lastLoadedError = null
-        this.deps.onView?.({
+        this.emit({
           sourceId, snapshotId, ready: true, page, pageSize: size, q,
           kind: 'search', status: 'ok', total: result.total, items: result.results, error: null,
           hasActiveSync: this.hasActiveSync, latestReadySnapshotId: this.latestReadySnapshotId
@@ -528,6 +602,9 @@ export class ProjectController {
       }
     } catch {
       fail('loadFailed')
+    } finally {
+      // 结束后清掉 in-flight 标记：后续轻量刷新才能按 lastLoadedQuery 判断是否真的需要重载。
+      if (this.viewController === controller) this.viewController = null
     }
   }
 

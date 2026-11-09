@@ -1,0 +1,47 @@
+{
+  "schema": "ragkb-deployment-acceptance/v1",
+  "environment": {
+    "name": "",
+    "version": "",
+    "deployed_at": "",
+    "operator": ""
+  },
+  "items": {
+    "version_identity": {
+      "status": "unknown",
+      "level": "unknown",
+      "evidence": [],
+      "notes": ""
+    },
+    "backup_restore_rto_rpo": {
+      "status": "unknown",
+      "level": "unknown",
+      "evidence": [],
+      "notes": ""
+    },
+    "alert_delivery_firing_resolved": {
+      "status": "unknown",
+      "level": "unknown",
+      "evidence": [],
+      "notes": ""
+    },
+    "member_acl_allow_deny": {
+      "status": "unknown",
+      "level": "unknown",
+      "evidence": [],
+      "notes": ""
+    },
+    "soak_24h": {
+      "status": "unknown",
+      "level": "unknown",
+      "evidence": [],
+      "notes": ""
+    },
+    "soak_72h": {
+      "status": "unknown",
+      "level": "unknown",
+      "evidence": [],
+      "notes": ""
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "schema": "rag-eval-result-reviews/v1",
+  "run_id": "REPLACE-WITH-REPORT-RUN-ID",
+  "identity_sha256": "REPLACE-WITH-REPORT-IDENTITY-SHA256",
+  "result_fingerprint_version": 1,
+  "mode": "offline",
+  "reviews": [
+    {
+      "id": "REPLACE-CASE-001",
+      "result_sha256": "REPLACE-WITH-REPORT-RESULT-SHA256",
+      "answer_correct": null,
+      "citation_supported": null,
+      "outcome_correct": null,
+      "reviewer": null,
+      "reviewed_at": null,
+      "unknowns": []
+    }
+  ]
+}

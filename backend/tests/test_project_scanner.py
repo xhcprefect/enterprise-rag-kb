@@ -95,6 +95,35 @@ class ManifestTests(ScannerTestCase):
         self.assertEqual(len(blobs), 1)
 
 
+class NewestMtimeTests(ScannerTestCase):
+    """ScanReport.newest_mtime_ns：纳入索引文件的最晚 mtime（供自动同步去抖）。"""
+
+    def test_newest_mtime_ns_matches_indexed_file(self):
+        p = self._file("a.txt", b"x")
+        value = 1_600_000_000_123_456_789
+        os.utime(p, ns=(value, value))
+        r = self._scan(git_commit="x")
+        self.assertIsNotNone(r.newest_mtime_ns)
+        # 文件系统可能有 <1ms 的 mtime 舍入。
+        self.assertLess(abs(r.newest_mtime_ns - value), 1_000_000)
+
+    def test_empty_scan_has_no_newest_mtime(self):
+        r = self._scan(git_commit="x")
+        self.assertIsNone(r.newest_mtime_ns)
+
+    def test_newest_mtime_ns_is_max_across_indexed_files(self):
+        base = 1_600_000_000_000_000_000
+        older = self._file("old.txt", b"o")
+        middle = self._file("mid.txt", b"m")
+        newest = self._file("new.txt", b"n")
+        os.utime(older, ns=(base, base))
+        os.utime(middle, ns=(base + 5_000_000_000, base + 5_000_000_000))
+        os.utime(newest, ns=(base + 10_000_000_000, base + 10_000_000_000))
+        r = self._scan(git_commit="x")
+        self.assertEqual({e.relative_path for e in r.entries}, {"old.txt", "mid.txt", "new.txt"})
+        self.assertLess(abs(r.newest_mtime_ns - (base + 10_000_000_000)), 1_000_000)
+
+
 class ExclusionTests(ScannerTestCase):
     def test_secret_env_and_key_never_reincluded(self):
         self._file(".env", b"SECRET=1")

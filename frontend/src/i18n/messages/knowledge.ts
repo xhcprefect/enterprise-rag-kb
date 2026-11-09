@@ -19,6 +19,112 @@ export default {
       listHint: '打开知识库管理文档，或直接进入问答',
       actionsAria: '知识库操作：{name}',
       documentCount: '{count} 篇文档',
+      diagnostics: {
+        menu: '检索诊断',
+        title: '检索诊断',
+        intro: '执行一次与真实问答相同的检索流程，用于检查召回效果；只返回检索结果。',
+        question: '问题',
+        questionPlaceholder: '输入要诊断的检索问题',
+        questionRequired: '请输入问题（首尾空白会被忽略）。',
+        questionTooLong: '问题不能超过 {max} 个字符。',
+        documents: '文档范围（可选）',
+        documentsPlaceholder: '全部可检索文档',
+        documentsLoading: '正在加载可检索文档…',
+        documentsFailed: '可检索文档加载失败',
+        documentsEmpty: '当前没有可检索的文档',
+        documentsTruncated: '仅列出前 {limit} 份可检索文档（共 {total} 份），建议用文件名搜索缩小范围。',
+        documentLimit: '最多选择 {max} 份文档。',
+        retry: '重试',
+        costWarning: '运行时会调用一次 embedding（若启用重排还会发起重排请求），可能产生模型费用；不会生成答案，也不会写入会话。',
+        run: '运行诊断',
+        running: '正在检索…',
+        runFailed: '检索诊断请求失败',
+        closeBlocked: '诊断正在运行，请等待完成后再关闭。',
+        noAnswer: '本次只执行检索，不生成答案（answer_generated = false），也不写入会话。',
+        resultTitle: '诊断结果',
+        questionEcho: '问题：{question}',
+        collection: '向量集合：{name}',
+        kbStats: '文档：共 {total}，就绪 {ready}，可检索 {retrievable}',
+        scopeTitle: '文档范围',
+        scopeAll: '全部可检索文档',
+        scopeItem: '{name}（版本 {version}）',
+        errorType: '错误类型',
+        totalMs: '总耗时',
+        yes: '是',
+        no: '否',
+        unknown: '未知',
+        status: {
+          ok: '检索完成',
+          error: '检索未完成'
+        },
+        config: {
+          title: '检索配置',
+          topK: 'TOP K',
+          minSimilarity: '最低相似度',
+          maxPerDoc: '单文档上限',
+          hybrid: '混合检索',
+          keywordCandidates: '关键词候选数',
+          rerank: '重排',
+          neighbors: '邻居块数',
+          enabled: '已启用',
+          disabled: '未启用'
+        },
+        stages: {
+          title: '阶段耗时',
+          name: '阶段',
+          status: '状态',
+          msLabel: '耗时',
+          ms: '{count} ms',
+          candidates: '候选数',
+          errorType: '错误类型',
+          names: {
+            vector: '向量检索',
+            keyword: '关键词检索',
+            fusion: '融合',
+            rerank: '重排',
+            select: '选取',
+            neighbors: '邻居扩展',
+            unknown: '其他阶段'
+          },
+          statuses: {
+            ok: '完成',
+            error: '失败',
+            skipped: '跳过',
+            fallback: '降级',
+            unknown: '未知'
+          },
+          reasons: {
+            disabled: '未启用',
+            not_configured: '未配置',
+            unknown: '其他原因'
+          }
+        },
+        candidates: {
+          title: '候选片段',
+          empty: '未检索到候选，检查资料是否可检索或换一种问法。',
+          rank: '#{rank}',
+          unknownFilename: '未知文档',
+          chunkRange: '分块 {start}–{end}',
+          chunkSingle: '分块 {start}',
+          locationUnknown: '位置未知',
+          indexVersion: '索引版本 {version}',
+          lifecycle: '生命周期',
+          retrievable: '可检索',
+          truncated: '摘要已截断（共 {count} 字符）',
+          methods: {
+            vector: '向量',
+            keyword: '关键词',
+            hybrid: '混合',
+            unknown: '未知'
+          }
+        },
+        scores: {
+          distance: '距离',
+          fusion_score: '融合分数',
+          rerank_score: '重排分数',
+          citation_score: '引用分数'
+        }
+      },
       manage: '管理文档',
       projectManage: '管理项目源',
       projectReady: '项目已就绪',
@@ -70,6 +176,116 @@ export default {
       listHint: 'Open a knowledge base to manage its documents, or start a chat',
       actionsAria: 'Knowledge base actions: {name}',
       documentCount: '{count} document | {count} documents',
+      diagnostics: {
+        menu: 'Retrieval diagnostics',
+        title: 'Retrieval diagnostics',
+        intro: 'Runs the same retrieval pipeline as a real chat turn to inspect recall. It returns retrieval results only.',
+        question: 'Question',
+        questionPlaceholder: 'Enter the retrieval question to diagnose',
+        questionRequired: 'Enter a question (leading and trailing whitespace is ignored).',
+        questionTooLong: 'The question cannot exceed {max} characters.',
+        documents: 'Document scope (optional)',
+        documentsPlaceholder: 'All retrievable documents',
+        documentsLoading: 'Loading retrievable documents…',
+        documentsFailed: 'Failed to load retrievable documents',
+        documentsEmpty: 'No retrievable documents in this knowledge base',
+        documentsTruncated:
+          'Only the first {limit} retrievable documents are listed (of {total}). Search by file name to narrow the scope.',
+        documentLimit: 'Select at most {max} documents.',
+        retry: 'Retry',
+        costWarning:
+          'Running this calls embedding once (and reranking when enabled), which may incur model charges. No answer is generated and no conversation is written.',
+        run: 'Run diagnostics',
+        running: 'Retrieving…',
+        runFailed: 'Retrieval diagnostics request failed',
+        closeBlocked: 'Diagnostics is running. Wait for it to finish before closing.',
+        noAnswer:
+          'This run only performs retrieval. No answer is generated (answer_generated = false) and no conversation is written.',
+        resultTitle: 'Diagnostics result',
+        questionEcho: 'Question: {question}',
+        collection: 'Vector collection: {name}',
+        kbStats: 'Documents: {total} total, {ready} ready, {retrievable} retrievable',
+        scopeTitle: 'Document scope',
+        scopeAll: 'All retrievable documents',
+        scopeItem: '{name} (version {version})',
+        errorType: 'Error type',
+        totalMs: 'Total time',
+        yes: 'Yes',
+        no: 'No',
+        unknown: 'Unknown',
+        status: {
+          ok: 'Retrieval completed',
+          error: 'Retrieval did not complete'
+        },
+        config: {
+          title: 'Retrieval configuration',
+          topK: 'TOP K',
+          minSimilarity: 'Minimum similarity',
+          maxPerDoc: 'Max per document',
+          hybrid: 'Hybrid retrieval',
+          keywordCandidates: 'Keyword candidates',
+          rerank: 'Rerank',
+          neighbors: 'Neighbor chunks',
+          enabled: 'Enabled',
+          disabled: 'Disabled'
+        },
+        stages: {
+          title: 'Stage timing',
+          name: 'Stage',
+          status: 'Status',
+          msLabel: 'Time',
+          ms: '{count} ms',
+          candidates: 'Candidates',
+          errorType: 'Error type',
+          names: {
+            vector: 'Vector retrieval',
+            keyword: 'Keyword retrieval',
+            fusion: 'Fusion',
+            rerank: 'Rerank',
+            select: 'Selection',
+            neighbors: 'Neighbor expansion',
+            unknown: 'Other stage'
+          },
+          statuses: {
+            ok: 'Completed',
+            error: 'Failed',
+            skipped: 'Skipped',
+            fallback: 'Fallback',
+            unknown: 'Unknown'
+          },
+          reasons: {
+            disabled: 'Disabled',
+            not_configured: 'Not configured',
+            unknown: 'Other reason'
+          }
+        },
+        candidates: {
+          title: 'Candidate chunks',
+          empty:
+            'No candidates were retrieved. Check whether the documents are retrievable or try a different question.',
+          rank: '#{rank}',
+          unknownFilename: 'Unknown document',
+          chunkRange: 'Chunks {start}–{end}',
+          chunkSingle: 'Chunk {start}',
+          locationUnknown: 'Location unknown',
+          indexVersion: 'Index version {version}',
+          lifecycle: 'Lifecycle',
+          retrievable: 'Retrievable',
+          truncated: 'Excerpt truncated ({count} characters in total)',
+          methods: {
+            vector: 'Vector',
+            keyword: 'Keyword',
+            hybrid: 'Hybrid',
+            unknown: 'Unknown'
+          }
+        },
+        scores: {
+          distance: 'Distance',
+          fusion_score: 'Fusion score',
+          rerank_score: 'Rerank score',
+          citation_score: 'Citation score'
+        }
+      },
       manage: 'Manage docs',
       projectManage: 'Manage project source',
       projectReady: 'Project ready',

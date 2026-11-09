@@ -105,6 +105,81 @@
           </div>
         </header>
 
+        <!-- 自动同步：页面只负责配置与刷新展示，实际检查由服务端 project worker 执行 -->
+        <section class="auto-sync-panel" data-testid="auto-sync-panel" :aria-label="t('projects.autoSync.title')">
+          <div class="auto-sync-summary">
+            <span class="auto-sync-title">{{ t('projects.autoSync.title') }}</span>
+            <el-tag
+              size="small"
+              :type="selected.auto_sync_enabled ? 'success' : 'info'"
+              effect="light"
+              round
+              data-testid="auto-sync-state"
+            >{{ selected.auto_sync_enabled ? t('projects.autoSync.enabled') : t('projects.autoSync.disabled') }}</el-tag>
+            <span class="auto-sync-desc" data-testid="auto-sync-hint">
+              {{ selected.revoked_at
+                ? t('projects.autoSync.revokedHint')
+                : selected.auto_sync_enabled
+                  ? t('projects.autoSync.enabledHint', { interval: intervalText(selected.auto_sync_interval_seconds) })
+                  : t('projects.autoSync.disabledHint') }}
+            </span>
+          </div>
+
+          <div class="auto-sync-meta">
+            <span data-testid="auto-sync-last-checked">
+              {{ t('projects.autoSync.lastChecked') }}：
+              {{ selected.auto_sync_last_checked_at ? formatDateTime(selected.auto_sync_last_checked_at) : t('projects.autoSync.neverChecked') }}
+            </span>
+            <span v-if="selected.auto_sync_enabled" data-testid="auto-sync-next-check">
+              {{ t('projects.autoSync.nextCheck') }}：
+              {{ selected.auto_sync_next_check_at ? formatDateTime(selected.auto_sync_next_check_at) : t('projects.autoSync.notScheduled') }}
+            </span>
+          </div>
+
+          <el-alert
+            v-if="selected.auto_sync_last_error_code || selected.auto_sync_last_error_message"
+            class="auto-sync-error"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="t('projects.autoSync.lastError')"
+            :description="autoSyncErrorText(selected)"
+            data-testid="auto-sync-error"
+          />
+
+          <div v-if="isAdmin && !selected.revoked_at" class="auto-sync-controls">
+            <el-switch
+              v-model="autoSyncDraft.enabled"
+              :loading="autoSyncSaving"
+              :disabled="autoSyncSaving"
+              data-testid="auto-sync-toggle"
+            />
+            <span class="auto-sync-interval-label">{{ t('projects.autoSync.interval') }}</span>
+            <el-select
+              v-model="autoSyncDraft.interval"
+              size="small"
+              class="auto-sync-interval"
+              :disabled="autoSyncSaving"
+              data-testid="auto-sync-interval"
+            >
+              <el-option
+                v-for="opt in autoSyncIntervalOptions"
+                :key="opt.value"
+                :value="opt.value"
+                :label="opt.label"
+              />
+            </el-select>
+            <el-button
+              type="primary"
+              size="small"
+              :loading="autoSyncSaving"
+              :disabled="autoSyncSaving"
+              data-testid="auto-sync-save"
+              @click="saveAutoSync"
+            >{{ t('projects.autoSync.save') }}</el-button>
+          </div>
+        </section>
+
         <el-alert v-if="pageError" class="detail-alert" :title="pageError" type="error" :closable="true" show-icon @close="pageError = ''" />
         <el-alert
           v-if="selected.revoked_at"
@@ -114,6 +189,17 @@
           :closable="false"
           show-icon
         />
+
+        <!-- 新版本提示：只提示，绝不静默改绑当前快照 -->
+        <div v-if="showNewSnapshotBanner" class="new-snapshot-banner" role="status" data-testid="new-snapshot-banner">
+          <div class="new-snapshot-copy">
+            <strong>{{ t('projects.newSnapshotBanner.title') }}</strong>
+            <span>{{ t('projects.newSnapshotBanner.description') }}</span>
+          </div>
+          <el-button type="primary" size="small" data-testid="view-new-snapshot" @click="viewNewSnapshot">
+            {{ t('projects.newSnapshotBanner.view') }}
+          </el-button>
+        </div>
 
         <!-- 快照视图：只有 ready 才能浏览/搜索 -->
         <div class="snapshot-bar" role="group" :aria-label="t('projects.snapshotLabel')">
@@ -409,12 +495,35 @@ const revoking = ref(false)
 const pageError = ref('')
 const queryText = ref('')
 
+/** 自动同步设置草稿：服务端值是唯一事实，保存成功后用返回的源覆盖。 */
+const autoSyncSaving = ref(false)
+const autoSyncDraft = reactive({ enabled: false, interval: 300 })
+const AUTO_SYNC_REFRESH_MS = 15_000
+const AUTO_SYNC_INTERVALS = [60, 300, 900, 1800, 3600] as const
+let autoSyncTimer: ReturnType<typeof setInterval> | null = null
+let autoSyncTickInFlight = false
+
 const createOpen = ref(false)
 const creating = ref(false)
 const formRef = ref<FormInstance>()
 const form = reactive({ name: '', root_key: '', relative_dir: '' })
 
 const controlsBusy = computed(() => syncing.value || cancelling.value || revoking.value)
+
+/** 当前仍停留在旧快照，但服务端已有更新的 ready 快照：只提示，不静默改绑。 */
+const showNewSnapshotBanner = computed(() =>
+  view.value.ready &&
+  !!view.value.latestReadySnapshotId &&
+  view.value.snapshotId !== view.value.latestReadySnapshotId
+)
+
+/** 固定间隔选项；服务端返回的自定义值不在列表内时补一项，避免把用户值显示成空白。 */
+const autoSyncIntervalOptions = computed(() => {
+  const values: number[] = [...AUTO_SYNC_INTERVALS]
+  const current = autoSyncDraft.interval
+  if (Number.isFinite(current) && current > 0 && !values.includes(current)) values.push(current)
+  return values.sort((a, b) => a - b).map((value) => ({ value, label: intervalText(value) }))
+})
 
 const rules = computed<FormRules>(() => ({
   name: [{ required: true, message: t('projects.form.nameRequired'), trigger: 'blur' }],
@@ -465,7 +574,8 @@ function snapshotStatusLabel(status: ProjectSnapshot['status']) {
     processing: 'syncing',
     ready: 'ready',
     failed: 'failed',
-    cancelled: 'cancelled'
+    cancelled: 'cancelled',
+    unchanged: 'unchanged'
   }
   return t(`projects.${map[status]}`)
 }
@@ -492,6 +602,110 @@ function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+/** 服务端返回的间隔非法/缺失时回到契约默认值 300 秒。 */
+function normalizeAutoSyncInterval(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 300
+}
+
+/** 秒数 → 人类可读间隔（整小时/整分钟/秒）。 */
+function intervalText(seconds: number | null | undefined) {
+  if (!seconds || !Number.isFinite(seconds) || seconds <= 0) return '—'
+  if (seconds % 3600 === 0) return t('projects.autoSync.hours', { count: seconds / 3600 })
+  if (seconds % 60 === 0) return t('projects.autoSync.minutes', { count: seconds / 60 })
+  return t('projects.autoSync.seconds', { count: seconds })
+}
+
+/** 错误码 + 服务端安全提示：都是纯文本插值，不渲染 HTML。 */
+function autoSyncErrorText(source: ProjectSource) {
+  const code = source.auto_sync_last_error_code
+  const message = source.auto_sync_last_error_message
+  if (code && message) return `${code}: ${message}`
+  return code || message || ''
+}
+
+/** 用 PATCH 返回的最新源替换列表条目（保留列表位置）。 */
+function replaceSource(next: ProjectSource) {
+  const index = sources.value.findIndex((source) => source.id === next.id)
+  if (index >= 0) sources.value.splice(index, 1, next)
+  else sources.value.unshift(next)
+}
+
+async function saveAutoSync() {
+  if (!isAdmin.value || !selected.value || autoSyncSaving.value) return
+  const sourceId = selected.value.id
+  autoSyncSaving.value = true
+  pageError.value = ''
+  try {
+    const { data } = await projectApi.updateAutoSync(sourceId, {
+      enabled: autoSyncDraft.enabled,
+      interval_seconds: autoSyncDraft.interval
+    })
+    replaceSource(data)
+    ElMessage.success(t('projects.autoSync.saved'))
+    syncAutoSyncTimer()
+  } catch (err: any) {
+    pageError.value = errorText(err, 'projects.autoSync.saveFailed')
+  } finally {
+    autoSyncSaving.value = false
+  }
+}
+
+function viewNewSnapshot() {
+  const target = view.value.latestReadySnapshotId
+  if (!target) return
+  onSnapshotChange(target)
+}
+
+function stopAutoSyncTimer() {
+  if (autoSyncTimer !== null) {
+    clearInterval(autoSyncTimer)
+    autoSyncTimer = null
+  }
+}
+
+/**
+ * 空闲轻量刷新：选中源开启自动同步且页面可见时每 15 秒一次。
+ * 只重读当前源详情（自动同步字段）+ 让控制器刷新快照列表，不重载文件/搜索视图。
+ * 页面隐藏时暂停；条件不满足或卸载时清理。
+ */
+function syncAutoSyncTimer() {
+  stopAutoSyncTimer()
+  if (!selected.value?.auto_sync_enabled || selected.value.revoked_at) return
+  if (typeof document !== 'undefined' && document.hidden) return
+  autoSyncTimer = setInterval(() => { void autoSyncRefreshTick() }, AUTO_SYNC_REFRESH_MS)
+}
+
+async function autoSyncRefreshTick() {
+  if (autoSyncTickInFlight) return
+  if (typeof document !== 'undefined' && document.hidden) return
+  const current = selected.value
+  const sourceId = current?.id
+  if (!sourceId || !current) return
+  // 若刷新期间用户刚保存了新的自动同步设置，丢弃这份陈旧详情，避免覆盖新配置。
+  const expected = {
+    enabled: current.auto_sync_enabled,
+    interval: current.auto_sync_interval_seconds
+  }
+  autoSyncTickInFlight = true
+  try {
+    const { data } = await projectApi.get(sourceId)
+    const latest = selected.value
+    if (!latest || latest.id !== sourceId) return
+    if (latest.auto_sync_enabled !== expected.enabled || latest.auto_sync_interval_seconds !== expected.interval) return
+    replaceSource(data)
+    await controller.refreshSnapshots()
+  } catch {
+    // 轻量刷新失败保持既有展示；用户仍可手动刷新，不每 15 秒弹错误。
+  } finally {
+    autoSyncTickInFlight = false
+  }
+}
+
+function onVisibilityChange() {
+  if (typeof document !== 'undefined' && document.hidden) stopAutoSyncTimer()
+  else syncAutoSyncTimer()
 }
 
 /** 后端错误 → 可展示文案（404/410/409/403 分别对应不可用/撤销/未就绪/无权限）。 */
@@ -739,6 +953,23 @@ async function submitCreate() {
   }
 }
 
+// 选中源的自动同步设置变化时，把草稿对齐到服务端最新值。
+watch(
+  () => [selectedId.value, selected.value?.auto_sync_enabled, selected.value?.auto_sync_interval_seconds] as const,
+  () => {
+    autoSyncDraft.enabled = selected.value?.auto_sync_enabled ?? false
+    autoSyncDraft.interval = normalizeAutoSyncInterval(selected.value?.auto_sync_interval_seconds)
+  },
+  { immediate: true }
+)
+
+// 开启自动同步且页面可见时维护 15 秒轻量刷新定时器；隐藏/关闭/切源即暂停或清理。
+watch(
+  () => [selectedId.value, selected.value?.auto_sync_enabled, selected.value?.revoked_at] as const,
+  () => { syncAutoSyncTimer() },
+  { immediate: true }
+)
+
 // 直接打开 /projects/:id（浏览器前进/后退）时同步选中项。
 watch(() => route.params.sourceId, (value) => {
   if (typeof value !== 'string' || !value || value === selectedId.value) return
@@ -747,9 +978,12 @@ watch(() => route.params.sourceId, (value) => {
 })
 
 onMounted(async () => {
+  document.addEventListener('visibilitychange', onVisibilityChange)
   await Promise.all([loadSources(), loadRoots()])
 })
 onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  stopAutoSyncTimer()
   controller.dispose()
 })
 </script>
@@ -949,6 +1183,85 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+}
+
+.auto-sync-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-soft);
+}
+
+.auto-sync-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.auto-sync-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.auto-sync-desc,
+.auto-sync-meta {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.auto-sync-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.auto-sync-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.auto-sync-interval-label {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.auto-sync-interval {
+  width: 130px;
+}
+
+.new-snapshot-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 13px;
+  border: 1px solid var(--success-border);
+  border-radius: 9px;
+  background: var(--success-soft);
+}
+
+.new-snapshot-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.new-snapshot-copy strong {
+  color: var(--success);
+  font-size: 13px;
 }
 
 .snapshot-bar {

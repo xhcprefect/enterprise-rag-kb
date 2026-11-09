@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from app.models import Message
-from app.services import chat_turns
+from app.services import answer_history, chat_turns
 
 
 @contextmanager
@@ -27,8 +27,9 @@ def async_factory(factory):
     return generate
 
 
-def mock_turns(stack, conversation_id, writer, *, document_scope=None, scope_revision=0):
+def mock_turns(stack, conversation_id, writer, *, document_scope=None, scope_revision=0, history=()):
     writer.__enter__.return_value = writer
+    stack.enter_context(patch.object(answer_history, "load_rag_history", return_value=list(history)))
 
     def claim(db, **kwargs):
         turn_id, message_id = uuid.uuid4(), uuid.uuid4()
@@ -36,7 +37,9 @@ def mock_turns(stack, conversation_id, writer, *, document_scope=None, scope_rev
                        turn_id=turn_id, status="processing"))
         return chat_turns.Reservation(turn_id, kwargs.get("request_id") or uuid.uuid4(), conversation_id,
                                       message_id, kwargs["user_id"], document_scope=document_scope or [],
-                                      scope_revision=scope_revision)
+                                      scope_revision=scope_revision, auth_token_version=kwargs.get("auth_token_version"),
+                                      mode=kwargs["mode"], kb_id=kwargs["kb_id"],
+                                      project_snapshot_id=kwargs.get("project_snapshot_id"))
 
     def complete(db, reservation, answer, citations, latency, trace, **_options):
         identifier = uuid.uuid4()
@@ -46,8 +49,9 @@ def mock_turns(stack, conversation_id, writer, *, document_scope=None, scope_rev
         db.commit()
         return identifier
 
-    stack.enter_context(patch.object(chat_turns, "claim_turn", side_effect=claim))
-    stack.enter_context(patch.object(chat_turns, "complete_turn", side_effect=complete))
+    claimed = stack.enter_context(patch.object(chat_turns, "claim_turn", side_effect=claim))
+    completed = stack.enter_context(patch.object(chat_turns, "complete_turn", side_effect=complete))
     stack.enter_context(patch.object(chat_turns, "end_turn"))
     stack.enter_context(patch.object(chat_turns, "check_lease", return_value=True))
     stack.enter_context(patch.object(chat_turns, "keepalive", side_effect=keepalive))
+    return claimed, completed

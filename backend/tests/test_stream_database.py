@@ -54,6 +54,8 @@ class StreamDatabaseTests(unittest.TestCase):
         self.key = uuid.uuid4()
         self.payload = {"question": "synthetic question", "mode": "chat", "request_id": str(self.key)}
         self.request = Request({"type": "http", "method": "POST", "path": "/api/v1/chat/stream", "headers": []})
+        # 认领事务要求认证时刻的原始令牌版本快照（测试用户 token_version 默认 0）。
+        self.request.state.auth_token_version = 0
 
     def state(self, headers=None):
         return self.client.get(f"/api/v1/chat/requests/{self.key}", headers=headers or self.headers)
@@ -119,7 +121,8 @@ class StreamDatabaseTests(unittest.TestCase):
     def test_expired_processing_request_becomes_failed_on_read(self):
         with SessionLocal() as db:
             reservation = chat_turns.claim_turn(db, user_id=self.user.id, conversation_id=None, kb_id=None,
-                                                mode="chat", question="expired", top_k=6, request_id=self.key)
+                                                mode="chat", question="expired", top_k=6, request_id=self.key,
+                                                auth_token_version=0)
             db.execute(update(Conversation).where(Conversation.id == reservation.conversation_id)
                        .values(lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)))
             db.commit()
@@ -134,12 +137,13 @@ class StreamDatabaseTests(unittest.TestCase):
     def test_reading_legacy_stale_request_does_not_release_newer_claim(self):
         with SessionLocal() as db:
             old = chat_turns.claim_turn(db, user_id=self.user.id, conversation_id=None, kb_id=None,
-                                       mode="chat", question="old", top_k=6, request_id=self.key)
+                                       mode="chat", question="old", top_k=6, request_id=self.key,
+                                       auth_token_version=0)
             db.execute(update(Conversation).where(Conversation.id == old.conversation_id)
                        .values(lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)))
             db.commit()
             new = chat_turns.claim_turn(db, user_id=self.user.id, conversation_id=old.conversation_id, kb_id=None,
-                                       mode="chat", question="new", top_k=6)
+                                       mode="chat", question="new", top_k=6, auth_token_version=0)
             db.execute(update(ChatTurn).where(ChatTurn.id == old.turn_id).values(status="processing"))
             db.commit()
         self.assertEqual(self.state().json()["data"]["status"], "failed")

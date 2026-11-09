@@ -18,6 +18,11 @@ MAX_SEARCH_QUERY = 2000
 MAX_TOP_K = 20
 MAX_PREVIEW_CHARS = 20000
 
+# 可选定时自动同步：默认 300 秒检查一次；60 秒 ~ 24 小时。
+AUTO_SYNC_DEFAULT_INTERVAL_SECONDS = 300
+AUTO_SYNC_MIN_INTERVAL_SECONDS = 60
+AUTO_SYNC_MAX_INTERVAL_SECONDS = 86400
+
 
 def _validate_relative_dir(value: str, info) -> str:
     """先拒绝原始路径的绝对/盘符/UNC/反斜杠形式，再逐组件校验。
@@ -75,9 +80,27 @@ class ProjectSourceRead(BaseModel):
     # 仅回显 root_key，绝不暴露绝对根路径（root_fingerprint 不对外）。
     active_snapshot_id: uuid.UUID | None = None
     revoked_at: datetime | None = None
+    # 自动同步配置与最近一次结果（错误消息只含固定安全文案，不含路径/正文）。
+    auto_sync_enabled: bool = False
+    auto_sync_interval_seconds: int = AUTO_SYNC_DEFAULT_INTERVAL_SECONDS
+    auto_sync_next_check_at: datetime | None = None
+    auto_sync_last_checked_at: datetime | None = None
+    auto_sync_last_error_code: str | None = None
+    auto_sync_last_error_message: str | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ProjectAutoSyncUpdate(BaseModel):
+    """PATCH 自动同步开关与间隔；间隔硬界由 schema 先校验（422）。"""
+
+    enabled: bool
+    interval_seconds: int = Field(
+        default=AUTO_SYNC_DEFAULT_INTERVAL_SECONDS,
+        ge=AUTO_SYNC_MIN_INTERVAL_SECONDS,
+        le=AUTO_SYNC_MAX_INTERVAL_SECONDS,
+    )
 
 
 # ---------------- 快照 / 同步任务 ----------------
@@ -86,6 +109,7 @@ class ProjectSnapshotRead(BaseModel):
     id: uuid.UUID
     source_id: uuid.UUID
     status: str
+    trigger_source: str = "manual"
     base_snapshot_id: uuid.UUID | None = None
     progress: int
     file_count: int

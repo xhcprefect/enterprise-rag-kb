@@ -61,6 +61,9 @@ def get_current_user(
     version = payload.get("ver", 0)
     if type(version) is not int or version != user.token_version:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录状态已失效，请重新登录")
+    # 认证通过时刻的原始令牌版本快照：只在这里捕获一次。
+    # 后续治理写入口必须依赖该快照（而不是重新解码令牌，或读取可能已被刷新/改写的 ORM 实例）。
+    request.state.auth_token_version = version
     # 供请求日志中间件记录"是谁在调接口"
     request.state.user = user
     return user

@@ -54,7 +54,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column :label="t('audit.colAction')" width="180">
+        <el-table-column :label="t('audit.colAction')" width="200">
           <template #default="{ row }">
             <el-tag size="small" :type="actionType(row.action)" effect="light">
               {{ actionText(row.action) }}
@@ -157,7 +157,20 @@ const ACTION_TEXT = computed<Record<string, string>>(() => ({
   kb_delete: t('audit.actions.kbDelete'),
   document_upload: t('audit.actions.documentUpload'),
   document_delete: t('audit.actions.documentDelete'),
-  chat_query: t('audit.actions.chatQuery')
+  chat_query: t('audit.actions.chatQuery'),
+  conversation_metadata: t('audit.actions.conversationMetadata'),
+  project_kb_delete: t('audit.actions.projectKbDelete'),
+  document_governance_update: t('audit.actions.documentGovernanceUpdate'),
+  document_supersede: t('audit.actions.documentSupersede'),
+  document_reenable: t('audit.actions.documentReenable'),
+  model_price_update: t('audit.actions.modelPriceUpdate'),
+  feedback_export: t('audit.actions.feedbackExport'),
+  feedback_review: t('audit.actions.feedbackReview'),
+  feedback_view_detail: t('audit.actions.feedbackViewDetail'),
+  feedback_regression_enroll: t('audit.actions.feedbackRegressionEnroll'),
+  feedback_regression_prepare: t('audit.actions.feedbackRegressionPrepare'),
+  feedback_regression_export: t('audit.actions.feedbackRegressionExport'),
+  feedback_regression_import: t('audit.actions.feedbackRegressionImport')
 }))
 
 function actionText(action: string) {

@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Barrier
 from unittest.mock import patch
 
+from tests import _memory_project_test_gate as gate
 from tests._env import TEST_URL
 
 from fastapi import HTTPException, Request
@@ -53,6 +54,7 @@ class DocumentIdentityTests(unittest.TestCase):
     def setUpClass(cls):
         if engine.url != make_url(TEST_URL):
             raise RuntimeError("应用引擎未指向专用测试库，拒绝运行")
+        gate.verify(gate.TEST_DATABASE_URL, gate.TARGET_OWNER, engine)
         init_db(create_admin=False)
 
     @classmethod
@@ -60,6 +62,7 @@ class DocumentIdentityTests(unittest.TestCase):
         engine.dispose()
 
     def setUp(self):
+        gate.verify(gate.TEST_DATABASE_URL, gate.TARGET_OWNER, engine)
         _document_tables_reset()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -80,6 +83,7 @@ class DocumentIdentityTests(unittest.TestCase):
             db.commit()
             self.admin_id = self.admin.id
             self.kb_id, self.other_kb_id = self.kb.id, self.other_kb.id
+            self.request.state.auth_token_version = self.admin.token_version
 
     # ---- 辅助 ----
     def small_upload(self, data: bytes, *, kb_id=None, filename="same.txt"):
@@ -221,6 +225,106 @@ class DocumentIdentityTests(unittest.TestCase):
             with SessionLocal() as db:
                 result = knowledge.reindex_document(self.kb_id, first.id, db, self.admin)
             self.assertEqual(result.data.status, DocumentStatus.PENDING.value)
+
+    # ---- 治理：inactive canonical 不得被复用/复活，重索引不得重置治理 ----
+    def _set_governance(self, doc_id, **fields):
+        with SessionLocal() as db:
+            doc = db.get(Document, doc_id)
+            for name, value in fields.items():
+                setattr(doc, name, value)
+            db.commit()
+
+    def test_small_upload_inactive_canonical_is_409_not_revived(self):
+        data = b"governed content"
+        first = self.small_upload(data)
+        self._set_governance(first.id, superseded_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        for governance in ({"superseded_at": datetime(2026, 1, 1, tzinfo=timezone.utc)},
+                           {"enabled": False},
+                           {"valid_until": datetime(2000, 1, 1, tzinfo=timezone.utc)},
+                           {"valid_from": datetime(2999, 1, 1, tzinfo=timezone.utc)}):
+            self._set_governance(first.id, **{"superseded_at": None, "enabled": True,
+                                              "valid_from": None, "valid_until": None})
+            self._set_governance(first.id, **governance)
+            with self.assertRaises(HTTPException) as error:
+                self.small_upload(data, filename=f"retry-{uuid.uuid4().hex}.txt")
+            self.assertEqual(error.exception.status_code, 409, str(governance))
+            # 不复活：行仍是原治理状态，且没有产生第二份 canonical
+            self.assertEqual(self.document_count(), 1)
+            doc = self.fresh_document(first.id)
+            self.assertEqual(doc.governance_revision, 0)
+        # 本次被拒上传写入的 tmp 文件也必须清干净
+        files = [p for p in Path(self.temp.name).rglob("*") if p.is_file()]
+        self.assertEqual(len(files), 1)
+
+    def test_chunked_complete_inactive_canonical_is_409(self):
+        data = b"chunked governed"
+        first = self.chunked_upload(data)
+        self._set_governance(first.data.document.id, enabled=False)
+        with self.assertRaises(HTTPException) as error:
+            self.chunked_upload(data, filename="again.txt")
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(self.document_count(), 1)
+        # 被拒的分片会话不留正式文件（tmp 分片由会话 TTL 处理）
+        remaining = [p for p in Path(self.temp.name).rglob("*") if p.is_file()]
+        self.assertEqual(len(remaining), 1)
+
+    def test_completed_session_replay_of_inactive_canonical_is_409(self):
+        data = b"replay governed"
+        first = self.chunked_upload(data)
+        with SessionLocal() as db:
+            session_id = db.scalar(select(UploadSession.id).where(
+                UploadSession.document_id == first.data.document.id,
+                UploadSession.deduplicated.is_(False)))
+        self._set_governance(first.data.document.id,
+                             superseded_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                             status=DocumentStatus.READY.value)
+        with SessionLocal() as db:
+            with self.assertRaises(HTTPException) as error:
+                knowledge.complete_upload(self.kb_id, session_id, self.request, db, self.admin)
+        self.assertEqual(error.exception.status_code, 409)
+        # 重放被拒既不改治理、也不改入库状态
+        doc = self.fresh_document(first.data.document.id)
+        self.assertIsNotNone(doc.superseded_at)
+        self.assertEqual(doc.governance_revision, 0)
+        self.assertEqual(doc.status, DocumentStatus.READY.value)
+
+    def test_reindex_keeps_governance_metadata(self):
+        data = b"reindex governed"
+        first = self.small_upload(data)
+        valid_until = datetime(2999, 1, 1, tzinfo=timezone.utc)
+        reviewed = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        self._set_governance(first.id, maintainer="ops", last_reviewed_at=reviewed,
+                             valid_until=valid_until, index_version=4,
+                             status=DocumentStatus.READY.value)
+        with SessionLocal() as db:
+            result = knowledge.reindex_document(self.kb_id, first.id, db, self.admin)
+        self.assertEqual(result.data.status, DocumentStatus.PENDING.value)
+        doc = self.fresh_document(first.id)
+        self.assertEqual(doc.maintainer, "ops")
+        self.assertEqual(doc.last_reviewed_at, reviewed)
+        self.assertEqual(doc.valid_until, valid_until)
+        self.assertEqual(doc.index_version, 5)   # 只推进代次
+        self.assertEqual(doc.governance_revision, 0)
+
+    def test_cancel_keeps_governance_metadata(self):
+        data = b"cancel governed"
+        first = self.small_upload(data)
+        valid_from = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self._set_governance(first.id, maintainer="ops", valid_from=valid_from,
+                             status=DocumentStatus.PENDING.value)
+        with SessionLocal() as db:
+            knowledge.cancel_document(self.kb_id, first.id, db, self.admin)
+        doc = self.fresh_document(first.id)
+        self.assertEqual(doc.maintainer, "ops")
+        self.assertEqual(doc.valid_from, valid_from)
+        self.assertTrue(doc.cancel_requested)
+        self.assertEqual(doc.governance_revision, 0)
+
+    def fresh_document(self, doc_id):
+        with SessionLocal() as db:
+            doc = db.get(Document, doc_id)
+            db.refresh(doc)
+            return doc
 
     def test_missing_local_file_after_dedup_cleans_only_own_copy(self):
         data = b"cleanup content"

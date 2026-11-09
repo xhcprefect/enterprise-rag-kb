@@ -36,7 +36,7 @@ export default {
         restrictedHint: '本次回答仅依据所选 {count} 篇文档。',
         dialog: {
           title: '限定回答依据',
-          description: '只从已就绪的文档中检索，最多选择 {max} 篇。清空选择表示检索整个知识库。',
+          description: '只从可检索的文档中检索，最多选择 {max} 篇。清空选择表示检索整个知识库。',
           selectedTitle: '已选文档',
           selectedCount: '已选 {count}/{max}',
           selectedEmpty: '尚未选择文档，将检索整个知识库。',
@@ -44,12 +44,16 @@ export default {
           loading: '正在加载文档…',
           loadedCount: '已加载 {loaded}/{total}',
           loadMore: '加载更多',
-          empty: '这个知识库还没有已就绪的文档。',
+          empty: '这个知识库还没有可检索的文档。',
           loadFailed: '文档加载失败，请重试。',
           retry: '重试',
           limit: '最多只能选择 {max} 篇文档。',
           cancel: '取消',
-          confirm: '应用范围'
+          confirm: '应用范围',
+          freshNotRetrievable: '有文档已不再可检索（可能被停用、替代或已过期），当前选择保持不变。',
+          freshVersionChanged: '有文档已重新索引，代次发生变化，请重新打开范围对话框后再确认。',
+          freshUnavailable: '暂时无法确认部分文档的最新状态，当前选择保持不变，请重试。',
+          freshChecksIncomplete: '每一篇已选文档都必须核验，本次未能全部核验，当前选择保持不变，请减少选择后重试。'
         }
       },
       newChat: '开启新对话',
@@ -269,12 +273,16 @@ export default {
           loading: 'Loading documents…',
           loadedCount: '{loaded} of {total} loaded',
           loadMore: 'Load more',
-          empty: 'This knowledge base has no ready documents yet.',
+          empty: 'This knowledge base has no retrievable documents yet.',
           loadFailed: 'Could not load documents. Please retry.',
           retry: 'Retry',
           limit: 'You can select up to {max} documents.',
           cancel: 'Cancel',
-          confirm: 'Apply scope'
+          confirm: 'Apply scope',
+          freshNotRetrievable: 'Some selected documents are no longer retrievable (disabled, superseded, or expired). Your selection is unchanged.',
+          freshVersionChanged: 'Some documents were re-indexed, so their generation changed. Reopen the scope dialog and confirm again.',
+          freshUnavailable: 'The latest state of some documents could not be confirmed. Your selection is unchanged; please retry.',
+          freshChecksIncomplete: 'Every selected document must be checked. Not all could be checked, so your selection is unchanged; select fewer documents and retry.'
         }
       },
       newChat: 'Start a new conversation',

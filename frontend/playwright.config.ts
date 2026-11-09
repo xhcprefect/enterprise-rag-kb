@@ -82,7 +82,13 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'], locale: 'zh-CN' }
+      use: {
+        ...devices['Desktop Chrome'],
+        locale: 'zh-CN',
+        // RAG_E2E_BROWSER_CHANNEL：显式指定本机已装浏览器渠道（如 msedge），
+        // 用于没有 Playwright 下载浏览器缓存的环境；未设置时行为完全不变。
+        channel: process.env.RAG_E2E_BROWSER_CHANNEL || undefined
+      }
     }
   ]
 })

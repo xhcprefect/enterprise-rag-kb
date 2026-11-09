@@ -5,8 +5,9 @@ import os
 import shutil
 import uuid
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
@@ -18,21 +19,33 @@ from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.models import (
     KNOWLEDGE_BASE_KIND_PROJECT,
+    KNOWLEDGE_BASE_KIND_UPLOAD,
+    ChatTurn,
     Conversation,
     Document,
     DocumentChunk,
     DocumentStatus,
     KnowledgeBase,
+    Message,
     UploadSession,
     UploadStatus,
     User,
 )
 from app.schemas.common import ApiResponse, PageResult
+from app.schemas.document_comparison import DocumentComparisonRead
+from app.schemas.inspection import (
+    DocumentChunkPage, DocumentQualityRead, RetrievalDiagnosticsRead, RetrievalDiagnosticsRequest,
+)
 from app.schemas.knowledge import (
-    DocumentRead, DocumentUploadRead, KnowledgeBaseCreate, KnowledgeBaseRead, KnowledgeBaseUpdate, SourceRead,
+    DocumentGovernanceUpdate, DocumentRead, DocumentReenableRequest, DocumentSupersedeRequest,
+    DocumentUploadRead, KnowledgeBaseCreate, KnowledgeBaseRead, KnowledgeBaseUpdate, SourceRead,
     UploadChunkRead, UploadCompleteRead, UploadSessionCreate, UploadSessionRead,
 )
-from app.services import chat_turns, document_identity, project_sources, source_documents
+from app.services import (
+    chat_turns, document_comparison, document_identity, document_lifecycle,
+    document_governance, document_quality, project_sources, retrieval_diagnostics,
+    source_documents,
+)
 from app.services import upload as upload_service
 from app.services.ingest import reset_document_for_reindex
 from app.services.parser import SUPPORTED_EXTENSIONS
@@ -63,13 +76,57 @@ def _get_kb_for_user(db: DBSession, kb_id: uuid.UUID, user: User) -> KnowledgeBa
 
 
 def _reject_project_kb(kb: KnowledgeBase) -> None:
-    """项目源码库拒绝普通上传/分片/重排/取消等上传文档旁路。
+    """上传/分片/重排/取消等写入口只接受 ``kind='upload'``。
 
-    kind='project' 的库只能通过项目 API 登记管理；任何普通 KB 上传/重排入口
-    都不允许在此库上执行，防止绕过项目索引写入不可变原文。
+    ``project`` 库只能通过项目 API 登记管理，任何普通上传入口都不得执行，防止
+    绕过项目索引写入不可变原文；未知 ``kind`` 同样没有旁路，一律 400。
     """
     if kb.kind == KNOWLEDGE_BASE_KIND_PROJECT:
         raise HTTPException(status_code=400, detail="项目源码库不支持此操作")
+    if kb.kind != KNOWLEDGE_BASE_KIND_UPLOAD:
+        raise HTTPException(status_code=400, detail="该知识库类型不支持此操作")
+
+
+def _request_token_version(request: Request) -> int | None:
+    """取认证依赖在本次请求上留下的原始 ``ver`` 快照；缺失或非 int 返回 None。
+
+    只用于治理写入口的"新鲜校验"：即使依赖层已经验过，管理员权限与令牌版本
+    也可能在请求排队期间被撤销，必须在写入事务里按锁定后的 User 行复核。
+
+    这里**不再重新解码**令牌：请求排队到取锁之间令牌可能已过期或签名失效，
+    重新解码失败会得到 None 并让旧实现跳过版本校验（fail open）。快照缺失
+    （例如绕过认证依赖的直接调用）一律视为无效，由调用方 fail closed。
+    """
+    try:
+        state = request.state
+    except Exception:  # noqa: BLE001 - 直接调用场景可能是极简 Request
+        return None
+    version = getattr(state, "auth_token_version", None)
+    return version if type(version) is int else None
+
+
+def _lock_governance_admin(db: DBSession, request: Request, admin: User) -> User:
+    """治理写入口的第一把锁：新鲜锁定 User 并复核管理员身份与令牌版本。
+
+    锁顺序固定为 User -> KnowledgeBase -> Document；这里必须在取 KB 锁之前完成，
+    任何失败（禁用/降权/令牌已失效）都不会再碰知识库与文档行。
+
+    版本比较只使用 ``get_current_user`` 在认证成功时写入的原始令牌快照：
+    快照缺失或类型不对一律 401（fail closed），绝不因为"取不到版本"就放行。
+    """
+    token_version = _request_token_version(request)
+    if token_version is None or token_version < 0:
+        raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
+    fresh = db.scalar(
+        select(User).where(User.id == admin.id)
+        .with_for_update().execution_options(populate_existing=True)
+    )
+    if fresh is None or not fresh.is_active or not fresh.is_admin:
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    if token_version != fresh.token_version:
+        raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
+    request.state.user = fresh
+    return fresh
 
 
 def _get_doc(db: DBSession, kb_id: uuid.UUID, doc_id: uuid.UUID, *, lock=False) -> Document:
@@ -146,20 +203,33 @@ def update_kb(kb_id: uuid.UUID, payload: KnowledgeBaseUpdate, request: Request, 
 
 @router.delete("/{kb_id}", response_model=ApiResponse[None], summary="删除知识库（管理员）")
 def delete_kb(kb_id: uuid.UUID, request: Request, db: DBSession = Depends(get_db), admin: User = Depends(require_admin)):
+    # 统一锁序：User -> KnowledgeBase -> (项目源 -> 快照) / (Conversation ->
+    # ChatTurn -> Message) -> Document（各类内按 UUID 排序）。
+    admin = _lock_governance_admin(db, request, admin)
     kb = _get_kb_or_404(db, kb_id, lock=True)
     if kb.kind == KNOWLEDGE_BASE_KIND_PROJECT:
         # 项目源码库删除走源软撤销 + 取消活跃任务：不做硬删历史。
         # （快照/引用仍有效，授权读取此后按 410 处理，不删原目录、不自动 GC。）
+        # revoke_source_by_kb 内部再按 KB -> Source -> Snapshot 顺序取新鲜行锁。
         project_sources.revoke_source_by_kb(db, kb.id)
         db.commit()
         write_audit(db, request, admin, "project_kb_delete", kb.name)
         return ApiResponse(data=None, message="项目源码库已撤销（源软删除，历史保留）")
     name, collection = kb.name, kb.collection_name
-    docs = db.scalars(select(Document).where(Document.kb_id == kb.id).with_for_update()).all()
-    paths = [Path(doc.stored_path) for doc in docs]
-    conversations = db.scalars(select(Conversation.id).where(Conversation.kb_id == kb_id)
+    # 会话 -> 轮次 -> 消息：先锁后改，批量清理诊断时看到的都是锁定的真相。
+    conversations = db.scalars(select(Conversation).where(Conversation.kb_id == kb_id)
                               .order_by(Conversation.id).with_for_update()).all()
-    chat_turns.clear_conversation_requests(db, conversations)
+    conversation_ids = [conv.id for conv in conversations]
+    if conversation_ids:
+        db.scalars(select(ChatTurn).where(ChatTurn.conversation_id.in_(conversation_ids))
+                   .order_by(ChatTurn.id).with_for_update()).all()
+        db.scalars(select(Message).where(Message.conversation_id.in_(conversation_ids))
+                   .order_by(Message.id).with_for_update()).all()
+        chat_turns.clear_conversation_requests(db, conversation_ids)
+    # 上传文档最后锁，按 UUID 排序（与最终发布的 Document 锁序一致）。
+    docs = db.scalars(select(Document).where(Document.kb_id == kb.id)
+                      .order_by(Document.id).with_for_update()).all()
+    paths = [Path(doc.stored_path) for doc in docs]
     store = get_vector_store(collection)
     db.execute(delete(store.EmbeddingStore).where(store.EmbeddingStore.collection_id.in_(
         select(store.CollectionStore.uuid).where(store.CollectionStore.name == collection))))
@@ -190,14 +260,27 @@ def _like_pattern(term: str) -> str:
 
 
 @router.get("/{kb_id}/documents", response_model=ApiResponse[PageResult[DocumentRead]], summary="文档列表（q 为字面匹配，trim 后超过 200 字符截断）")
-def list_documents(kb_id: uuid.UUID, page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
-                   status_filter: str | None = Query(None, alias="status"),
-                   q: str | None = Query(None),
-                   db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
+def list_documents(kb_id: uuid.UUID,
+                   page: Annotated[int, Query(ge=1)] = 1,
+                   page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+                   status_filter: Annotated[str | None, Query(alias="status")] = None,
+                   q: Annotated[str | None, Query()] = None,
+                   db: DBSession = Depends(get_db), user: User = Depends(get_current_user),
+                   retrievable_only: Annotated[bool, Query()] = False):
+    """列表分页。
+
+    参数一律使用 ``Annotated[...] + 普通 Python 默认值``：HTTP 语义与 FastAPI 完全
+    一致，同时保持"直接调用（现有测试）省略参数时拿到真正默认值"的兼容性——
+    ``bool = Query(False)`` 在直接调用里会被 ``bool(Query(...))`` 判成 True，
+    从而把 status=failed 等查询悄悄过滤成 0 条。
+    """
     _get_kb_for_user(db, kb_id, user)
     stmt = select(Document).where(Document.kb_id == kb_id)
     if status_filter:
         stmt = stmt.where(Document.status == status_filter)
+    # retrievable_only 先于 count/limit 应用：total 与页长都反映过滤后的真实规模。
+    if retrievable_only:
+        stmt = stmt.where(*document_lifecycle.retrievable_conditions())
     term = _normalize_search(q)
     if term is not None:
         stmt = stmt.where(Document.filename.ilike(_like_pattern(term), escape="\\"))
@@ -212,6 +295,60 @@ def list_documents(kb_id: uuid.UUID, page: int = Query(1, ge=1), page_size: int 
 def get_document(kb_id: uuid.UUID, doc_id: uuid.UUID, db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     _get_kb_for_user(db, kb_id, user)
     return ApiResponse(data=_get_doc(db, kb_id, doc_id))
+
+
+@router.patch("/{kb_id}/documents/{doc_id}/governance", response_model=ApiResponse[DocumentRead], summary="更新文档治理元数据（管理员）")
+def update_document_governance(kb_id: uuid.UUID, doc_id: uuid.UUID, payload: DocumentGovernanceUpdate,
+                               request: Request, db: DBSession = Depends(get_db), admin: User = Depends(require_admin)):
+    _lock_governance_admin(db, request, admin)
+    kb = document_governance.require_governance_kb(db, kb_id)
+    doc = document_governance.update_governance(db, kb, doc_id, payload)
+    changes = sorted(set(payload.model_fields_set) - {"expected_revision"})
+    write_audit(db, request, admin, "document_governance_update", str(doc.id),
+                document_governance.audit_detail(doc, changes))
+    return ApiResponse(data=doc)
+
+
+@router.post("/{kb_id}/documents/{doc_id}/supersede", response_model=ApiResponse[DocumentRead], summary="替代文档（管理员）")
+def supersede_document(kb_id: uuid.UUID, doc_id: uuid.UUID, payload: DocumentSupersedeRequest,
+                       request: Request, db: DBSession = Depends(get_db), admin: User = Depends(require_admin)):
+    _lock_governance_admin(db, request, admin)
+    kb = document_governance.require_governance_kb(db, kb_id)
+    doc = document_governance.supersede_document(
+        db, kb, doc_id, payload.replacement_document_id, payload.expected_revision,
+        comparison_fingerprint=payload.comparison_fingerprint,
+    )
+    write_audit(db, request, admin, "document_supersede", str(doc.id),
+                document_governance.audit_detail(doc, ["superseded_at", "superseded_by_id"]))
+    return ApiResponse(data=doc)
+
+
+@router.get("/{kb_id}/documents/{doc_id}/comparison",
+            response_model=ApiResponse[DocumentComparisonRead],
+            summary="资料更新差异预览（管理员，只读）")
+def compare_document(kb_id: uuid.UUID, doc_id: uuid.UUID, response: Response,
+                     replacement_document_id: Annotated[uuid.UUID, Query()],
+                     db: DBSession = Depends(get_db), admin: User = Depends(require_admin)):
+    """只读比较两份文档已入库的文本。
+
+    不写审计、不写会话、不生成答案、不记录正文；响应禁止缓存。
+    不可比较时仍返回 200，由 ``comparable/reason`` 表达原因。
+    """
+    _reject_project_kb(_get_kb_or_404(db, kb_id))
+    response.headers["Cache-Control"] = "no-store"
+    return ApiResponse(data=document_comparison.build_comparison(
+        db, kb_id, doc_id, replacement_document_id))
+
+
+@router.post("/{kb_id}/documents/{doc_id}/reenable", response_model=ApiResponse[DocumentRead], summary="显式重新启用文档（管理员）")
+def reenable_document(kb_id: uuid.UUID, doc_id: uuid.UUID, payload: DocumentReenableRequest,
+                      request: Request, db: DBSession = Depends(get_db), admin: User = Depends(require_admin)):
+    _lock_governance_admin(db, request, admin)
+    kb = document_governance.require_governance_kb(db, kb_id)
+    doc = document_governance.reenable_document(db, kb, doc_id, payload.expected_revision)
+    write_audit(db, request, admin, "document_reenable", str(doc.id),
+                document_governance.audit_detail(doc, ["superseded_at", "superseded_by_id", "enabled"]))
+    return ApiResponse(data=doc)
 
 
 @router.get("/{kb_id}/documents/{doc_id}/source", response_model=ApiResponse[SourceRead], summary="读取当前有效的引用原文")
@@ -230,6 +367,30 @@ def get_source_pdf(kb_id: uuid.UUID, doc_id: uuid.UUID, index_version: int = Que
     path = source_documents.pdf_file_path(doc)
     return FileResponse(path, media_type="application/pdf", filename=doc.filename, content_disposition_type="inline",
                         headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@router.get("/{kb_id}/documents/{doc_id}/quality", response_model=ApiResponse[DocumentQualityRead], summary="入库质量预览（管理员）")
+def get_document_quality(kb_id: uuid.UUID, doc_id: uuid.UUID,
+                         db: DBSession = Depends(get_db), admin: User = Depends(require_admin)):
+    _reject_project_kb(_get_kb_or_404(db, kb_id))
+    return ApiResponse(data=document_quality.build_quality(db, _get_doc(db, kb_id, doc_id)))
+
+
+@router.get("/{kb_id}/documents/{doc_id}/chunks", response_model=ApiResponse[DocumentChunkPage], summary="分块分页预览（管理员，正文最多 1200 字符）")
+def get_document_chunks(kb_id: uuid.UUID, doc_id: uuid.UUID,
+                        offset: Annotated[int, Query(ge=0)] = 0,
+                        limit: Annotated[int, Query(ge=1, le=50)] = 20,
+                        db: DBSession = Depends(get_db), admin: User = Depends(require_admin)):
+    _reject_project_kb(_get_kb_or_404(db, kb_id))
+    return ApiResponse(data=document_quality.chunk_page(db, _get_doc(db, kb_id, doc_id), offset, limit))
+
+
+@router.post("/{kb_id}/retrieval-diagnostics", response_model=ApiResponse[RetrievalDiagnosticsRead], summary="检索诊断（管理员，不生成答案）")
+def run_retrieval_diagnostics(kb_id: uuid.UUID, payload: RetrievalDiagnosticsRequest,
+                              db: DBSession = Depends(get_db), admin: User = Depends(require_admin)):
+    kb = _get_kb_or_404(db, kb_id)
+    _reject_project_kb(kb)
+    return ApiResponse(data=retrieval_diagnostics.run(db, kb, payload.question, payload.document_ids, user=admin))
 
 
 @router.post("/{kb_id}/documents", response_model=ApiResponse[DocumentUploadRead], summary="上传文档（小文件单请求，后台入库）")
@@ -258,6 +419,8 @@ def upload_document(kb_id: uuid.UUID, request: Request, file: UploadFile = File(
         content_sha256 = digest.hexdigest()
         canonical = document_identity.canonical_document(db, kb_id, content_sha256)
         if canonical is not None:
+            # 治理契约：inactive canonical 显式拒绝（409），绝不复活或假装可检索。
+            document_governance.ensure_active_dedup_canonical(canonical)
             # 复用同库已有内容：返回原文档 ID/状态，不新建、不改名、不改旧引用。
             # 本次写入的文件不是 canonical，必须由本请求清理。
             _unlink(stored_path)
@@ -279,6 +442,7 @@ def upload_document(kb_id: uuid.UUID, request: Request, file: UploadFile = File(
             canonical = document_identity.canonical_document(db, kb_id, content_sha256)
             if canonical is None:
                 raise HTTPException(status_code=409, detail="文档内容冲突，请重试")
+            document_governance.ensure_active_dedup_canonical(canonical)
             write_audit(db, request, user, "document_upload", canonical.filename,
                         {"kb": kb.name, "deduplicated": True})
             return ApiResponse(data=DocumentUploadRead.model_validate(canonical).model_copy(update={"deduplicated": True}))
@@ -313,7 +477,8 @@ def cancel_document(kb_id: uuid.UUID, doc_id: uuid.UUID, db: DBSession = Depends
 
 @router.delete("/{kb_id}/documents/{doc_id}", response_model=ApiResponse[None], summary="删除文档")
 def delete_document(kb_id: uuid.UUID, doc_id: uuid.UUID, request: Request, db: DBSession = Depends(get_db), user: User = Depends(require_admin)):
-    kb = _get_kb_or_404(db, kb_id)
+    # 与治理串行化：删除替代文档的自引用 FK SET NULL 还会锁住原文档。
+    kb = _get_kb_or_404(db, kb_id, lock=True)
     _reject_project_kb(kb)
     doc = _get_doc(db, kb_id, doc_id, lock=True)
     filename, path = doc.filename, Path(doc.stored_path)
@@ -419,19 +584,23 @@ def _completed_response(db: DBSession, session: UploadSession) -> ApiResponse:
     doc = db.get(Document, session.document_id)
     if doc is None:
         raise HTTPException(status_code=410, detail="该上传对应的文档已删除，请重新上传")
+    # 已完成的会话重放同样不得把治理性不可用的 canonical 当成可用结果返回。
+    document_governance.ensure_active_governance_document(doc)
     return ApiResponse(data=UploadCompleteRead(upload_id=session.id, document=doc,
                                                deduplicated=session.deduplicated), message="上传已完成")
 
 
 @router.post("/{kb_id}/upload-sessions/{session_id}/complete", response_model=ApiResponse[UploadCompleteRead], summary="校验合并并原子创建文档（幂等）")
 def complete_upload(kb_id: uuid.UUID, session_id: uuid.UUID, request: Request, db: DBSession = Depends(get_db), user: User = Depends(require_admin)):
+    # 提交可能使认证 ORM 对象过期；锁住 KB/会话后不得再靠刷新 User 读取身份。
+    uploader_id = user.id
     # 阶段一（短事务）：确认知识库仍存在且非项目库，立刻释放 KB 行锁。
     _reject_project_kb(_get_kb_or_404(db, kb_id, lock=True))
     db.commit()
 
     # 阶段二（慢写，只持有会话行锁）：合并、fsync、服务端摘要。
-    # 这段可能耗时数十秒，不能把 KB 行锁跨在磁盘操作上。
-    session = _get_session_or_404(db, kb_id, session_id, user.id, lock=True)
+    # 这段可能耗时数十秒，不能把 User/KB 行锁跨在磁盘操作上。
+    session = _get_session_or_404(db, kb_id, session_id, uploader_id, lock=True)
     if session.status == UploadStatus.COMPLETED.value:
         return _completed_response(db, session)
     if session.status == UploadStatus.ABORTED.value:
@@ -452,13 +621,18 @@ def complete_upload(kb_id: uuid.UUID, session_id: uuid.UUID, request: Request, d
     # 复用同一认领路径，不会产生第二个文件。
     db.commit()
 
-    # 阶段三（短事务）：固定锁顺序 知识库 -> 上传会话，与删除知识库一致。
-    # 慢写期间删除知识库/终止会话都可能发生：此时会话已不存在，不能依赖 TTL 找回，
+    # 阶段三（短事务）：固定锁顺序 User -> 知识库 -> 上传会话，与用户/知识库删除一致。
+    # 慢写期间删除用户/知识库或终止会话都可能发生：不能依赖 TTL 找回合并文件，
     # 必须在这里清理本次合并出的文件——但前提是没有文档引用它（并发完成可能已收编）。
     try:
+        # 文档 uploaded_by 的 FK 需要 KEY SHARE，先取以免与用户删除的 FOR UPDATE 成环。
+        # SQLAlchemy 只有 read=True + key_share=True 才生成 PostgreSQL FOR KEY SHARE。
+        if db.scalar(select(User.id).where(User.id == uploader_id)
+                     .with_for_update(read=True, key_share=True)) is None:
+            raise HTTPException(status_code=401, detail="用户不存在")
         kb = _get_kb_or_404(db, kb_id, lock=True)
         _reject_project_kb(kb)
-        session = _get_session_or_404(db, kb_id, session_id, user.id, lock=True)
+        session = _get_session_or_404(db, kb_id, session_id, uploader_id, lock=True)
     except HTTPException:
         db.rollback()
         _cleanup_owned_assembly(db, assembled, session_id)
@@ -484,13 +658,22 @@ def complete_upload(kb_id: uuid.UUID, session_id: uuid.UUID, request: Request, d
 
     canonical = document_identity.canonical_document(db, kb_id, assembled.digest)
     if canonical is not None:
+        # 治理契约：inactive canonical 显式拒绝（409），绝不复活或假装可检索。
+        # 此时本次合并出的文件不是 canonical、也不会被任何文档引用：必须由本请求
+        # 清理，否则 409 路径会留下孤儿文件。
+        try:
+            document_governance.ensure_active_dedup_canonical(canonical)
+        except HTTPException:
+            db.rollback()
+            _cleanup_owned_assembly(db, assembled, session_id)
+            raise
         # 复用同库 canonical：返回原文档 ID/状态，不改名、不改旧消息引用、不跨库。
         return reuse(canonical)
 
     doc = Document(id=assembled.claimed_doc_id, kb_id=kb_id, filename=session.filename,
                    file_ext=session.file_ext, file_size=session.file_size,
                    stored_path=str(assembled.path), content_sha256=assembled.digest,
-                   status=DocumentStatus.PENDING.value, uploaded_by=user.id)
+                   status=DocumentStatus.PENDING.value, uploaded_by=uploader_id)
     db.add(doc)
     session.status = UploadStatus.COMPLETED.value
     session.deduplicated = False
@@ -501,7 +684,7 @@ def complete_upload(kb_id: uuid.UUID, session_id: uuid.UUID, request: Request, d
         # 只删除本次合并出的文件，绝不触碰 canonical。
         db.rollback()
         try:
-            session = _get_session_or_404(db, kb_id, session_id, user.id, lock=True)
+            session = _get_session_or_404(db, kb_id, session_id, uploader_id, lock=True)
         except HTTPException:
             _cleanup_owned_assembly(db, assembled, session_id)
             raise
@@ -509,6 +692,12 @@ def complete_upload(kb_id: uuid.UUID, session_id: uuid.UUID, request: Request, d
         if canonical is None:
             _cleanup_owned_assembly(db, assembled, session_id)
             raise HTTPException(status_code=409, detail="文档内容冲突，请重试")
+        try:
+            document_governance.ensure_active_dedup_canonical(canonical)
+        except HTTPException:
+            db.rollback()
+            _cleanup_owned_assembly(db, assembled, session_id)
+            raise
         return reuse(canonical)
     shutil.rmtree(upload_service.tmp_dir(session.id), ignore_errors=True)
     write_audit(db, request, user, "document_upload", doc.filename, {"kb": kb.name, "mode": "chunked"})

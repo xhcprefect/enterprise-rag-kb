@@ -186,6 +186,25 @@ docker compose exec api python -m scripts.migrate_keyword_index
 这一步只建立索引，不填充旧分块。旧文档仍可向量检索，在页面重新索引后获得关键词、
 页码、章节与表格行信息；重新索引期间该文档暂不参与问答。扫描 PDF 仍需预先 OCR。
 
+### 部署验收（只读检查 + 人工证据）
+
+上面的验收清单通过后，可运行只读 CLI 做部署验收。默认 dry-run 零网络；`--live` 才做有限只读 GET，令牌只从环境变量读取：
+
+```bash
+# dry-run：只校验参数与目标，不发任何请求
+python backend/scripts/verify_deployment.py --base-url https://rag.example.com --json
+
+# live：--confirm-target 必须与 --base-url 规范化后的 origin 完全一致
+export RAG_DEPLOY_ADMIN_TOKEN='<在终端中设置>'
+export RAG_DEPLOY_METRICS_TOKEN='<在终端中设置>'
+python backend/scripts/verify_deployment.py \
+  --base-url https://rag.example.com \
+  --confirm-target https://rag.example.com \
+  --live --out /srv/ragkb-acceptance/verification.json
+```
+
+工具检查通过不等于真实业务/生产验收通过；恢复、告警、成员 ACL 与 soak 等真实证据缺失时保持 `unknown`。证据模板、检查项、退出码与填表要求见 [部署验收指南](deploy/acceptance/README.md)。
+
 - **备份与升级注意事项**：备份现在会短暂停止 API/worker，以保证数据库和上传文件一致；升级必须同步更新 API、worker 与前端，见 [OPTIMIZATION.md](OPTIMIZATION.md)。
 
 ### 用量与费用升级
@@ -338,6 +357,8 @@ ls -lt data/backups | head          # 最近一组时间戳应该是今天 03:20
 - 只写测试库、测试上传文件；**不要指向真实数据库或生产上传目录**。
 
 这是"验证备份能恢复"的日常手段；真实业务恢复仍走上面的 `restore.sh`，两者不要混用。
+
+演练结果与 RTO/RPO/校验证据需填入验收模板，工具不会自动判定生产验收；详见 [部署验收指南](deploy/acceptance/README.md)。
 
 ## 日常运维
 

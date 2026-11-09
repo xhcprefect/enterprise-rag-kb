@@ -53,7 +53,7 @@ function createHarness(t: TestContext, options: {
 test('only login and fallback routes are registered before authentication', (t) => {
   const { router } = createHarness(t)
   assert.deepEqual(router.getRoutes().map(route => route.name).sort(), ['login', 'not-found'])
-  for (const name of ['workspace', 'chat', 'knowledge', 'documents', 'usage', 'profile', 'users', 'audit']) {
+  for (const name of ['workspace', 'chat', 'knowledge', 'documents', 'usage', 'profile', 'users', 'audit', 'feedback']) {
     assert.equal(router.hasRoute(name), false, name)
   }
 })
@@ -61,9 +61,9 @@ test('only login and fallback routes are registered before authentication', (t) 
 test('role filtering keeps the source configuration intact and menus match accessible routes', () => {
   const memberRoutes = filterAuthorizedRoutes([workspaceRoute], 'user')[0].children || []
   assert.deepEqual(memberRoutes.map(route => route.name), ['chat', 'knowledge', 'projects', 'project', 'documents', 'usage', 'profile'])
-  assert.equal(workspaceRoute.children?.length, 9)
+  assert.equal(workspaceRoute.children?.length, 10)
   assert.deepEqual(getNavigationItems(workspaceRoute, 'user').map(item => item.path), ['/chat', '/knowledge', '/projects', '/usage'])
-  assert.deepEqual(getNavigationItems(workspaceRoute, 'admin').map(item => item.path), ['/chat', '/knowledge', '/projects', '/usage', '/users', '/audit'])
+  assert.deepEqual(getNavigationItems(workspaceRoute, 'admin').map(item => item.path), ['/chat', '/knowledge', '/projects', '/usage', '/users', '/audit', '/feedback'])
   assert.deepEqual(getNavigationItems(workspaceRoute), [])
   assert.equal(memberRoutes.find(route => route.name === 'documents')?.meta?.activeMenu, '/knowledge')
   assert.equal(memberRoutes.find(route => route.name === 'profile')?.meta?.activeMenu, '')
@@ -94,11 +94,13 @@ test('dynamic registration is idempotent, replaces roles, and removes all busine
   assert.equal(access.register('admin'), false)
   assert.equal(router.hasRoute('users'), true)
   assert.equal(router.hasRoute('audit'), true)
-  assert.equal(router.getRoutes().length, 12)
+  assert.equal(router.hasRoute('feedback'), true)
+  assert.equal(router.getRoutes().length, 13)
 
   assert.equal(access.register('user'), true)
   assert.equal(router.hasRoute('users'), false)
   assert.equal(router.hasRoute('audit'), false)
+  assert.equal(router.hasRoute('feedback'), false)
   assert.equal(router.hasRoute('chat'), true)
   assert.equal(router.hasRoute('usage'), true)
   assert.equal(router.getRoutes().length, 10)
@@ -138,11 +140,12 @@ test('refreshing an admin deep link loads the server role and rematches the orig
 
 test('members cannot open admin URLs, including on the initial navigation', async (t) => {
   const { router } = createHarness(t, { token: 'member-token', loadProfile: async () => member })
-  for (const path of ['/users', '/audit', '/missing-page']) {
+  for (const path of ['/users', '/audit', '/feedback', '/missing-page']) {
     await router.push(path)
     assert.equal(router.currentRoute.value.name, 'chat', path)
     assert.equal(router.hasRoute('users'), false)
     assert.equal(router.hasRoute('audit'), false)
+    assert.equal(router.hasRoute('feedback'), false)
   }
 })
 

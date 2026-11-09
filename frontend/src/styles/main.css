@@ -258,6 +258,9 @@ a { color: var(--brand); }
 .el-table .cell { padding-inline: 20px; line-height: 1.65; }
 .el-table__inner-wrapper::before { display: none; }
 .el-table__empty-block { min-height: 220px; }
+/* 横向滚动时给固定操作列一层柔和投影，避免与底层内容黏在一起。 */
+.el-table--scrollable-x .el-table__cell.el-table-fixed-column--right { box-shadow: -10px 0 14px -12px rgb(24 48 35 / 24%); }
+html.dark .el-table--scrollable-x .el-table__cell.el-table-fixed-column--right { box-shadow: -10px 0 14px -12px rgb(0 0 0 / 60%); }
 .el-pagination { --el-pagination-bg-color: transparent; --el-pagination-button-disabled-bg-color: transparent; font-size: 12px; font-weight: 450; }
 .el-pager li { border-radius: 7px; }
 .el-pagination .el-select__wrapper { min-height: 30px; }
@@ -316,7 +319,7 @@ html.dark .hljs-built_in, html.dark .hljs-attr, html.dark .hljs-variable { color
 @media (max-width: 900px) {
   /* 固定操作列在窄屏会遮挡主要内容，改为整表内部横向滚动。 */
   .el-table .el-table__cell.el-table-fixed-column--left,
-  .el-table .el-table__cell.el-table-fixed-column--right { position: static !important; }
+  .el-table .el-table__cell.el-table-fixed-column--right { position: static !important; box-shadow: none !important; }
   .el-table .el-table__cell.el-table-fixed-column--left::before,
   .el-table .el-table__cell.el-table-fixed-column--right::before { display: none; }
 }

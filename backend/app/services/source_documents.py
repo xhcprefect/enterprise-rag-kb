@@ -10,7 +10,8 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Document, DocumentChunk, DocumentStatus
+from app.models import Document, DocumentChunk
+from app.services.document_lifecycle import is_retrievable, retrievable_conditions
 
 LOCATION_FIELDS = ("page_start", "page_end", "section", "sheet", "row_start", "row_end", "line_start", "line_end")
 MAX_PREVIEW_CHARS = 20000
@@ -135,11 +136,12 @@ def merge_locations(metadata: list[dict]) -> dict:
 
 
 def ready_document(db: Session, kb_id: uuid.UUID, document_id: uuid.UUID, index_version: int) -> Document:
+    """读取当前原文前必须通过统一可检索判定（生命周期 + 入库就绪）。"""
     doc = db.scalar(select(Document).where(Document.id == document_id, Document.kb_id == kb_id)
                     .execution_options(populate_existing=True))
     if doc is None:
         raise HTTPException(404, "文档不存在")
-    if doc.status != DocumentStatus.READY.value or doc.cancel_requested or doc.index_version != index_version:
+    if not is_retrievable(doc) or doc.index_version != index_version:
         raise HTTPException(409, "引用对应的文档已更新或不可用，请重新提问以获取当前来源")
     return doc
 
@@ -154,7 +156,7 @@ def read_source(db: Session, kb_id: uuid.UUID, document_id: uuid.UUID, chunk_ind
     rows = db.scalars(select(DocumentChunk).join(Document, Document.id == DocumentChunk.document_id).where(
         DocumentChunk.document_id == document_id, DocumentChunk.chunk_index.between(start, end),
         DocumentChunk.embedded.is_(True), Document.kb_id == kb_id,
-        Document.status == DocumentStatus.READY.value, Document.cancel_requested.is_(False),
+        *retrievable_conditions(),
         Document.index_version == index_version,
     ).order_by(DocumentChunk.chunk_index).limit(5)).all()
     if len(rows) != end - start + 1:

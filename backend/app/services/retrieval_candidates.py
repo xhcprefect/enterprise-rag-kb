@@ -5,8 +5,12 @@ from langchain_core.documents import Document as LCDocument
 from sqlalchemy import and_, func, literal_column, or_, select
 
 from app.db.session import SessionLocal
-from app.models import Document, DocumentChunk, DocumentStatus, KnowledgeBase
-from app.services.source_documents import merge_locations, public_location
+from app.models import Document, DocumentChunk, KnowledgeBase
+from app.services.document_lifecycle import retrievable_conditions
+from app.services.source_documents import LOCATION_FIELDS, merge_locations, public_location
+
+# 候选自带的这些键可能来自上一次合并/旧索引，不能当成本次权威位置或正文。
+_UNVERIFIED_KEYS = ("chunk_start", "chunk_end", "_anchor_content", "_anchor_location")
 
 
 def keyword_candidates(collection_name: str, question: str, limit: int = 60, *,
@@ -25,8 +29,7 @@ def keyword_candidates(collection_name: str, question: str, limit: int = 60, *,
                         Document.id, Document.filename, Document.index_version, rank)
                  .join(Document, Document.id == DocumentChunk.document_id)
                  .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
-                 .where(KnowledgeBase.collection_name == collection_name,
-                        Document.status == DocumentStatus.READY.value, Document.cancel_requested.is_(False),
+                 .where(KnowledgeBase.collection_name == collection_name, *retrievable_conditions(),
                         DocumentChunk.embedded.is_(True), DocumentChunk.search_text != "", vector.op("@@")(query))
                  .order_by(rank.desc(), Document.id, DocumentChunk.chunk_index).limit(max(1, min(limit, 200))))
     if document_scope is not None:
@@ -51,31 +54,79 @@ def _same_structure(left: dict, right: dict) -> bool:
     return True
 
 
+def _strict_index(value):
+    """严格非负整数；bool、float、字符串和负数都是坏输入，返回 None。"""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _pair_identity(meta: dict):
+    """解析候选的文档身份；缺失或类型非法一律返回 None（fail closed）。
+
+    缺失/None 的 ``index_version`` 不补 0：那会让旧代次候选冒充当前代次。
+    显式给出且不是 ``document`` 的来源类型（如 project）绝不当上传文档核对。
+    """
+    if "source_kind" in meta and meta["source_kind"] != "document":
+        return None
+    if "index_version" not in meta:
+        return None
+    try:
+        identifier = uuid.UUID(str(meta["document_id"]))
+    except (ValueError, KeyError, TypeError):
+        return None
+    index = _strict_index(meta.get("chunk_index"))
+    version = _strict_index(meta.get("index_version"))
+    if index is None or version is None:
+        return None
+    return str(identifier), index, version
+
+
+def _authoritative_metadata(meta: dict, rows: list, anchor, version: int) -> dict:
+    """用本次查到的权威 base 行重写位置/anchor；不保留候选自带的旧范围。
+
+    只保留标量标签（filename、排名、检索方式等）。``document_id``、
+    ``index_version``、``chunk_index`` 也从权威行重写，候选自带的身份不参与输出。
+    """
+    base = {key: value for key, value in meta.items()
+            if key not in LOCATION_FIELDS and key not in _UNVERIFIED_KEYS
+            and key not in ("document_id", "index_version", "chunk_index")}
+    identity = {"document_id": str(anchor.document_id), "index_version": version,
+                "chunk_index": anchor.chunk_index}
+    indexes = [row.chunk_index for row in rows]
+    return {
+        **base,
+        **identity,
+        **merge_locations([row.source_metadata or {} for row in rows]),
+        "chunk_start": min(indexes), "chunk_end": max(indexes),
+        "_anchor_content": anchor.content,
+        "_anchor_location": public_location(anchor.source_metadata),
+    }
+
+
 def expand_neighbors(collection_name: str, pairs, radius: int = 1):
-    """只合并同一结构的连续片段；返回数量不会增加，最终仍由提示预算裁剪。"""
+    """只合并同一结构的连续片段；返回数量不会增加，最终仍由提示预算裁剪。
+
+    radius 为 0、片段缺少结构信息或没有可解析身份时也不能直接返回候选：
+    所有片段都要先回查「同知识库 + 当前代次 + embedded + 统一治理可检索」的
+    base 行，查不到就丢弃，绝不把无权威原正文的候选交给模型。
+    """
+    if not pairs:
+        return []
     radius = max(0, min(radius, 2))
-    if not radius or not pairs:
-        return pairs
     requests = []
     for doc, _ in pairs[:20]:
-        meta = doc.metadata
-        if not any(meta.get(key) is not None for key in ("section_key", "section", "sheet", "page_start", "line_start", "row_start")):
-            continue  # 旧索引仍按原片段工作，结构信息由重新索引补齐。
-        try:
-            identifier = uuid.UUID(str(meta["document_id"]))
-            index, version = int(meta["chunk_index"]), int(meta.get("index_version") or 0)
-        except (ValueError, KeyError, TypeError):
-            continue
-        requests.append((identifier, index, version))
+        identity = _pair_identity(doc.metadata or {})
+        if identity is not None:
+            requests.append(identity)
     if not requests:
-        return pairs
+        return []
     statement = (select(DocumentChunk, Document.index_version)
                  .join(Document, Document.id == DocumentChunk.document_id)
                  .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
-                 .where(KnowledgeBase.collection_name == collection_name,
-                        Document.status == DocumentStatus.READY.value, Document.cancel_requested.is_(False),
+                 .where(KnowledgeBase.collection_name == collection_name, *retrievable_conditions(),
                         DocumentChunk.embedded.is_(True),
-                        or_(*(and_(Document.id == identifier, Document.index_version == version,
+                        or_(*(and_(Document.id == uuid.UUID(identifier), Document.index_version == version,
                                   DocumentChunk.chunk_index.between(max(0, index - radius), index + radius))
                               for identifier, index, version in requests)))
                  .order_by(DocumentChunk.document_id, DocumentChunk.chunk_index).limit(100))
@@ -84,15 +135,17 @@ def expand_neighbors(collection_name: str, pairs, radius: int = 1):
     found = {(str(row.document_id), version, row.chunk_index): row for row, version in rows}
     result, consumed = [], set()
     for doc, distance in pairs:
-        meta = doc.metadata
-        identifier, version, index = str(meta.get("document_id")), meta.get("index_version") or 0, meta.get("chunk_index")
+        meta = doc.metadata or {}
+        identity = _pair_identity(meta)
+        if identity is None:
+            continue
+        identifier, index, version = identity
         key = (identifier, version, index)
         if key in consumed:
             continue
         base = found.get(key)
         if base is None:
-            result.append((doc, distance))
-            continue
+            continue  # 没有权威原文：直接丢弃
         selected = {index: base}
         for direction in (-1, 1):
             for offset in range(1, radius + 1):
@@ -104,10 +157,8 @@ def expand_neighbors(collection_name: str, pairs, radius: int = 1):
                 selected[other_index] = row
         ordered = [selected[key] for key in sorted(selected)]
         consumed.update((identifier, version, row.chunk_index) for row in ordered)
-        location = merge_locations([row.source_metadata or {} for row in ordered])
-        combined = LCDocument(page_content="\n\n".join(row.content for row in ordered), metadata={
-            **meta, **location, "chunk_start": min(selected), "chunk_end": max(selected),
-            "_anchor_content": base.content, "_anchor_location": public_location(base.source_metadata),
-        })
-        result.append((combined, distance))
+        result.append((LCDocument(
+            page_content="\n\n".join(row.content for row in ordered),
+            metadata=_authoritative_metadata(meta, ordered, base, version),
+        ), distance))
     return result

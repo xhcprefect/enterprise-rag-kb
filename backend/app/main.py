@@ -36,10 +36,10 @@ async def lifespan(app: FastAPI):
     anyio.to_thread.current_default_thread_limiter().total_tokens = settings.THREAD_POOL_SIZE
     init_db()
     with SessionLocal() as db:
-        # 上次进程在生成中途退出时，那轮问答没有机会写回状态；租约全局兜底一次。
+        # 上次进程在生成中途退出时，那轮问答没有机会写回状态；启动时分批排空过期积压。
         # 放在启动阶段而不是定时任务里：只要会卡住的进程都必然重走过这里。
         try:
-            chat_turns.reclaim_expired(db)
+            chat_turns.reclaim_expired_on_startup(db)
         except Exception as exc:
             db.rollback()
             logger.warning("回收过期问答失败，将由租约续期逻辑处理: %s", type(exc).__name__)

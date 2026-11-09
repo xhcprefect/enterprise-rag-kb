@@ -1,10 +1,17 @@
-"""文档列表搜索 q：字面匹配、状态组合、分页 total 与权限（真实 PostgreSQL）。"""
+"""文档列表搜索 q：字面匹配、状态组合、分页 total 与权限（真实 PostgreSQL）。
+
+另覆盖 ``retrievable_only``：过滤必须先于 count/limit，且与生命周期判定同义；
+本文件全部走 ``knowledge.list_documents`` 的**直接位置调用**，正是历史
+``bool = Query(False)`` 缺陷的暴露面。
+"""
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from tests import _memory_project_test_gate as gate
 from tests._env import TEST_URL
 
 from fastapi import HTTPException
@@ -33,6 +40,7 @@ class DocumentSearchTests(unittest.TestCase):
     def setUpClass(cls):
         if engine.url != make_url(TEST_URL):
             raise RuntimeError("应用引擎未指向专用测试库，拒绝运行")
+        gate.verify(gate.TEST_DATABASE_URL, gate.TARGET_OWNER, engine)
         init_db(create_admin=False)
 
     @classmethod
@@ -40,6 +48,7 @@ class DocumentSearchTests(unittest.TestCase):
         engine.dispose()
 
     def setUp(self):
+        gate.verify(gate.TEST_DATABASE_URL, gate.TARGET_OWNER, engine)
         with engine.begin() as conn:
             conn.execute(text(
                 "TRUNCATE users, knowledge_bases, documents, conversations, upload_sessions, audit_logs, "
@@ -65,19 +74,23 @@ class DocumentSearchTests(unittest.TestCase):
             self.kb_id, self.private_id = self.kb.id, self.private.id
             self.admin_id, self.owner_id, self.stranger_id = self.admin.id, self.owner.id, self.stranger.id
 
-    def add(self, filename, status="ready", kb_id=None):
+    def add(self, filename, status="ready", kb_id=None, **governance):
         with SessionLocal() as db:
             doc = Document(kb_id=kb_id or self.kb_id, filename=filename, file_ext=Path(filename).suffix,
                            file_size=1, stored_path=str(Path(self.temp.name) / f"{uuid.uuid4().hex}.txt"),
-                           status=status)
+                           status=status, **governance)
             db.add(doc)
             db.commit()
             return doc.id
 
-    def search(self, q=None, *, page=1, page_size=20, status=None, user_id=None, kb_id=None):
+    def search(self, q=None, *, page=1, page_size=20, status=None, user_id=None, kb_id=None,
+               retrievable_only=None):
         with SessionLocal() as db:
             user = db.get(User, user_id or self.admin_id)
-            return knowledge.list_documents(kb_id or self.kb_id, page, page_size, status, q, db, user).data
+            args = [kb_id or self.kb_id, page, page_size, status, q, db, user]
+            if retrievable_only is not None:
+                args.append(retrievable_only)
+            return knowledge.list_documents(*args).data
 
     def names(self, result):
         return [item.filename for item in result.items]
@@ -171,3 +184,65 @@ class DocumentSearchTests(unittest.TestCase):
         # 公开库普通用户可搜索
         self.add("public.txt")
         self.assertEqual(self.search("public", user_id=self.stranger_id).total, 1)
+
+    # ---- retrievable_only：过滤先于 count/limit，与生命周期判定同义 ----
+    def test_retrievable_only_false_keeps_direct_call_default(self):
+        """历史缺陷回归：直接调用省略参数必须拿到真默认 False，
+        否则 status=failed 等普通列表会被静默过滤成 0 条。"""
+        import inspect
+
+        self.add("failed-doc.txt", status="failed")
+        self.add("ready-doc.txt", status="ready")
+        self.assertEqual(self.search(status="failed").total, 1)
+        self.assertEqual(self.search(status="ready").total, 1)
+        self.assertEqual(self.search().total, 2)
+        default = inspect.signature(knowledge.list_documents).parameters["retrievable_only"].default
+        self.assertIs(default, False)
+        # OpenAPI 上仍是 HTTP boolean query，默认 false
+        schema = knowledge.list_documents.__annotations__
+        self.assertIn("retrievable_only", schema)
+
+    def test_retrievable_only_filters_and_totals_before_count_and_limit(self):
+        past = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        future = datetime(2999, 1, 1, tzinfo=timezone.utc)
+        self.add("live-1.txt")
+        self.add("live-2.txt")
+        self.add("superseded.txt", superseded_at=past)
+        self.add("disabled.txt", enabled=False)
+        self.add("scheduled.txt", valid_from=future)
+        self.add("expired.txt", valid_until=past)
+        self.add("not-ingested.txt", status="pending")
+        self.add("failed.txt", status="failed")
+        self.add("cancelled-flag.txt", cancel_requested=True)
+        result = self.search("txt", retrievable_only=True)
+        self.assertEqual(result.total, 2)
+        self.assertEqual(sorted(self.names(result)), ["live-1.txt", "live-2.txt"])
+        for item in result.items:
+            self.assertTrue(item.retrievable)
+            self.assertEqual(item.lifecycle_state, "active")
+        # 不带过滤的同一查询全部可见
+        self.assertEqual(self.search("txt").total, 9)
+        # 组合状态过滤 + retrievable_only：total 也反映两者交集
+        self.assertEqual(self.search("txt", status="pending", retrievable_only=True).total, 0)
+        self.assertEqual(self.search("txt", status="ready", retrievable_only=True).total, 2)
+
+    def test_retrievable_only_respects_window_boundary_at_read_time(self):
+        self.add("boundary.txt", valid_until=datetime.now(timezone.utc).replace(
+            year=2000, month=1, day=1, hour=1, minute=0, second=0))
+        result = self.search("boundary", retrievable_only=True)
+        self.assertEqual(result.total, 0)
+
+    def test_retrievable_only_pagination_is_filtered_first(self):
+        self.add("page-live-1.txt")
+        self.add("page-live-2.txt")
+        for index in range(4):
+            self.add(f"page-gone-{index}.txt", enabled=False)
+        first = self.search("page-", retrievable_only=True, page=1, page_size=1)
+        second = self.search("page-", retrievable_only=True, page=2, page_size=1)
+        self.assertEqual(first.total, 2)
+        self.assertEqual(len(first.items), 1)
+        self.assertEqual(len(second.items), 1)
+        self.assertNotEqual(first.items[0].id, second.items[0].id)
+        # 全部页加起来恰好等于过滤后的 total
+        collected = {str(first.items[0].id), str(second.items[0].id)}
+        self.assertEqual(len(collected), 2)

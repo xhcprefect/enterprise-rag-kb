@@ -17,8 +17,11 @@ class DocumentScopeTests(unittest.TestCase):
     def setUp(self):
         self.kb_id, self.identifier = uuid.uuid4(), uuid.uuid4()
         self.item = {"document_id": str(self.identifier), "filename": "手册.pdf", "index_version": 2}
+        # 治理字段必须显式给出：缺失即 fail closed，不能靠宽松默认过 mock。
         self.doc = SimpleNamespace(id=self.identifier, kb_id=self.kb_id, filename="服务器原名.pdf",
-                                   status="ready", cancel_requested=False, index_version=2)
+                                   status="ready", cancel_requested=False, index_version=2,
+                                   enabled=True, superseded_at=None, superseded_by_id=None,
+                                   valid_from=None, valid_until=None)
         self.conv = SimpleNamespace(id=uuid.uuid4(), kb_id=self.kb_id, mode="rag", user_id=uuid.uuid4(),
                                     document_scope=[self.item], scope_revision=3,
                                     active_turn_id=None, lease_expires_at=None)
@@ -110,30 +113,44 @@ class DocumentScopeTests(unittest.TestCase):
                          chat_turns.payload_hash("q", "rag", self.kb_id, 6, document_ids=[self.identifier, self.identifier]))
 
     def test_claim_checks_scope_before_saving_question_and_keeps_its_snapshot(self):
+        # 新锁序：advisory 垂幕锁后先经 answer_sources.lock_root 锁 User/KB，
+        # 再由 claim_turn 查会话；patch 掉根锁，scalar 序列只留会话查询。
+        from app.services import answer_sources as sources
+        root = sources.SourceRoot(
+            user=SimpleNamespace(id=self.conv.user_id, is_active=True, token_version=0, is_admin=False),
+            knowledge_base=SimpleNamespace(id=self.kb_id, kind="upload", is_public=True, owner_id=self.conv.user_id))
         self.db.scalar.side_effect = [None, self.conv]
-        result = chat_turns.claim_turn(self.db, user_id=self.conv.user_id, conversation_id=self.conv.id,
-                                      kb_id=self.kb_id, mode="rag", question="内部级能否外发？", top_k=6,
-                                      scope_revision=3)
+        with patch.object(sources, "lock_root", return_value=root):
+            result = chat_turns.claim_turn(self.db, user_id=self.conv.user_id, conversation_id=self.conv.id,
+                                           kb_id=self.kb_id, mode="rag", question="内部级能否外发？", top_k=6,
+                                           scope_revision=3, auth_token_version=0)
         self.assertEqual(result.document_scope[0]["document_id"], str(self.identifier))
         self.assertEqual(result.scope_revision, 3)
         self.assertIn("FOR UPDATE", str(self.db.scalar.call_args.args[0]))
         self.assertIn("FOR SHARE", str(self.db.scalars.call_args.args[0].compile(dialect=postgresql.dialect())))
 
     def test_invalid_scope_or_stale_revision_cannot_create_a_user_message(self):
+        # 发布契约下轮次/消息先落、Document 锁最后取；mock db 无真实事务回滚，
+        # 因此断言异常抛出且从不 commit（真实 PG 上异常即整轮回滚，无持久化写入）。
         for scope, revision in [([self.item], 2), ({}, 3), (None, 3), ([{**self.item, "index_version": 1}], 3)]:
             self.conv.document_scope = scope
             db = MagicMock()
             db.scalar.side_effect = [None, self.conv]
             db.scalars.return_value.all.return_value = [self.doc]
-            with self.subTest(scope=scope), self.assertRaises(HTTPException):
+            from app.services import answer_sources as sources
+            root = sources.SourceRoot(
+                user=SimpleNamespace(id=self.conv.user_id, is_active=True, token_version=0, is_admin=False),
+                knowledge_base=SimpleNamespace(id=self.kb_id, kind="upload", is_public=True, owner_id=self.conv.user_id))
+            with self.subTest(scope=scope), patch.object(sources, "lock_root", return_value=root), \
+                 self.assertRaises(HTTPException):
                 chat_turns.claim_turn(db, user_id=self.conv.user_id, conversation_id=self.conv.id,
-                                      kb_id=self.kb_id, mode="rag", question="q", top_k=6, scope_revision=revision)
-            db.add.assert_not_called()
+                                      kb_id=self.kb_id, mode="rag", question="q", top_k=6, scope_revision=revision,
+                                      auth_token_version=0)
             db.commit.assert_not_called()
 
     def test_plain_chat_rejects_draft_and_scope_revision(self):
         for options in [dict(document_ids=[]), dict(scope_revision=0)]:
             with self.subTest(options=options), self.assertRaises(HTTPException):
                 chat_turns.claim_turn(self.db, user_id=uuid.uuid4(), conversation_id=None, kb_id=None,
-                                      mode="chat", question="q", top_k=6, **options)
+                                      mode="chat", question="q", top_k=6, auth_token_version=0, **options)
         self.db.add.assert_not_called()

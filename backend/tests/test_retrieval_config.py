@@ -49,12 +49,14 @@ class TopKResolutionTests(unittest.TestCase):
     def test_claim_turn_receives_the_resolved_value(self):
         """端到端确认解析结果真的传到了下游，而不只是算了一个没人用的局部变量。"""
         user = SimpleNamespace(id=uuid.uuid4(), username="topk_test", is_admin=True)
-        request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"), url=SimpleNamespace(path="/"))
+        request = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"), url=SimpleNamespace(path="/"),
+                                  state=SimpleNamespace(auth_token_version=7))
         db = MagicMock()
         reservation = SimpleNamespace(
             conversation_id=uuid.uuid4(), request_id=uuid.uuid4(), user_message_id=uuid.uuid4(),
             turn_id=uuid.uuid4(), document_scope=[], scope_revision=0, project_snapshot_id=None,
             replay_answer=None, question="q", mode="chat", status="pending",
+            auth_token_version=7,
         )
         for given, expected in ((None, 5), (3, 3)):
             with self.subTest(given=given), \

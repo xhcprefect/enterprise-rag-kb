@@ -114,7 +114,20 @@ export default {
         kbDelete: '删除知识库',
         documentUpload: '上传文档',
         documentDelete: '删除文档',
-        chatQuery: '知识问答'
+        chatQuery: '知识问答',
+        conversationMetadata: '更新会话信息',
+        projectKbDelete: '撤销项目库',
+        documentGovernanceUpdate: '更新文档治理',
+        documentSupersede: '替代文档',
+        documentReenable: '重新启用文档',
+        modelPriceUpdate: '更新模型价格',
+        feedbackExport: '导出反馈',
+        feedbackReview: '核实反馈',
+        feedbackViewDetail: '查看反馈详情',
+        feedbackRegressionEnroll: '纳入回归',
+        feedbackRegressionPrepare: '准备回归重跑',
+        feedbackRegressionExport: '下载回归样例',
+        feedbackRegressionImport: '导入回归报告'
       }
     },
     profile: {
@@ -140,7 +153,8 @@ export default {
       validation: {
         oldRequired: '请输入原密码',
         newMin: '新密码至少 6 位',
-        mismatch: '两次输入的密码不一致'
+        mismatch: '两次输入的密码不一致',
+        confirmRequired: '请再次输入新密码'
       }
     }
   },
@@ -259,7 +273,20 @@ export default {
         kbDelete: 'Knowledge base deleted',
         documentUpload: 'Document uploaded',
         documentDelete: 'Document deleted',
-        chatQuery: 'Knowledge chat'
+        chatQuery: 'Knowledge chat',
+        conversationMetadata: 'Conversation updated',
+        projectKbDelete: 'Project base revoked',
+        documentGovernanceUpdate: 'Governance updated',
+        documentSupersede: 'Document superseded',
+        documentReenable: 'Document re-enabled',
+        modelPriceUpdate: 'Model price updated',
+        feedbackExport: 'Feedback exported',
+        feedbackReview: 'Feedback reviewed',
+        feedbackViewDetail: 'Feedback viewed',
+        feedbackRegressionEnroll: 'Regression enrolled',
+        feedbackRegressionPrepare: 'Regression prepared',
+        feedbackRegressionExport: 'Regression sample',
+        feedbackRegressionImport: 'Regression imported'
       }
     },
     profile: {
@@ -285,7 +312,8 @@ export default {
       validation: {
         oldRequired: 'Enter your current password',
         newMin: 'New password must be at least 6 characters',
-        mismatch: 'The passwords do not match'
+        mismatch: 'The passwords do not match',
+        confirmRequired: 'Re-enter the new password'
       }
     }
   }

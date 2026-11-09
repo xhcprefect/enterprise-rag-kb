@@ -1,5 +1,5 @@
 import { test, expect, type APIRequestContext, type Page } from '@playwright/test'
-import { writeFileSync, realpathSync } from 'node:fs'
+import { writeFileSync, realpathSync, mkdirSync } from 'node:fs'
 import { dirname, resolve, relative, isAbsolute } from 'node:path'
 import { apiLogin, apiUrl, assertProxiedApi, loadManifest, stubControl, uiLogin } from './fixtures'
 
@@ -136,6 +136,114 @@ test('project registration, fixed snapshots, CAS conflicts and historical source
   const detail = await api(request, 'get', `/chat/conversations/${conversationId}`)
   expect(detail.project_snapshot_id).toBe(first.id)
   expect(detail.scope_revision).toBe(2)
+})
+
+test('auto sync indexes a changed project subdirectory without any manual sync', async ({ page, request }) => {
+  test.setTimeout(180_000)
+  const fixture = manifest.project_fixture
+  if (!fixture) throw new Error('manifest 缺少合成项目目录')
+
+  // 在授权根下新建独立子目录，绝不复用其它用例的 fixture 文件。
+  const relativeDir = `auto-sync-${Date.now()}`
+  const projectDir = resolve(fixture.root, relativeDir)
+  const projectFile = resolve(projectDir, 'notes.md')
+  const within = relative(fixture.root, projectDir)
+  if (within.startsWith('..') || isAbsolute(within)) throw new Error('自动同步子目录越出授权根')
+  mkdirSync(projectDir, { recursive: true })
+  writeFileSync(projectFile, '# 自动同步\n\nAUTO_SYNC_VERSION_ONE：自动同步第一版内容。\n', 'utf-8')
+
+  const source = await api(request, 'post', '/projects', {
+    name: `自动同步验收 ${Date.now()}`,
+    root_key: fixture.root_key,
+    relative_dir: relativeDir
+  })
+
+  // 页面只允许通过 PATCH 配置自动同步；任何手动同步请求都视为用例失败。
+  const manualSyncs: string[] = []
+  page.on('request', outgoing => {
+    if (outgoing.method() === 'POST' && outgoing.url().endsWith(`/api/v1/projects/${source.id}/sync`)) {
+      manualSyncs.push(outgoing.url())
+    }
+  })
+
+  await uiLogin(page)
+  await page.goto(`/projects/${source.id}`)
+  await expect(page.locator('.detail-title')).toContainText(source.name)
+
+  const panel = page.getByTestId('auto-sync-panel')
+  await expect(panel).toBeVisible()
+  await expect(panel.getByTestId('auto-sync-state')).toHaveText('未开启')
+  await expect(panel.getByTestId('auto-sync-hint')).toContainText('开启后由服务端定时检查受控目录')
+
+  // 通过页面开启自动同步并选择 1 分钟间隔。
+  await panel.getByTestId('auto-sync-toggle').click()
+  await panel.getByTestId('auto-sync-interval').locator('.el-select__wrapper').click()
+  await page.getByRole('option', { name: '1 分钟', exact: true }).click()
+  const firstPatch = page.waitForResponse(response =>
+    response.url().endsWith(`/api/v1/projects/${source.id}/auto-sync`) && response.request().method() === 'PATCH')
+  await panel.getByTestId('auto-sync-save').click()
+  const firstPatchBody = (await (await firstPatch).json()).data
+  expect(firstPatchBody.auto_sync_enabled).toBe(true)
+  expect(firstPatchBody.auto_sync_interval_seconds).toBe(60)
+  await expect(panel.getByTestId('auto-sync-state')).toHaveText('已开启')
+  await expect(panel.getByTestId('auto-sync-hint')).toContainText('1 分钟')
+
+  // 首次自动检查由服务端 project worker 执行，页面不触发手动同步。
+  let firstSnapshotId = ''
+  await expect.poll(async () => {
+    const snaps = await api(request, 'get', `/projects/${source.id}/snapshots`)
+    firstSnapshotId = snaps.find((item: { id: string; status: string; trigger_source: string }) =>
+      item.trigger_source === 'auto' && item.status === 'ready')?.id ?? ''
+    return firstSnapshotId
+  }, { timeout: 90_000 }).toBeTruthy()
+  expect(firstSnapshotId).not.toBe('')
+
+  await expect(page.getByTestId('source-status')).toHaveText('已就绪', { timeout: 45_000 })
+  await page.getByRole('textbox', { name: '搜索项目内容', exact: true }).fill('AUTO_SYNC_VERSION_ONE')
+  await page.getByTestId('project-search-run').click()
+  await expect(page.getByTestId('project-search-results')).toContainText('AUTO_SYNC_VERSION_ONE')
+
+  // 修改自己子目录里的文件；页面此时仍停留在旧快照视图。
+  writeFileSync(projectFile, '# 自动同步\n\nAUTO_SYNC_VERSION_TWO：自动同步第二版内容。\n', 'utf-8')
+
+  // 通过 UI 关闭再开启自动同步，使服务端下次检查立即到期（不点击“同步”）。
+  await panel.getByTestId('auto-sync-toggle').click()
+  const offPatch = page.waitForResponse(response =>
+    response.url().endsWith(`/api/v1/projects/${source.id}/auto-sync`) && response.request().method() === 'PATCH')
+  await panel.getByTestId('auto-sync-save').click()
+  expect((await (await offPatch).json()).data.auto_sync_enabled).toBe(false)
+  await expect(panel.getByTestId('auto-sync-state')).toHaveText('未开启')
+
+  await panel.getByTestId('auto-sync-toggle').click()
+  const onPatch = page.waitForResponse(response =>
+    response.url().endsWith(`/api/v1/projects/${source.id}/auto-sync`) && response.request().method() === 'PATCH')
+  await panel.getByTestId('auto-sync-save').click()
+  expect((await (await onPatch).json()).data.auto_sync_enabled).toBe(true)
+  await expect(panel.getByTestId('auto-sync-state')).toHaveText('已开启')
+
+  let secondSnapshotId = ''
+  await expect.poll(async () => {
+    const snaps = await api(request, 'get', `/projects/${source.id}/snapshots`)
+    secondSnapshotId = snaps.find((item: { id: string; status: string; trigger_source: string }) =>
+      item.trigger_source === 'auto' && item.status === 'ready' && item.id !== firstSnapshotId)?.id ?? ''
+    return secondSnapshotId
+  }, { timeout: 90_000 }).toBeTruthy()
+  expect(secondSnapshotId).not.toBe(firstSnapshotId)
+
+  // 空闲刷新应发现新 ready 快照，但只提示，不静默改绑当前（旧）快照。
+  await expect(page.getByTestId('new-snapshot-banner')).toBeVisible({ timeout: 60_000 })
+  await expect(page.getByTestId('new-snapshot-banner')).toContainText('新版本已可检索')
+
+  await page.getByTestId('view-new-snapshot').click()
+  await expect(page.getByTestId('project-files')).toBeVisible({ timeout: 30_000 })
+  await page.getByRole('textbox', { name: '搜索项目内容', exact: true }).fill('AUTO_SYNC_VERSION_TWO')
+  await page.getByTestId('project-search-run').click()
+  await expect(page.getByTestId('project-search-results')).toContainText('AUTO_SYNC_VERSION_TWO')
+
+  expect(manualSyncs, '整个用例不得触发手动同步').toEqual([])
+
+  // 只撤销本用例自己创建的源，不影响其它测试数据。
+  await api(request, 'delete', `/projects/${source.id}`)
 })
 
 test('summary worker publishes and resets real conversation memory', async ({ page, request }) => {

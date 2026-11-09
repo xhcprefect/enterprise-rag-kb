@@ -56,6 +56,36 @@ export interface DocumentItem {
   progress: number
   cancel_requested: boolean
   created_at: string
+  /** 当前索引代次；非负整数。 */
+  index_version: number
+  /** 负责人说明（≤200 字符的描述文本，不是权限/ACL）。 */
+  maintainer: string
+  last_reviewed_at: string | null
+  /** 生效窗口 [valid_from, valid_until)，UTC ISO，均可为空。 */
+  valid_from: string | null
+  valid_until: string | null
+  /** 显式停用开关；false 时不可检索。 */
+  enabled: boolean
+  /** 被替代时间；null 表示未被替代。 */
+  superseded_at: string | null
+  /** 替代本文档的新文档 id；null 表示未被替代（或替代者已删除）。 */
+  superseded_by_id: string | null
+  /** 治理版本号，CAS 乐观锁；非负整数，默认 0。 */
+  governance_revision: number
+  /** 派生生命周期：active | scheduled | expired | disabled | superseded。 */
+  lifecycle_state: 'active' | 'scheduled' | 'expired' | 'disabled' | 'superseded'
+  /** 服务端实时派生的可检索标志（requires ready + cancel 未请求 + 治理谓词全部满足）。 */
+  retrievable: boolean
+}
+
+/** PATCH governance 请求体；expected_revision 必须来自打开表单时的快照。 */
+export interface GovernancePatchBody {
+  expected_revision: number
+  maintainer?: string
+  last_reviewed_at?: string | null
+  valid_from?: string | null
+  valid_until?: string | null
+  enabled?: boolean
 }
 
 export interface SourceLocation {
@@ -203,6 +233,265 @@ export interface ChatStreamMeta {
 export interface PageResult<T> {
   total: number
   items: T[]
+}
+
+// ---------- 答案反馈 ----------
+export type FeedbackCategory = 'inaccurate_answer' | 'citation_error' | 'missing_material'
+export type FeedbackStatus = 'pending' | 'verified' | 'rejected'
+export type FeedbackOutcome = 'answer' | 'refuse' | 'clarify'
+
+export interface FeedbackCitation {
+  document_id?: string | null
+  filename?: string | null
+  chunk_index?: number | null
+  index_version?: number | null
+  snippet?: string | null
+}
+
+export interface ExpectedSource {
+  document_id?: string | null
+  filename?: string | null
+  chunk_index?: number | null
+  index_version?: number | null
+}
+
+/** 本人反馈列表项（GET /feedback/mine）。 */
+export interface AnswerFeedbackOwnerItem {
+  id: string
+  message_id: string
+  conversation_id: string
+  category: FeedbackCategory
+  note: string
+  status: FeedbackStatus
+  revision: number
+  created_at: string
+  reviewed_at: string | null
+}
+
+/** 管理员列表项（GET /feedback）：默认脱敏，不返回问题/回答/引用正文。 */
+export interface AnswerFeedbackAdminItem {
+  id: string
+  category: FeedbackCategory
+  status: FeedbackStatus
+  revision: number
+  created_at: string
+  reviewed_at: string | null
+  reviewer_name: string
+  note_present: boolean
+}
+
+/** 管理员详情（GET /feedback/{id}）：显式查看时才返回正文。 */
+export interface AnswerFeedbackAdminDetail {
+  id: string
+  category: FeedbackCategory
+  status: FeedbackStatus
+  revision: number
+  created_at: string
+  reviewed_at: string | null
+  reviewer_name: string
+  /** 原回答所属会话模式；来源校验以它为准，而不是靠引用数量猜测。 */
+  mode: 'rag' | 'chat'
+  message_id: string
+  conversation_id: string
+  question: string | null
+  answer: string
+  note: string
+  citations: FeedbackCitation[]
+  invalid_source_ids: string[]
+  result_stale: boolean
+  corrected_outcome: FeedbackOutcome | null
+  expected_sources: ExpectedSource[]
+  required_phrases: string[]
+  forbidden_phrases: string[]
+  unknowns: string[]
+  evidence_note: string
+  reviewer_note: string
+}
+
+/** PATCH /feedback/{id}/review 请求体；expected_revision 必须来自打开详情时的快照。 */
+export interface FeedbackReviewRequest {
+  expected_revision: number
+  decision: 'verified' | 'rejected'
+  corrected_outcome?: FeedbackOutcome | null
+  expected_sources?: ExpectedSource[]
+  required_phrases?: string[]
+  forbidden_phrases?: string[]
+  unknowns?: string[]
+  evidence_note?: string
+  reviewer_note?: string
+}
+
+/** GET /feedback/export 的 data；jsonl 由用户显式下载，不自动保存/上传。 */
+export interface FeedbackExportPayload {
+  filename: string
+  case_count: number
+  dataset_sha256: string
+  jsonl: string
+}
+
+export const feedbackApi = {
+  /** 提交反馈；重复提交时后端返回既有记录，按成功处理。 */
+  submit: (data: { message_id: string; category: FeedbackCategory; note?: string }, signal?: AbortSignal) =>
+    client.post<AnswerFeedbackOwnerItem>('/feedback', data, { signal }),
+  mine: (params: { page?: number; page_size?: number; status?: FeedbackStatus }) =>
+    client.get<PageResult<AnswerFeedbackOwnerItem>>('/feedback/mine', { params }),
+  adminList: (params: {
+    page?: number
+    page_size?: number
+    status?: FeedbackStatus
+    category?: FeedbackCategory
+    signal?: AbortSignal
+  }) =>
+    client.get<PageResult<AnswerFeedbackAdminItem>>('/feedback', {
+      params: {
+        page: params.page,
+        page_size: params.page_size,
+        status: params.status,
+        category: params.category
+      },
+      signal: params.signal
+    }),
+  adminDetail: (id: string, signal?: AbortSignal) =>
+    client.get<AnswerFeedbackAdminDetail>(`/feedback/${id}`, { signal }),
+  review: (id: string, payload: FeedbackReviewRequest) =>
+    client.patch<AnswerFeedbackAdminItem>(`/feedback/${id}/review`, payload),
+  /** 单个导出传 feedback_id；批量导出不传参数。 */
+  export: (feedbackId?: string) =>
+    client.get<FeedbackExportPayload>(
+      '/feedback/export',
+      feedbackId ? { params: { feedback_id: feedbackId } } : undefined
+    )
+}
+
+// ---------- 反馈回归闭环（管理员） ----------
+export type FeedbackRegressionCause =
+  | 'parsing'
+  | 'retrieval'
+  | 'document_version'
+  | 'generation'
+  | 'scope_context'
+  | 'other'
+
+export type FeedbackRegressionMode = 'offline' | 'live'
+export type FeedbackRegressionRunState = 'awaiting_report' | 'imported' | 'stale'
+export type FeedbackRegressionValidationLevel = 'consistency_only' | 'content_regraded'
+
+/** 一轮重跑的白名单摘要；不含样例/报告正文。 */
+export interface FeedbackRegressionRun {
+  run_id: string
+  attempt_no: number
+  is_current: boolean
+  state: FeedbackRegressionRunState
+  requested_mode: FeedbackRegressionMode
+  protocol_version: number
+  case_sha256: string
+  dataset_sha256: string
+  binding_sha256: string
+  prepared_by_name: string
+  created_at: string
+  imported_at: string | null
+  imported_by_name: string | null
+  report_mode: string | null
+  validation_level: FeedbackRegressionValidationLevel | null
+  passed: boolean | null
+  failures: string[]
+  outcome: string | null
+  http_status: number | null
+  citation_count: number | null
+  dataset_report_sha256: string | null
+  report_sha256: string | null
+  result_sha256: string | null
+  machine_sha256: string | null
+}
+
+/** GET /feedback/{id}/regression 的 data；未纳入时为 null。 */
+export interface FeedbackRegression {
+  feedback_id: string
+  revision: number
+  cause: FeedbackRegressionCause
+  cause_note: string
+  created_by_name: string
+  created_at: string
+  current_attempt_no: number
+  available: boolean
+  unavailable_reason: string | null
+  current_run: FeedbackRegressionRun | null
+}
+
+/** POST /feedback/{id}/regression 请求体；expected_feedback_revision 来自详情快照。 */
+export interface FeedbackRegressionEnrollRequest {
+  expected_feedback_revision: number
+  cause: FeedbackRegressionCause
+  cause_note: string
+}
+
+/** POST /feedback/{id}/regression/runs 请求体；prepare_request_id 为幂等键。 */
+export interface FeedbackRegressionPrepareRequest {
+  expected_revision: number
+  requested_mode: FeedbackRegressionMode
+  prepare_request_id: string
+}
+
+/** 准备/重新导出当前轮的统一响应；jsonl 由用户显式下载。 */
+export interface FeedbackRegressionPrepare {
+  regression_revision: number
+  run: FeedbackRegressionRun
+  filename: string
+  case_count: 1
+  dataset_sha256: string
+  protocol_version: number
+  jsonl: string
+  cli_hint: string
+}
+
+/** 导入成功后的摘要；不返回报告正文。 */
+export interface FeedbackRegressionImport {
+  regression_revision: number
+  run: FeedbackRegressionRun
+}
+
+export const feedbackRegressionApi = {
+  /** 回归纳入状态与实时可用性；未纳入时 data 为 null。 */
+  get: (id: string, signal?: AbortSignal) =>
+    client.get<FeedbackRegression | null>(`/feedback/${id}/regression`, { signal }),
+  /** 纳入回归；相同原因与说明重复提交时后端幂等返回既有记录。 */
+  enroll: (id: string, payload: FeedbackRegressionEnrollRequest, signal?: AbortSignal) =>
+    client.post<FeedbackRegression>(`/feedback/${id}/regression`, payload, { signal }),
+  /** 准备下一轮并取得单条 JSONL；每个 prepare_request_id 只创建一轮。 */
+  prepare: (id: string, payload: FeedbackRegressionPrepareRequest, signal?: AbortSignal) =>
+    client.post<FeedbackRegressionPrepare>(`/feedback/${id}/regression/runs`, payload, { signal }),
+  /** 重新下载当前轮已绑定的 JSONL；非当前轮由后端返回 409。 */
+  exportRun: (id: string, runId: string, signal?: AbortSignal) =>
+    client.get<FeedbackRegressionPrepare>(
+      `/feedback/${id}/regression/runs/${runId}/export`,
+      { signal }
+    ),
+  /** 历史按 attempt_no 倒序分页。 */
+  history: (id: string, params: { page?: number; page_size?: number }, signal?: AbortSignal) =>
+    client.get<PageResult<FeedbackRegressionRun>>(`/feedback/${id}/regression/runs`, {
+      params: { page: params.page, page_size: params.page_size },
+      signal
+    }),
+  /**
+   * 导入 CLI 生成的报告。请求体必须是原始 JSON 字节，不能包成对象；
+   * 文件过大时由服务端返回 413，结构/绑定错误返回 400/409/422。
+   */
+  importReport: (
+    id: string,
+    runId: string,
+    expectedRevision: number,
+    file: File,
+    signal?: AbortSignal
+  ) =>
+    client.post<FeedbackRegressionImport>(
+      `/feedback/${id}/regression/runs/${runId}/import`,
+      file,
+      {
+        params: { expected_revision: expectedRevision },
+        headers: { 'Content-Type': 'application/json' },
+        signal
+      }
+    )
 }
 
 /** 分片上传完成的结果；deduplicated=true 表示服务端复用了已有文档。 */
@@ -381,6 +670,221 @@ export interface SourcePreview {
   truncated: boolean
 }
 
+// ---------- 入库质量 ----------
+export type DocumentQualitySeverity = 'info' | 'warning' | 'error'
+
+/** 单条质量问题的数量可能未知（count=null）；details 仅供诊断，不直接展示原始键名。 */
+export interface DocumentQualityIssue {
+  code: string
+  severity: DocumentQualitySeverity
+  count: number | null
+  details: Record<string, string | number> | null
+}
+
+export interface DocumentQualityStats {
+  empty_chunks: number
+  short_chunks: number
+  duplicate_chunks: number
+  replacement_chunks: number
+  control_chunks: number
+  oversized_chunks: number
+  min_chars: number
+  max_chars: number
+  avg_chars: number
+  page_chunks: number
+  section_chunks: number
+  line_chunks: number
+  sheet_chunks: number
+  table_chunks: number
+}
+
+/** GET /knowledge-bases/{kbId}/documents/{docId}/quality */
+export interface DocumentQuality {
+  document_id: string
+  filename: string
+  file_ext: string
+  status: DocumentItem['status']
+  error_message: string | null
+  index_version: number
+  parse_done: boolean
+  cancel_requested: boolean
+  chunk_count: number
+  char_count: number
+  scanned_chunks: number
+  scan_limit: number
+  scan_truncated: boolean
+  embedded_count: number
+  unembedded_count: number
+  file_exists: boolean
+  stats: DocumentQualityStats
+  issues: DocumentQualityIssue[]
+}
+
+/** 分块预览条目；content 已由服务端截断到 1200 字符。 */
+export interface DocumentChunkPreview {
+  chunk_index: number
+  content: string
+  content_chars: number
+  truncated: boolean
+  embedded: boolean
+  location: SourceLocation
+}
+
+/** GET /knowledge-bases/{kbId}/documents/{docId}/chunks */
+export interface DocumentChunkPage {
+  total: number
+  offset: number
+  limit: number
+  items: DocumentChunkPreview[]
+}
+
+// ---------- 文档版本对比 ----------
+
+/** 不可比较的原因；'ok' 表示可比较。字段值由后端冻结，不要自行扩展。 */
+export type DocumentComparisonReason =
+  | 'ok'
+  | 'not_ready'
+  | 'not_eligible'
+  | 'incomplete'
+  | 'empty_document'
+  | 'too_many_chunks'
+  | 'too_many_chars'
+  | 'too_many_units'
+
+/** 对比一侧的文档摘要。 */
+export interface ComparisonDocument {
+  id: string
+  filename: string
+  index_version: number
+  governance_revision: number
+  chunk_count: number
+  char_count: number
+  lifecycle_state: DocumentItem['lifecycle_state']
+  retrievable: boolean
+}
+
+/** 已入库文本的最小对比单元。 */
+export interface ComparisonUnit {
+  chunk_index: number
+  line_index: number
+  text: string
+  location: SourceLocation
+}
+
+export type ComparisonRowKind = 'unchanged' | 'added' | 'removed' | 'modified'
+
+export interface ComparisonRow {
+  kind: ComparisonRowKind
+  original: ComparisonUnit | null
+  replacement: ComparisonUnit | null
+}
+
+export interface ComparisonSummary {
+  added: number
+  removed: number
+  modified: number
+  unchanged: number
+}
+
+/** GET /knowledge-bases/{kbId}/documents/{docId}/comparison 的响应（契约冻结）。 */
+export interface DocumentComparison {
+  comparison_version: number
+  basis: 'ingested_chunks'
+  comparable: boolean
+  reason: DocumentComparisonReason
+  original: ComparisonDocument
+  replacement: ComparisonDocument
+  summary: ComparisonSummary | null
+  rows: ComparisonRow[]
+  comparison_fingerprint: string | null
+}
+
+// ---------- 检索诊断 ----------
+export interface RetrievalDiagnosticsScopeItem {
+  document_id: string
+  filename: string
+  index_version: number
+}
+
+export interface RetrievalDiagnosticsKbStats {
+  total_documents: number
+  ready_documents: number
+  retrievable_documents: number
+}
+
+export interface RetrievalDiagnosticsConfig {
+  top_k: number
+  min_similarity: number
+  max_per_doc: number
+  hybrid_retrieval_enabled: boolean
+  keyword_candidates: number
+  rerank_enabled: boolean
+  neighbor_chunks: number
+}
+
+export type RetrievalDiagnosticsStageName =
+  | 'vector'
+  | 'keyword'
+  | 'fusion'
+  | 'rerank'
+  | 'select'
+  | 'neighbors'
+
+export type RetrievalDiagnosticsStageStatus = 'ok' | 'error' | 'skipped' | 'fallback'
+
+export interface RetrievalDiagnosticsStage {
+  name: RetrievalDiagnosticsStageName
+  status: RetrievalDiagnosticsStageStatus
+  ms: number
+  candidates: number
+  error_type: string | null
+  applied: boolean | null
+  reason: string | null
+}
+
+/** 候选片段；excerpt 已由服务端截断到 600 字符。 */
+export interface RetrievalDiagnosticsCandidate {
+  rank: number
+  document_id: string | null
+  filename: string | null
+  chunk_index: number | null
+  chunk_start: number | null
+  chunk_end: number | null
+  index_version: number | null
+  location: SourceLocation
+  excerpt: string
+  excerpt_chars: number
+  excerpt_truncated: boolean
+  scores: Record<string, number>
+  retrieval_method: 'vector' | 'keyword' | 'hybrid' | null
+  lifecycle_state: string | null
+  retrievable: boolean | null
+}
+
+/**
+ * POST /knowledge-bases/{kbId}/retrieval-diagnostics 的 data。
+ * 注意：status='error' 仍是 HTTP 200，表示检索执行失败；answer_generated 恒为 false。
+ */
+export interface RetrievalDiagnosticsResult {
+  status: 'ok' | 'error'
+  error_type: string | null
+  question: string
+  kb_id: string
+  collection_name: string
+  scope: RetrievalDiagnosticsScopeItem[]
+  kb: RetrievalDiagnosticsKbStats
+  config: RetrievalDiagnosticsConfig
+  stages: RetrievalDiagnosticsStage[]
+  candidates: RetrievalDiagnosticsCandidate[]
+  total_ms: number
+  answer_generated: false
+}
+
+export interface RetrievalDiagnosticsRequest {
+  question: string
+  document_ids: string[]
+}
+
 export const docApi = {
   source: (kbId: string, citation: Citation) => client.get<SourcePreview>(`/knowledge-bases/${kbId}/documents/${citation.document_id}/source`, {
     params: { chunk_index: citation.chunk_index, index_version: citation.index_version ?? 0,
@@ -391,14 +895,91 @@ export const docApi = {
   }),
   get: (kbId: string, docId: string) => client.get<DocumentItem>(`/knowledge-bases/${kbId}/documents/${docId}`),
   /** q 为文件名关键字（服务端做字面匹配、trim、最长 200 字符）。 */
-  list: (kbId: string, params: { page?: number; page_size?: number; status?: string; q?: string }) =>
+  list: (
+    kbId: string,
+    params: {
+      page?: number
+      page_size?: number
+      status?: string
+      q?: string
+      /** true = 只返回当前可检索的文档（范围选择器专用）。 */
+      retrievable_only?: boolean
+    }
+  ) =>
     client.get<PageResult<DocumentItem>>(`/knowledge-bases/${kbId}/documents`, { params }),
   reindex: (kbId: string, docId: string) =>
     client.post<DocumentItem>(`/knowledge-bases/${kbId}/documents/${docId}/reindex`),
   cancel: (kbId: string, docId: string) =>
     client.post<DocumentItem>(`/knowledge-bases/${kbId}/documents/${docId}/cancel`),
   remove: (kbId: string, docId: string) =>
-    client.delete(`/knowledge-bases/${kbId}/documents/${docId}`)
+    client.delete(`/knowledge-bases/${kbId}/documents/${docId}`),
+  /**
+   * 管理员治理编辑。expected_revision 为打开表单时的快照；
+   * 409 = 版本冲突，调用方应提示刷新并重新打开表单，不能静默重试。
+   */
+  updateGovernance: (kbId: string, docId: string, body: GovernancePatchBody) =>
+    client.patch<DocumentItem>(
+      `/knowledge-bases/${kbId}/documents/${docId}/governance`,
+      body
+    ),
+  /** 显式替代：同库、非自身、替代者当前可检索；409 = CAS 冲突、已被替代或预览已过期。 */
+  supersede: (
+    kbId: string,
+    docId: string,
+    body: {
+      expected_revision: number
+      replacement_document_id: string
+      /** 对比预览指纹；服务端据此拒绝过期预览。旧调用可省略。 */
+      comparison_fingerprint?: string
+    }
+  ) =>
+    client.post<DocumentItem>(
+      `/knowledge-bases/${kbId}/documents/${docId}/supersede`,
+      body
+    ),
+  /**
+   * 查看「本文档」与同库候选文档的已入库文本差异（管理员）。
+   * comparable=false 时按 reason 展示不可比较原因，绝不当作“无差异”。
+   */
+  comparison: (kbId: string, docId: string, replacementId: string, signal?: AbortSignal) =>
+    client.get<DocumentComparison>(
+      `/knowledge-bases/${kbId}/documents/${docId}/comparison`,
+      { params: { replacement_document_id: replacementId }, signal }
+    ),
+  /** 显式重新启用：清除替代标记并置 enabled=true；不删除文件、不触发重建索引。 */
+  reenable: (kbId: string, docId: string, body: { expected_revision: number }) =>
+    client.post<DocumentItem>(
+      `/knowledge-bases/${kbId}/documents/${docId}/reenable`,
+      body
+    ),
+  /** 单份文档的入库质量汇总（管理员）。 */
+  quality: (kbId: string, docId: string, signal?: AbortSignal) =>
+    client.get<DocumentQuality>(
+      `/knowledge-bases/${kbId}/documents/${docId}/quality`,
+      { signal }
+    ),
+  /** 分块分页预览；limit 由服务端限制为 1..50，界面固定 20。 */
+  chunks: (
+    kbId: string,
+    docId: string,
+    params: { offset: number; limit: number },
+    signal?: AbortSignal
+  ) =>
+    client.get<DocumentChunkPage>(
+      `/knowledge-bases/${kbId}/documents/${docId}/chunks`,
+      { params, signal }
+    )
+}
+
+// ---------- 检索诊断 ----------
+export const diagnosticsApi = {
+  /** 执行一次真实检索（不生成答案）；status='error' 也走 HTTP 200。 */
+  run: (kbId: string, body: RetrievalDiagnosticsRequest, signal?: AbortSignal) =>
+    client.post<RetrievalDiagnosticsResult>(
+      `/knowledge-bases/${kbId}/retrieval-diagnostics`,
+      body,
+      { signal }
+    )
 }
 
 // ---------- 问答 ----------

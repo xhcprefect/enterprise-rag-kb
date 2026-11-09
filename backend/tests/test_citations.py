@@ -22,7 +22,8 @@ from app.services.cloud_models import CloudModelError
 def documents():
     return [
         (LCDocument(page_content=f"刑法资料 {index}", metadata={
-            "document_id": str(index), "filename": f"law-{index}.txt", "chunk_index": index - 1,
+            "document_id": str(uuid.UUID(int=index)), "filename": f"law-{index}.txt",
+            "chunk_index": index - 1, "index_version": 0,
         }), 0.1 * index)
         for index in range(1, 7)
     ]

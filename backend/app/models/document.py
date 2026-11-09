@@ -110,6 +110,55 @@ class Document(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
+    # ---- 治理字段（T3 冻结契约）----
+    # 负责人说明文本（最多 200 字符），仅描述用途，绝不承载任何访问控制语义。
+    # 真实 server_default：绕过 ORM 的 INSERT（迁移脚本/psql/backfill）也得到确定值。
+    maintainer: Mapped[str] = mapped_column(
+        String(200), default="", server_default="", nullable=False
+    )
+    # 最近一次人工审核时间；缺失只告警，不参与可检索判定。
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 显式生效窗口 [valid_from, valid_until)：NULL 表示该侧不限。
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enabled: Mapped[bool] = mapped_column(
+        default=True, server_default=text("true"), nullable=False
+    )
+    # 替代关系：superseded_at/superseded_by_id 任一存在即视为已被替代。
+    # 自引用外键 ON DELETE SET NULL：删除替代文档不删除原文档，也不复活它。
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "documents.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_documents_superseded_by_id_documents",
+        ),
+        nullable=True,
+    )
+    governance_revision: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+
+    superseded_by: Mapped["Document | None"] = relationship(
+        foreign_keys=[superseded_by_id], remote_side=[id]
+    )
+
+    @property
+    def lifecycle_state(self) -> str:
+        """派生生命周期状态；与 SQL 谓词共享同一模块，保证两边一致。"""
+        from app.services.document_lifecycle import lifecycle_state as derive
+
+        return derive(self)
+
+    @property
+    def retrievable(self) -> bool:
+        """当前是否可被检索：入库状态 + 治理谓词的实时派生值。"""
+        from app.services.document_lifecycle import is_retrievable
+
+        return is_retrievable(self)
+
     knowledge_base: Mapped["KnowledgeBase"] = relationship(back_populates="documents")
     uploader: Mapped["User | None"] = relationship()
     chunks: Mapped[list["DocumentChunk"]] = relationship(

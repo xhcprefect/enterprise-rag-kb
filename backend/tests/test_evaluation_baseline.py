@@ -15,6 +15,21 @@ ROOT = Path(__file__).parents[1] / "evaluation"
 RUN_ID = "00000000-0000-4000-8000-000000000010"
 
 
+def _lf_documents_copy(temp):
+    """基线按 LF 语料生成；在 Windows 工作区用临时 LF 副本复现基线。
+
+    不改真实语料或基线，也不改变身份算法：只为工作区换行差异提供可比输入。
+    """
+    target = Path(temp) / "documents-lf"
+    for source in sorted((ROOT / "documents").rglob("*")):
+        if not source.is_file():
+            continue
+        destination = target / source.relative_to(ROOT / "documents")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes().replace(b"\r\n", b"\n"))
+    return target
+
+
 def _cases(name="cases.platform.example.jsonl"):
     return ev.validate_cases(ev.read_jsonl(ROOT / name))
 
@@ -371,10 +386,12 @@ class CliBaselineTests(unittest.TestCase):
     def _run(self, *extra, dataset="cases.platform.example.jsonl", responses="responses.platform.example.jsonl"):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
+        documents = _lf_documents_copy(temp.name)
         report = Path(temp.name) / "report.json"
         comparison = Path(temp.name) / "comparison.json"
         with contextlib.redirect_stdout(io.StringIO()) as output, patch("scripts.evaluate_rag.httpx.Client") as client:
             code = main(["--dataset", str(ROOT / dataset), "--responses", str(ROOT / responses),
+                         "--documents-dir", str(documents),
                          "--output", str(report), "--comparison-output", str(comparison), *extra])
         client.assert_not_called()
         return code, report, comparison, output.getvalue()

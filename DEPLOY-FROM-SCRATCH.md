@@ -500,25 +500,17 @@ db (pg_isready 健康) → api (curl /health 健康) → worker
 ### 8.1 命令行检查
 
 ```bash
-# ① 四个容器都在跑，api 是 (healthy)
+# ① 默认四个容器都在跑，api 是 (healthy)；启用 profile 时还有对应角色 worker
 docker compose ps
 
 # ② 健康检查（WEB_PORT 改过的话把 80 换掉）
 curl -s http://localhost/health
 ```
 
-`/health` 返回形如：
+`/health` 只返回两个字段：
 
 ```json
-{
-  "status": "ok",
-  "app": "Enterprise RAG Knowledge Base",
-  "llm": "deepseek-flash",
-  "llm_provider": "cloud",
-  "embedding": "BAAI/bge-m3",
-  "embedding_provider": "cloud",
-  "worker": "idle"
-}
+{"status": "ok", "worker": "idle"}
 ```
 
 `worker` 字段有三种值，含义要分清：
@@ -531,6 +523,23 @@ curl -s http://localhost/health
 
 > 注意 `idle` **不等于**"worker 活着"。这是有意设计的：老实现把空闲当存活，
 > 结果 worker 挂了 `/health` 还报正常。要确认 worker 真活着，用下面的办法。
+
+部署完成后还可运行只读验收 CLI。默认 dry-run 零网络；`--live` 才做有限只读 GET，令牌只从环境变量读取：
+
+```bash
+# dry-run：只校验参数与目标，不发任何请求
+python backend/scripts/verify_deployment.py --base-url https://rag.example.com --json
+
+# live：--confirm-target 必须与 --base-url 规范化后的 origin 完全一致
+export RAG_DEPLOY_ADMIN_TOKEN='<在终端中设置>'
+export RAG_DEPLOY_METRICS_TOKEN='<在终端中设置>'
+python backend/scripts/verify_deployment.py \
+  --base-url https://rag.example.com \
+  --confirm-target https://rag.example.com \
+  --live --out /srv/ragkb-acceptance/verification.json
+```
+
+工具检查通过不等于真实业务/生产验收通过；真实恢复、通知回执、成员 ACL 与 24h/72h soak 证据缺失时保持 `unknown`。详见 [部署验收指南](deploy/acceptance/README.md)。
 
 ### 8.2 确认 worker 真的在跑
 

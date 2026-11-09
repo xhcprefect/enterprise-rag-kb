@@ -1,7 +1,9 @@
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 
 class KnowledgeBaseCreate(BaseModel):
@@ -50,8 +52,152 @@ class DocumentRead(BaseModel):
     progress: int
     cancel_requested: bool
     created_at: datetime
+    # ---- 治理字段（冻结契约：所有 list/detail/upload/reindex/cancel/complete 路径）----
+    # 全部 REQUIRED：缺失/None 会直接校验失败，绝不靠宽松默认放行伪装成治理值。
+    # 派生字段由 Document 的 property（document_lifecycle 模块）提供。
+    index_version: int = Field(ge=0)
+    maintainer: str = Field(max_length=200)
+    last_reviewed_at: datetime | None
+    valid_from: datetime | None
+    valid_until: datetime | None
+    enabled: bool
+    superseded_at: datetime | None
+    superseded_by_id: uuid.UUID | None
+    governance_revision: int = Field(ge=0)
+    lifecycle_state: Literal["active", "scheduled", "expired", "disabled", "superseded"]
+    retrievable: bool
 
-    model_config = {"from_attributes": True}
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("created_at", "last_reviewed_at", "valid_from", "valid_until", "superseded_at")
+    def _serialize_aware(self, value: datetime | None) -> str | None:
+        """统一输出 ISO；aware 值规范到 UTC，naive 值不捏造时区（原样输出）。
+
+        契约要求 aware 输出；naive 说明上游数据不规范，本层不替它补 ``Z``。
+        """
+        if value is None:
+            return None
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            return value.isoformat()
+        return value.astimezone(timezone.utc).isoformat()
+
+
+# 请求体治理时间字段的统一验证：只接受"显式时区的完整 ISO 字符串"或
+# aware datetime。Pydantic 宽松解析（数字、数字字符串、naive、无秒等）之前
+# 先在本层拒绝；null 只用于显式清空（omitted 不变）。
+_ZONE_SUFFIX_RE = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
+
+
+def _validate_governance_date(value: Any) -> datetime | None | Any:
+    """field_validator 模式：非法日期输入直接抛 ValueError。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise ValueError("必须包含显式时区（UTC offset），拒绝 naive datetime")
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or not _ZONE_SUFFIX_RE.search(text):
+            raise ValueError("必须是带显式时区的完整 ISO 8601 字符串（如 2026-01-01T00:00:00+08:00 或 ...Z）")
+        if not re.search(r"\d{2}:\d{2}:\d{2}", text):
+            raise ValueError("必须包含秒级时间（HH:MM:SS），拒绝无秒的日期/时间字符串")
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("不是合法的 ISO 8601 日期时间") from error
+        if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+            raise ValueError("必须包含显式时区（UTC offset），拒绝 naive 时间")
+        return parsed.astimezone(timezone.utc)
+    raise ValueError("只接受带时区的 ISO 8601 字符串或 aware datetime")
+
+
+class _GovernanceDateMixin(BaseModel):
+    last_reviewed_at: datetime | None = None
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+
+    # mode="before" 很关键：必须在 Pydantic 宽松解析（数字时间戳、无秒、naive）
+    # 之前拿到原始输入，否则非法值已经被转成 datetime 而无法拒绝。
+    @field_validator("last_reviewed_at", "valid_from", "valid_until", mode="before")
+    @classmethod
+    def _strict_date(cls, value: Any) -> datetime | None:
+        return _validate_governance_date(value)
+
+
+class DocumentGovernanceUpdate(_GovernanceDateMixin):
+    """PATCH /documents/{id}/governance 的请求体。
+
+    契约：拒绝额外字段；``maintainer``/``enabled`` 不接受 null（显式 null 拒绝，
+    omitted 才是"不变"）；时间字段显式时区 ISO 或 aware datetime 或 null（清除）；
+    数字/数字字符串/naive/无秒/坏日期一律拒绝；空补丁（无任何可变字段）拒绝。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(strict=True, ge=0)
+    # 默认 None 只表示"未提供"；显式 null 由下面的 before 校验器直接拒绝，
+    # 因此业务层读到 None 时可能对应"未提供"，必须以 model_fields_set 判断。
+    maintainer: Annotated[str | None, Field(strict=True, max_length=200)] = None
+    enabled: Annotated[bool | None, Field(strict=True)] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_explicit_null(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "maintainer" in data and data["maintainer"] is None:
+                raise ValueError("maintainer 不接受 null；清除请省略该字段")
+            if "enabled" in data and data["enabled"] is None:
+                raise ValueError("enabled 不接受 null；清除请省略该字段")
+        return data
+
+    @model_validator(mode="after")
+    def _reject_empty_patch(self) -> "DocumentGovernanceUpdate":
+        # 按"显式出现"判空：日期显式 null 是合法的清除意图，不能和非 None 混为一谈。
+        provided = self.model_fields_set & set(self.changed_field_names())
+        if not provided:
+            raise ValueError("空补丁：至少提供一个可变字段")
+        return self
+
+    @staticmethod
+    def changed_field_names() -> tuple[str, ...]:
+        return ("maintainer", "last_reviewed_at", "valid_from", "valid_until", "enabled")
+
+    def changed_fields(self) -> dict[str, Any]:
+        """把"omitted 与显式提供"区分开：omitted 字段不出现在结果里。
+
+        显式 null 的日期会以 ``None`` 出现在结果中（表示清除）；``exclude_unset``
+        语义与 ``model_fields_set`` 一致。
+        """
+        return {
+            name: getattr(self, name)
+            for name in self.changed_field_names()
+            if name in self.model_fields_set
+        }
+
+
+class DocumentSupersedeRequest(BaseModel):
+    """POST /documents/{id}/supersede 请求体。
+
+    ``comparison_fingerprint`` 可选：来自差异预览的 64 位小写十六进制指纹，
+    仅用于检测预览后资料是否变化；不传时保持原有替代行为。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(strict=True, ge=0)
+    replacement_document_id: uuid.UUID
+    comparison_fingerprint: Annotated[
+        str | None, Field(strict=True, pattern=r"^[a-f0-9]{64}$")
+    ] = None
+
+
+class DocumentReenableRequest(BaseModel):
+    """POST /documents/{id}/reenable 请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(strict=True, ge=0)
 
 
 class DocumentUploadRead(DocumentRead):

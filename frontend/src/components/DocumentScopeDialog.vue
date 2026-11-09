@@ -23,7 +23,7 @@
           <button
             type="button"
             class="scope-remove"
-            :disabled="saving"
+            :disabled="saving || confirming"
             :aria-label="t('chat.scope.removeAria', { name: item.filename })"
             @click="removeSelected(item.document_id)"
           >
@@ -50,7 +50,7 @@
           <el-checkbox
             class="scope-checkbox"
             :model-value="isSelected(doc.id)"
-            :disabled="saving || (selection.length >= max && !isSelected(doc.id))"
+            :disabled="saving || confirming || (selection.length >= max && !isSelected(doc.id))"
             @change="toggleDoc(doc)"
           >
             <span :title="doc.filename">{{ doc.filename }}</span>
@@ -61,7 +61,7 @@
       <p v-if="limitWarning" class="scope-limit" role="alert">{{ t('chat.scope.dialog.limit', { max }) }}</p>
       <div v-if="hasMore" class="scope-load-more">
         <span>{{ t('chat.scope.dialog.loadedCount', { loaded: readyDocs.length, total }) }}</span>
-        <el-button size="small" :loading="loading" :disabled="saving" @click="loadMore">{{ t('chat.scope.dialog.loadMore') }}</el-button>
+        <el-button size="small" :loading="loading" :disabled="saving || confirming" @click="loadMore">{{ t('chat.scope.dialog.loadMore') }}</el-button>
       </div>
     </section>
 
@@ -72,7 +72,7 @@
         <span class="scope-dialog-count">{{ t('chat.scope.dialog.selectedCount', { count: selection.length, max }) }}</span>
         <div class="scope-dialog-buttons">
           <el-button :disabled="saving" @click="close">{{ t('chat.scope.dialog.cancel') }}</el-button>
-          <el-button type="primary" :loading="saving" @click="confirm">{{ t('chat.scope.dialog.confirm') }}</el-button>
+          <el-button type="primary" :loading="saving || confirming" :disabled="confirming" @click="confirm">{{ t('chat.scope.dialog.confirm') }}</el-button>
         </div>
       </div>
     </template>
@@ -80,14 +80,24 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { docApi, type DocumentItem } from '@/api'
 import {
+  MAX_SCOPE_DOCUMENTS,
   scopeItemFromDocument,
   toggleDocumentId,
   type DocumentScopeItem
 } from '@/utils/documentScope'
+import {
+  createScopeConfirmController,
+  createScopeDetailFetcher,
+  createScopeLoadGuard,
+  hasMoreScopePages,
+  mergeScopeListPage,
+  resolveSelectedIndexVersion,
+  type ScopeConfirmOutcome
+} from '@/utils/documentList'
 
 const props = defineProps<{
   modelValue: boolean
@@ -109,6 +119,8 @@ const { t } = useI18n()
 const PAGE_SIZE = 20
 
 const selection = ref<DocumentScopeItem[]>([])
+// 打开时继承、且用户尚未移除的旧选择：沿用原代次；移除后再选才绑定当前代次
+const keptSelectionIds = ref<Set<string>>(new Set())
 const readyDocs = ref<DocumentItem[]>([])
 const page = ref(0)
 const total = ref(0)
@@ -117,14 +129,47 @@ const loading = ref(false)
 const loadError = ref('')
 const limitWarning = ref(false)
 let loadGeneration = 0
+// 卸载后所有在途响应都必须作废（不能写入已卸载组件的 ref）
+let disposed = false
+// 确认前详情复核的代次：关闭/切 KB 后迟到的详情响应不能影响新一次确认
+let confirmGeneration = 0
+// 本次确认发起的 KB：详情必须属于同一个 KB，切换后迟到的响应一律作废
+let confirmKbId = ''
+const confirming = ref(false)
+// 列表会话身份：重开/切 KB/关闭/卸载时换 token，迟到的旧列表响应作废
+const loadGuard = createScopeLoadGuard()
+// 详情取数器：绑定发起确认时的 KB，请求前后都校验"仍打开 + 同一 KB"
+const fetchScopeDetail = createScopeDetailFetcher({
+  kbId: () => confirmKbId,
+  isKbCurrent: (kbId: string) =>
+    !disposed && props.modelValue && kbId === props.kbId && confirmKbId === kbId,
+  fetch: async (kbId: string, documentId: string) => {
+    const { data } = await docApi.get(kbId, documentId)
+    return data
+  }
+})
+// confirm 控制器：一次只允许一个在途确认，关闭即 invalidate
+const confirmController = createScopeConfirmController({ getDetail: fetchScopeDetail })
+
+/** 生效上限：后端契约固定 5；props.max 非法或更大都不放宽。 */
+const effectiveMax = computed(() =>
+  typeof props.max === 'number' && Number.isInteger(props.max) && props.max >= 0
+    ? Math.min(props.max, MAX_SCOPE_DOCUMENTS)
+    : MAX_SCOPE_DOCUMENTS
+)
 
 const hasMore = computed(() =>
-  !loading.value && lastPageSize.value >= PAGE_SIZE && readyDocs.value.length < total.value
+  hasMoreScopePages(lastPageSize.value, readyDocs.value.length, total.value, PAGE_SIZE, loading.value)
 )
 
 function resetState() {
   loadGeneration += 1
+  confirmGeneration += 1
+  confirmKbId = ''
+  confirmController.invalidate()
+  loadGuard.reset()
   selection.value = props.selected.map((item) => ({ ...item }))
+  keptSelectionIds.value = new Set(props.selected.map((item) => item.document_id))
   readyDocs.value = []
   page.value = 0
   total.value = 0
@@ -132,32 +177,42 @@ function resetState() {
   loading.value = false
   loadError.value = ''
   limitWarning.value = false
+  confirming.value = false
 }
 
 async function loadPage(reset: boolean) {
   if (!props.kbId) return
   if (loading.value) return
   const generation = reset ? ++loadGeneration : loadGeneration
+  const token = loadGuard.begin(reset)
+  const kb = props.kbId
   const nextPage = reset ? 1 : page.value + 1
   loading.value = true
   loadError.value = ''
   try {
-    const { data } = await docApi.list(props.kbId, { page: nextPage, page_size: PAGE_SIZE, status: 'ready' })
-    if (generation !== loadGeneration) return
-    const items = Array.isArray(data?.items)
-      ? data.items.filter((doc): doc is DocumentItem => !!doc && doc.status === 'ready' && typeof doc.id === 'string')
-      : []
-    const existing = reset ? [] : readyDocs.value
-    const seen = new Set(existing.map((doc) => doc.id))
-    readyDocs.value = [...existing, ...items.filter((doc) => !seen.has(doc.id))]
+    // 服务端已用治理谓词过滤（retrievable_only=true 在 count/limit 前生效），
+    // total 与页长都是服务端真实值，不用客户端估算或静默截断。
+    const { data } = await docApi.list(kb, {
+      page: nextPage,
+      page_size: PAGE_SIZE,
+      status: 'ready',
+      retrievable_only: true
+    })
+    // 绑定发起时的 KB 与会话代次：关闭/切 KB/卸载后的迟到响应直接丢弃
+    if (disposed || !loadGuard.isCurrent(token) || kb !== props.kbId) return
+    // 统一走纯合并：原始页长决定分页，本地过滤只影响展示
+    const merged = mergeScopeListPage(reset ? [] : readyDocs.value, data)
+    readyDocs.value = merged.docs as unknown as DocumentItem[]
     page.value = nextPage
-    lastPageSize.value = items.length
-    const reported = typeof data?.total === 'number' && Number.isFinite(data.total) ? Math.trunc(data.total) : 0
-    total.value = Math.max(0, reported, readyDocs.value.length)
+    lastPageSize.value = merged.lastPageSize
+    total.value = merged.total
   } catch (err: any) {
-    if (generation === loadGeneration) loadError.value = err?.message || t('chat.scope.dialog.loadFailed')
+    if (!disposed && loadGuard.isCurrent(token) && kb === props.kbId) {
+      loadError.value = err?.message || t('chat.scope.dialog.loadFailed')
+    }
   } finally {
-    if (generation === loadGeneration) loading.value = false
+    // 旧会话的 finally 不能清掉新会话的 busy
+    if (!disposed && loadGuard.isCurrent(token) && kb === props.kbId) loading.value = false
   }
 }
 
@@ -171,11 +226,12 @@ function isSelected(documentId: string) {
 }
 
 function toggleDoc(doc: DocumentItem) {
-  if (props.saving) return
+  if (props.saving || confirming.value) return
+  // 上限用对话框契约的 max（≤5）；确认控制器里再做一次严格校验兜底
   const { ids, rejected } = toggleDocumentId(
     selection.value.map((item) => item.document_id),
     doc.id,
-    props.max
+    effectiveMax.value
   )
   if (rejected) {
     limitWarning.value = true
@@ -183,20 +239,34 @@ function toggleDoc(doc: DocumentItem) {
   }
   limitWarning.value = false
   if (!ids.includes(doc.id)) {
+    // 主动移除：之后再选同一篇才允许绑定当前代次（旧选择不静默升级）
     selection.value = selection.value.filter((item) => item.document_id !== doc.id)
+    keptSelectionIds.value = new Set([...keptSelectionIds.value].filter((id) => id !== doc.id))
     return
   }
-  const item = scopeItemFromDocument(doc.id, doc.filename, props.selected.find((entry) => entry.document_id === doc.id)?.index_version)
+  // 保留的旧选择沿用其原代次（即使 props.selected 缺省为 0 也不升级）；
+  // 只有从列表新选（或移除后重选）才用列表返回的当前 index_version。
+  // 任一侧代次非法：拒绝这次选择，不退化成 0。
+  const prior = props.selected.find((entry) => entry.document_id === doc.id)
+  const version = resolveSelectedIndexVersion(
+    keptSelectionIds.value.has(doc.id),
+    prior?.index_version,
+    doc.index_version
+  )
+  const item = version === null ? null : scopeItemFromDocument(doc.id, doc.filename, version)
   if (item) selection.value = [...selection.value, item]
 }
 
 function removeSelected(documentId: string) {
-  if (props.saving) return
+  if (props.saving || confirming.value) return
   limitWarning.value = false
   selection.value = selection.value.filter((item) => item.document_id !== documentId)
+  // 从"已选列表"移除也算主动移除：再选同一篇必须绑定当前代次
+  keptSelectionIds.value = new Set([...keptSelectionIds.value].filter((id) => id !== documentId))
 }
 
 function loadMore() {
+  if (confirming.value) return
   void loadPage(false)
 }
 
@@ -204,39 +274,123 @@ function retryLoad() {
   void loadPage(readyDocs.value.length === 0)
 }
 
-function confirm() {
-  if (props.saving) return
-  emit('confirm', selection.value.map((item) => ({ ...item })))
+/** 确认前逐项重取详情：检查 retrievable 与选中时的 index_version。 */
+async function confirm() {
+  if (!props.modelValue) return
+  if (props.saving || confirming.value) return
+  if (!selection.value.length) {
+    emit('confirm', [])
+    return
+  }
+  confirming.value = true
+  const generation = ++confirmGeneration
+  const kb = props.kbId
+  confirmKbId = kb
+  const selected = selection.value.map((item) => ({ ...item }))
+  let outcome: ScopeConfirmOutcome | null = null
+  try {
+    outcome = await confirmController.confirm(selected, effectiveMax.value)
+  } catch {
+    outcome = null
+  }
+  // 迟到的结果只有在"同一代次 + 仍打开 + 仍是同一个 KB + 未卸载"时才允许落地
+  if (generation !== confirmGeneration || !props.modelValue || kb !== props.kbId || disposed) return
+  try {
+    if (outcome?.status === 'confirmed') {
+      loadError.value = ''
+      limitWarning.value = false
+      emit('confirm', outcome.items)
+    } else if (outcome?.status === 'notRetrievable' && outcome.documentId) {
+      limitWarning.value = false
+      loadError.value = t('chat.scope.dialog.freshNotRetrievable')
+    } else if (outcome?.status === 'versionChanged') {
+      limitWarning.value = false
+      loadError.value = t('chat.scope.dialog.freshVersionChanged')
+    } else if (outcome?.status === 'insufficientChecks') {
+      // 不能只核验一部分就确认：明确提示不可用，让用户重试/减少选择
+      limitWarning.value = false
+      loadError.value = t('chat.scope.dialog.freshChecksIncomplete')
+    } else if (outcome?.status === 'invalidSelection') {
+      limitWarning.value = false
+      loadError.value = t('chat.scope.dialog.freshUnavailable')
+    } else if (outcome === null || outcome?.status === 'detailMissing' || outcome?.status === 'invalidated') {
+      // 请求失败/确认被关闭作废：不 emit，提示用户重试
+      limitWarning.value = false
+      loadError.value = outcome?.status === 'invalidated'
+        ? ''
+        : t('chat.scope.dialog.freshUnavailable')
+    }
+  } finally {
+    // 仅当前代次允许清 busy；关闭/重开后旧 finally 不能动新会话
+    if (generation === confirmGeneration && !disposed) confirming.value = false
+  }
 }
 
 function close() {
   if (props.saving) return
+  // 关闭优先于确认：先作废在途请求，再通知父级关窗
+  invalidateAll()
   emit('update:modelValue', false)
 }
 
 function beforeClose(done: () => void) {
   if (props.saving) return
+  // 允许关闭，但必须先作废在途列表/确认请求
+  invalidateAll()
   done()
 }
 
 function onVisibilityChange(value: boolean) {
+  if (!value) invalidateAll()
   emit('update:modelValue', value)
 }
 
-function onClosed() {
+function invalidateAll() {
   loadGeneration += 1
+  confirmGeneration += 1
+  confirmKbId = ''
+  loadGuard.reset()
+  confirmController.invalidate()
+  confirming.value = false
+  loading.value = false
 }
 
+/**
+ * @closed 是异步的：close(new) → close(old) 时，新会话已经开始，
+ * 旧会话迟到的 @closed 绝不能再 invalidate 一次把新会话的加载/确认打掉。
+ * 只有"当前确实未打开"时才作废。
+ */
+function onClosed() {
+  if (props.modelValue) return
+  invalidateAll()
+}
+
+// 同步 flush：props.open / kbId 一变化立刻作废旧请求，不等下一个 tick。
+// 关闭时保留最后一次 open 时的选择快照，不重新初始化 selection。
 watch(() => props.modelValue, (open) => {
-  if (open) openReadyList()
-})
+  if (open) {
+    openReadyList()
+  } else {
+    invalidateAll()
+  }
+}, { flush: 'sync' })
 
-watch(() => props.kbId, () => {
+watch(() => props.kbId, (next, previous) => {
+  if (next === previous) return
+  invalidateAll()
+  // 未打开时只作废旧请求；打开中切库要按新库重开列表
   if (props.modelValue) openReadyList()
-})
+}, { flush: 'sync' })
 
+// 初始打开（首次挂载即 open）走 mounted，避免 setup 阶段就发请求
 onMounted(() => {
   if (props.modelValue) openReadyList()
+})
+
+// 同步在卸载前作废旧请求：onUnmounted 阶段太晚，refs 已不可安全写入
+onBeforeUnmount(() => {
+  disposed = true
+  invalidateAll()
 })
 </script>
 

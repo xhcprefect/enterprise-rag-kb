@@ -8,7 +8,7 @@ from langchain_core.documents import Document as LCDocument
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.core.config import settings
-from app.services import rag
+from app.services import answer_sources, rag
 from app.services.context_window import ContextBudgetError, estimate_message_tokens, estimate_tokens
 from app.services.conversation_memory import assemble_recall
 
@@ -18,7 +18,8 @@ def history(turns=4):
     for index in range(turns):
         result.extend([
             {"role": "user", "content": f"第{index}轮：盗窃罪如何量刑？", "id": f"q{index}"},
-            {"role": "assistant", "content": f"第{index}轮历史说明[3]。" * 20, "id": f"a{index}", "citations": [{"source_index": 3}]},
+            {"role": "assistant", "content": f"第{index}轮历史说明[3]。" * 20, "id": f"a{index}", "citations": [{"source_index": 3}],
+             "source_provenance": {"source_snapshot_version": 1, "supplied_sources": [], "history_sources": []}},
         ])
     return result
 
@@ -131,6 +132,55 @@ class ContextPromptTests(unittest.TestCase):
         self.assertEqual(citation["source_index"], 1)
         self.assertEqual(citation["index_version"], 2)
         self.assertIsNone(citation["score"])
+
+    def test_history_provenance_comes_only_from_the_final_retained_turns(self):
+        a = {"document_id": str(uuid.uuid4()), "index_version": 0, "chunk_index": 0}
+        b = {"document_id": str(uuid.uuid4()), "index_version": 0, "chunk_index": 0}
+        previous = []
+        for name, source in (("旧", a), ("近", b)):
+            previous.extend([
+                {"role": "user", "content": name + "问题"},
+                {"role": "assistant", "content": name + "回答", "source_provenance": {
+                    "source_snapshot_version": 1, "supplied_sources": [source], "history_sources": []}},
+            ])
+        before = copy.deepcopy(previous)
+        with patch.object(settings, "HISTORY_MAX_TURNS", 1):
+            prepared = rag.prepare_answer("本轮独立问题", [], previous)
+        self.assertEqual([source["document_id"] for source in prepared.history_sources], [b["document_id"]])
+        self.assertFalse(any("旧回答" in message.content for message in prepared.messages))
+        self.assertTrue(any("近回答" in message.content for message in prepared.messages))
+        prepared.history_sources[0]["index_version"] = 9
+        self.assertEqual(previous, before)
+
+    def test_budgeted_history_keeps_transitive_uncited_sources(self):
+        a = {"document_id": str(uuid.uuid4()), "index_version": 2, "chunk_index": 0}
+        b = {"document_id": str(uuid.uuid4()), "index_version": 3, "chunk_index": 1}
+        previous = [{"role": "user", "content": "旧问题"}, {"role": "assistant", "content": "回答[1]。",
+            "citations": [{**a, "source_index": 1}], "source_provenance": {
+                "source_snapshot_version": 1, "supplied_sources": [a], "history_sources": [b]}}]
+        prepared = rag.prepare_answer("本轮问题", [], previous)
+        self.assertEqual({source["document_id"] for source in prepared.history_sources},
+                         {a["document_id"], b["document_id"]})
+
+    def test_final_source_identity_tracks_anchor_fallback_and_budget_exclusions(self):
+        doc_id = str(uuid.uuid4())
+        doc = LCDocument(page_content="相邻内容" * 20000, metadata={
+            "document_id": doc_id, "filename": "a.txt", "index_version": 4,
+            "chunk_index": 1, "chunk_start": 0, "chunk_end": 2,
+            "_anchor_content": "命中原文", "_anchor_location": {"page_start": 2, "page_end": 2}})
+        with patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 4096), \
+             patch.object(settings, "LLM_MAX_OUTPUT_TOKENS", 128), patch.object(settings, "CONTEXT_TOKEN_SAFETY_MARGIN", 64):
+            prepared = rag.prepare_answer("问题", [(doc, 0.2)], [])
+        final = answer_sources.sources_from_pairs(prepared.pairs)
+        self.assertEqual((final[0]["chunk_start"], final[0]["chunk_end"]), (1, 1))
+        self.assertEqual(final[0]["index_version"], 4)
+        self.assertEqual(doc.metadata["chunk_start"], 0)
+
+    def test_prepared_answer_keeps_four_positional_arguments_compatible(self):
+        first = rag.PreparedAnswer([], [], 0, 100)
+        second = rag.PreparedAnswer([], [], 0, 100)
+        first.history_sources.append({"sentinel": True})
+        self.assertEqual(second.history_sources, [])
 
     def test_ollama_uses_the_same_configured_context_window_as_the_budget(self):
         with patch.object(settings, "LLM_PROVIDER", "ollama"), patch.object(settings, "LLM_CONTEXT_WINDOW_TOKENS", 16384), \

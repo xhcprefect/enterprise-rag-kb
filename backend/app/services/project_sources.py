@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import select
@@ -26,7 +26,11 @@ from app.models import (
     ProjectSource,
     User,
 )
-from app.schemas.project import ProjectSourceRead
+from app.schemas.project import (
+    AUTO_SYNC_MAX_INTERVAL_SECONDS,
+    AUTO_SYNC_MIN_INTERVAL_SECONDS,
+    ProjectSourceRead,
+)
 from app.services.project_paths import (
     ProjectPathError,
     RootAnchor,
@@ -46,6 +50,20 @@ class ProjectSourceRevoked(Exception):
 
 class ProjectRootError(ProjectPathError):
     """授权根绑定/子树校验失败（缺映射、换树、含链接组件等）。"""
+
+
+class AutoSyncDisabled(Exception):
+    """内部自动调度在源行锁内发现“自动同步已被关闭”。
+
+    领取到期源与真正入队之间存在窗口；管理员可能在窗口内关闭自动同步。入队
+    必须在**同一源行锁事务**内重新核验开关，关闭时抛出本异常由调度器静默跳过，
+    绝不新建 auto 快照、不误报入队失败。
+    """
+
+
+# 关闭自动同步时取消其活动任务的稳定错误码与固定安全消息。
+AUTO_SYNC_CANCELLED_CODE = "cancelled-auto-disabled"
+AUTO_SYNC_CANCELLED_MESSAGE = "自动同步已关闭，任务取消"
 
 
 def _source_root_path(root_key: str, relative_dir: str) -> Path:
@@ -195,6 +213,12 @@ def source_to_read(source: ProjectSource) -> ProjectSourceRead:
         relative_dir=source.relative_dir,
         active_snapshot_id=source.active_snapshot_id,
         revoked_at=source.revoked_at,
+        auto_sync_enabled=source.auto_sync_enabled,
+        auto_sync_interval_seconds=source.auto_sync_interval_seconds,
+        auto_sync_next_check_at=source.auto_sync_next_check_at,
+        auto_sync_last_checked_at=source.auto_sync_last_checked_at,
+        auto_sync_last_error_code=source.auto_sync_last_error_code,
+        auto_sync_last_error_message=source.auto_sync_last_error_message,
         created_at=source.created_at,
     )
 
@@ -244,20 +268,67 @@ def list_visible_sources(db: DBSession, user: User) -> list[ProjectSource]:
     return list(db.scalars(stmt).all())
 
 
-def _cancel_active_job(db: DBSession, source_id: uuid.UUID) -> None:
-    """取消源上所有 pending/processing 快照（释放租约，交由 worker 回收）。"""
-    active = db.scalars(
-        select(ProjectSnapshot)
-        .where(
-            ProjectSnapshot.source_id == source_id,
-            ProjectSnapshot.status.in_(
-                [
-                    ProjectSnapshotStatus.PENDING.value,
-                    ProjectSnapshotStatus.PROCESSING.value,
-                ]
-            ),
-        )
+def _lock_kb_row(db: DBSession, kb_id: uuid.UUID) -> KnowledgeBase | None:
+    """锁锁序里的第一个资源根：KnowledgeBase（``FOR UPDATE`` + 强制重读）。"""
+    return db.execute(
+        select(KnowledgeBase)
+        .where(KnowledgeBase.id == kb_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+
+
+def _lock_source_row(db: DBSession, source_id: uuid.UUID) -> ProjectSource | None:
+    """按全库统一锁序 ``KnowledgeBase -> ProjectSource`` 取得源的**新鲜**行。
+
+    调用方传来的 ``ProjectSource`` 可能来自事务外/identify map，绝不能用它做判断
+    或写回。这里先只读取出 ``kb_id``（仅用于确定先锁哪一行），锁住 KB 后再
+    ``FOR UPDATE + populate_existing`` 重读源行并复核 kb_id 未变；任何一步缺失都
+    返回 None（由调用方按各自语义处理，绝不冒用旧 ORM 数据）。
+    """
+    kb_id = db.scalar(select(ProjectSource.kb_id).where(ProjectSource.id == source_id))
+    if kb_id is None:
+        return None
+    if _lock_kb_row(db, kb_id) is None:
+        return None
+    source = db.execute(
+        select(ProjectSource)
+        .where(ProjectSource.id == source_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if source is None or source.kb_id != kb_id:
+        return None
+    return source
+
+
+def _cancel_active_job(
+    db: DBSession,
+    source_id: uuid.UUID,
+    *,
+    trigger_source: str | None = None,
+    error_code: str = "cancelled-revoked",
+    error_message: str = "源已删除/撤销，任务取消",
+) -> None:
+    """取消源上所有 pending/processing 快照（释放租约，交由 worker 回收）。
+
+    必须在 Source 行锁已持后调用；快照按 UUID 排序加锁（与全库统一类内顺序一致），
+    ``now`` 只等锁之后取。``trigger_source`` 非空时只取消该来源的活动任务（用于
+    关闭自动同步：只取消 auto 任务，绝不误取消手动任务）。
+    """
+    stmt = select(ProjectSnapshot).where(
+        ProjectSnapshot.source_id == source_id,
+        ProjectSnapshot.status.in_(
+            [
+                ProjectSnapshotStatus.PENDING.value,
+                ProjectSnapshotStatus.PROCESSING.value,
+            ]
+        ),
+    )
+    if trigger_source is not None:
+        stmt = stmt.where(ProjectSnapshot.trigger_source == trigger_source)
+    active = db.scalars(
+        stmt.order_by(ProjectSnapshot.id).with_for_update()
     ).all()
     now = datetime.now(timezone.utc)
     for snap in active:
@@ -266,28 +337,50 @@ def _cancel_active_job(db: DBSession, source_id: uuid.UUID) -> None:
         snap.lease_id = None
         snap.heartbeat_at = None
         snap.finished_at = now
-        snap.error_code = "cancelled-revoked"
-        snap.error_message = "源已删除/撤销，任务取消"
+        snap.error_code = error_code
+        snap.error_message = error_message
         snap.progress = snap.progress
         db.flush()
 
 
-def revoke_source(db: DBSession, source: ProjectSource) -> None:
+def revoke_source(db: DBSession, source: ProjectSource) -> ProjectSource | None:
     """软删除源：先 revoke + 取消活跃任务，再让授权读取返回 410。
 
     不删除原目录、不自动 GC、不硬删快照（旧会话/引用仍有效）。
+
+    调用方传入的 ``source`` 可能来自无锁 ``db.get``（API 鉴权路径），因此这里**不
+    使用它的字段做决策**：按全库统一锁序 ``KnowledgeBase -> ProjectSource ->
+    ProjectSnapshot`` 重新加锁并强制重读，任何写入都基于锁后行的最新值。并发删除
+    后源已不存在时返回 None（调用方语义仍视为已撤销）。
     """
-    source.revoked_at = datetime.now(timezone.utc)
-    _cancel_active_job(db, source.id)
+    locked = _lock_source_row(db, source.id)
+    if locked is None:
+        return None
+    if locked.revoked_at is None:
+        # 等锁后才取时钟：排队期间的时间不算进撤销时刻。
+        locked.revoked_at = datetime.now(timezone.utc)
+    _cancel_active_job(db, locked.id)
     db.flush()
+    return locked
 
 
 def revoke_source_by_kb(db: DBSession, kb_id: uuid.UUID) -> None:
-    """知识库删除的一致性路径：软撤销对应源（若存在），不级联硬删快照。"""
-    source = db.scalar(select(ProjectSource).where(ProjectSource.kb_id == kb_id))
-    if source is not None and source.revoked_at is None:
-        revoke_source(db, source)
-        db.flush()
+    """知识库删除的一致性路径：软撤销对应源（若存在），不级联硬删快照。
+
+    锁序同样从 KB 开始（调用方 delete_kb 已持该 KB 锁，重复加锁在同一事务内是
+    无操作），再锁源、再按 UUID 顺序锁活跃快照。
+    """
+    if _lock_kb_row(db, kb_id) is None:
+        return
+    source_id = db.scalar(select(ProjectSource.id).where(ProjectSource.kb_id == kb_id))
+    if source_id is None:
+        return
+    locked = _lock_source_row(db, source_id)
+    if locked is None or locked.revoked_at is not None:
+        return
+    locked.revoked_at = datetime.now(timezone.utc)
+    _cancel_active_job(db, locked.id)
+    db.flush()
 
 
 def cancel_active_snapshot(db: DBSession, source: ProjectSource) -> ProjectSnapshot | None:
@@ -297,15 +390,23 @@ def cancel_active_snapshot(db: DBSession, source: ProjectSource) -> ProjectSnaps
     - processing（持租约）：只置 cancel_requested=True，由 worker 心跳观察到
       cancel_requested 后合作转为 cancelled（保留 lease 完整性，不混停机回退）。
     返回被标记的快照（无活动任务时返回 None）。源须已由调用方鉴权。
+
+    与 revoke 相同：调用方传入的源对象不作为写入依据，入口先按统一锁序
+    ``KnowledgeBase -> ProjectSource -> ProjectSnapshot(UUID 序)`` 取得新鲜行；
+    源已消失/已撤销时返回 None（API 层按"没有活动任务"处理）。
     """
+    locked = _lock_source_row(db, source.id)
+    if locked is None or locked.revoked_at is not None:
+        return None
     active = db.scalars(
         select(ProjectSnapshot)
         .where(
-            ProjectSnapshot.source_id == source.id,
+            ProjectSnapshot.source_id == locked.id,
             ProjectSnapshot.status.in_(
                 [ProjectSnapshotStatus.PENDING.value, ProjectSnapshotStatus.PROCESSING.value]
             ),
         )
+        .order_by(ProjectSnapshot.id)
         .with_for_update()
     ).all()
     now = datetime.now(timezone.utc)
@@ -322,3 +423,59 @@ def cancel_active_snapshot(db: DBSession, source: ProjectSource) -> ProjectSnaps
             snap.error_message = "已取消"
     db.flush()
     return target
+
+
+def update_auto_sync(
+    db: DBSession,
+    source_id: uuid.UUID,
+    *,
+    enabled: bool,
+    interval_seconds: int,
+) -> ProjectSource:
+    """管理员开关/调整定时自动同步（复用源行锁取得新鲜行）。
+
+    语义（冻结契约）：
+    - 启用时 ``next_check_at = now``（立即纳入下一轮调度）；
+    - 已启用且间隔变化时 ``next_check_at = now + interval``；
+    - 禁用时清空 ``next_check_at`` 与最近错误，并**只取消 trigger_source='auto'**
+      的 pending/processing 快照（已 ready/unchanged/failed 的终态绝不动，手动
+      任务也绝不误取消）。
+    源不存在 -> ``ProjectSourceNotFound``；已撤销 -> ``ProjectSourceRevoked``。
+    """
+    interval = int(interval_seconds)
+    if not AUTO_SYNC_MIN_INTERVAL_SECONDS <= interval <= AUTO_SYNC_MAX_INTERVAL_SECONDS:
+        raise ValueError(
+            f"自动同步间隔必须在 {AUTO_SYNC_MIN_INTERVAL_SECONDS}~"
+            f"{AUTO_SYNC_MAX_INTERVAL_SECONDS} 秒之间"
+        )
+    locked = _lock_source_row(db, source_id)
+    if locked is None:
+        raise ProjectSourceNotFound()
+    if locked.revoked_at is not None:
+        raise ProjectSourceRevoked()
+
+    was_enabled = bool(locked.auto_sync_enabled)
+    previous_interval = int(locked.auto_sync_interval_seconds or 0)
+    now = datetime.now(timezone.utc)
+    locked.auto_sync_interval_seconds = interval
+    if enabled:
+        locked.auto_sync_enabled = True
+        if not was_enabled:
+            locked.auto_sync_next_check_at = now
+        elif interval != previous_interval or locked.auto_sync_next_check_at is None:
+            locked.auto_sync_next_check_at = now + timedelta(seconds=interval)
+    else:
+        locked.auto_sync_enabled = False
+        locked.auto_sync_next_check_at = None
+        locked.auto_sync_last_error_code = None
+        locked.auto_sync_last_error_message = None
+        # 只取消自动触发的活动任务；manual 任务保持原状。
+        _cancel_active_job(
+            db,
+            locked.id,
+            trigger_source="auto",
+            error_code=AUTO_SYNC_CANCELLED_CODE,
+            error_message=AUTO_SYNC_CANCELLED_MESSAGE,
+        )
+    db.flush()
+    return locked

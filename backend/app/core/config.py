@@ -162,6 +162,9 @@ class Settings(BaseSettings):
     PROJECT_POLL_SECONDS: float = Field(default=2.0, gt=0, le=120)
     PROJECT_STALE_SECONDS: int = Field(default=300, ge=3, le=86400)
     PROJECT_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=20)
+    # 自动同步安静窗口秒数：纳入索引的文件在最近 N 秒内被修改则延后重试，
+    # 避免编辑器分步保存的半成品被立即发布；0 表示关闭去抖。
+    PROJECT_AUTO_SYNC_QUIET_SECONDS: int = Field(default=10, ge=0, le=3600)
     # 项目 KB 的向量 collection 前缀；同一源/配置共享，跨配置不误复用。
     PROJECT_VECTOR_PREFIX: str = "proj_"
 

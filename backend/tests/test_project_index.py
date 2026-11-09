@@ -19,7 +19,9 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
+from app.core.config import settings
 from app.models import (
     KNOWLEDGE_BASE_KIND_PROJECT,
     ProjectChunk,
@@ -28,11 +30,18 @@ from app.models import (
 )
 from app.models import ProjectSnapshot
 from app.services.project_index import (
+    AUTO_FAILED_CODE,
+    AUTO_EMPTY_CODE,
+    AUTO_EMPTY_MESSAGE,
+    AUTO_UNCHANGED_CODE,
+    EMBEDDING_DIM,
     _build_chunks,
     _fresh_lease,
+    _hex,
     _map_parse_status,
     _parse_in_subprocess,
     _read_blob_verified,
+    _safe_auto_error_code,
     _vector_documents,
     compute_chunker_fingerprint,
     compute_config_fingerprint,
@@ -89,6 +98,69 @@ class FingerprintsTest(unittest.TestCase):
         rev = manifest_fingerprint(list(reversed(entries)))
         self.assertEqual(fwd, rev)
         self.assertEqual(len(fwd), 64)
+
+
+class EmbeddingFingerprintProviderTest(unittest.TestCase):
+    """embedding 指纹的基址分支必须与 ``vector_store.get_embeddings`` 一致。
+
+    回归：旧实现用 ``provider == "local"`` 选 OLLAMA_BASE_URL，而默认 provider
+    是 ``"ollama"``，会错误使用云端基址；自动同步的 unchanged 判定依赖该指纹。
+    """
+
+    OLLAMA = "http://ollama.local:11434"
+    CLOUD = "https://cloud.example.invalid/v1"
+
+    def _fingerprint(self, provider: str) -> str:
+        with (
+            patch.object(settings, "EMBEDDING_PROVIDER", provider),
+            patch.object(settings, "EMBEDDING_MODEL", "model-x"),
+            patch.object(settings, "OLLAMA_BASE_URL", self.OLLAMA),
+            patch.object(settings, "EMBEDDING_BASE_URL", self.CLOUD),
+        ):
+            return compute_embedding_fingerprint()
+
+    def _expected(self, provider: str, base: str) -> str:
+        return _hex(["embedding", provider, "model-x", base, str(EMBEDDING_DIM)])
+
+    def test_cloud_provider_uses_cloud_base_url(self) -> None:
+        self.assertEqual(self._fingerprint("cloud"), self._expected("cloud", self.CLOUD))
+
+    def test_non_cloud_providers_use_ollama_base_url(self) -> None:
+        # get_embeddings 只有 provider == "cloud" 走云端，其余（含 ollama/local）
+        # 一律是 Ollama；指纹必须完全一致。
+        for provider in ("ollama", "local", "anything-else"):
+            with self.subTest(provider=provider):
+                self.assertEqual(
+                    self._fingerprint(provider),
+                    self._expected(provider, self.OLLAMA),
+                )
+
+    def test_default_ollama_differs_from_cloud(self) -> None:
+        self.assertNotEqual(self._fingerprint("ollama"), self._fingerprint("cloud"))
+
+
+class SafeAutoErrorCodeTest(unittest.TestCase):
+    """自动同步只记录稳定错误码；路径/正文/未知形态一律收敛为安全通用码。"""
+
+    def test_stable_codes_pass_through(self) -> None:
+        for code in (
+            "sync-error", "parse-error", "root-error", "incomplete",
+            AUTO_EMPTY_CODE, AUTO_UNCHANGED_CODE, "max-attempts",
+        ):
+            with self.subTest(code=code):
+                self.assertEqual(_safe_auto_error_code(code), code)
+
+    def test_paths_content_and_unknown_shapes_collapse(self) -> None:
+        for code in (
+            None, "", "C:\\secret\\project\\a.py", "/abs/path/a.py",
+            "UPPER", "with space", "a" * 65, "含正文内容",
+        ):
+            with self.subTest(code=code):
+                self.assertEqual(_safe_auto_error_code(code), AUTO_FAILED_CODE)
+
+    def test_fixed_auto_messages_are_stable(self) -> None:
+        self.assertEqual(AUTO_EMPTY_CODE, "auto-empty")
+        self.assertEqual(AUTO_EMPTY_MESSAGE, "自动同步得到空清单，已保留当前版本；请手动同步确认")
 
 
 # ---------------- 点 9：有界校验读 ----------------

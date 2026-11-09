@@ -83,8 +83,31 @@ logger = logging.getLogger(__name__)
 
 EMPTY_HEX = "0" * 64
 
+# 自动同步的稳定结果码与固定安全文案（绝不写绝对路径/文件正文）。
+AUTO_UNCHANGED_CODE = "unchanged"
+AUTO_UNCHANGED_MESSAGE = "内容未变化，未发布新版本"
+AUTO_EMPTY_CODE = "auto-empty"
+AUTO_EMPTY_MESSAGE = "自动同步得到空清单，已保留当前版本；请手动同步确认"
+AUTO_FAILED_CODE = "auto-sync-failed"
+AUTO_FAILED_MESSAGE = "自动同步失败，请查看同步历史"
+
+# 稳定错误码白名单形态（仅小写字母/数字/连字符）；其余一律收敛为安全通用码。
+_SAFE_ERROR_CODE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+
 # 单文件最大分块数（硬界）：超过即该文件标注失败（不当作 ready 发布）。
 _MAX_CHUNKS_PER_FILE = 2000
+
+
+class ProjectScanUnstable(ProjectScanError):
+    """扫描结果尚不稳定：纳入文件仍在安静窗口内被写入，自动同步延后重试。
+
+    延后重试**不是失败**：不得写源上的错误字段，也不消耗 ``attempts``。
+    message 只含延迟秒数，绝不含路径/文件名/正文。
+    """
+
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = int(retry_after_seconds)
+        super().__init__(f"文件仍在写入，{self.retry_after_seconds} 秒后重试")
 
 
 # ---------------- 指纹 ----------------
@@ -162,11 +185,19 @@ def compute_chunker_fingerprint() -> str:
 def compute_embedding_fingerprint() -> str:
     """embedding 服务商/模型/实际基址/维度指纹；换配置不得误复用向量。
 
-    点 8：本地（ollama）必须用 OLLAMA_BASE_URL，云端才用 EMBEDDING_BASE_URL。
+    基址分支必须与 ``vector_store.get_embeddings`` 的真实选择一致：
+    仅 ``provider == "cloud"`` 使用 ``EMBEDDING_BASE_URL``，其余（ollama/local
+    及其他值）都走 ``OLLAMA_BASE_URL``。若这里按 ``provider == "local"`` 判断，
+    默认的 ``"ollama"`` 会错误地使用云端基址，导致 unchanged 判定与实际嵌入后端
+    不一致（配置未变却误判不变/变了）。
     """
     provider = str(settings.EMBEDDING_PROVIDER)
     model = str(settings.EMBEDDING_MODEL)
-    base = str(settings.OLLAMA_BASE_URL) if provider == "local" else str(settings.EMBEDDING_BASE_URL)
+    base = (
+        str(settings.EMBEDDING_BASE_URL)
+        if provider == "cloud"
+        else str(settings.OLLAMA_BASE_URL)
+    )
     return _hex(["embedding", provider, model, base, str(EMBEDDING_DIM)])
 
 
@@ -216,7 +247,14 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def enqueue_project_sync(db: DBSession, source_id: uuid.UUID, user: User) -> ProjectSnapshot:
+def enqueue_project_sync(
+    db: DBSession,
+    source_id: uuid.UUID,
+    user: User | None = None,
+    *,
+    trigger_source: str = "manual",
+    require_auto_sync_enabled: bool = False,
+) -> ProjectSnapshot:
     """创建/复用 pending 快照。幂等：已有 pending/processing 则返回原任务。
 
     点 6：**enqueue 自己加锁源行并校验**——绝不留给调用方"去锁 source"再传进来的
@@ -224,6 +262,14 @@ def enqueue_project_sync(db: DBSession, source_id: uuid.UUID, user: User) -> Pro
     事务外/identity map 里已过期的脏对象），锁下校验：管理员、源未撤销、快照原租约
     与状态（处理中即幂等返回原任务，绝不重复建）。统一保持 源行锁 -> 快照行锁 顺序。
     返回需再次 commit 的快照。
+
+    ``user=None`` 供自动调度等可信内部调用使用（不校验管理员）；API 手动同步必须
+    传入真实用户。新建快照记录 ``trigger_source``；复用已有活动任务时**不修改**其
+    trigger_source（手动任务不会因自动调度复用而被改标）。
+
+    ``require_auto_sync_enabled`` 仅限内部自动调度：在同一源行锁内再次核验
+    ``auto_sync_enabled``（领取到期源与入队之间可能被管理员关闭），关闭时抛
+    ``AutoSyncDisabled`` 且绝不建快照。默认 False，手动同步与既有调用行为不变。
     """
     # 源行锁（FOR UPDATE）+ 强制从 DB 重读（populate_existing），一致性锁序在
     # enqueue 内部恒定；绝不依据调用方事务外拿到的陈旧 source 对象。
@@ -237,7 +283,10 @@ def enqueue_project_sync(db: DBSession, source_id: uuid.UUID, user: User) -> Pro
         raise project_sources.ProjectSourceNotFound()
     if source.revoked_at is not None:
         raise project_sources.ProjectSourceRevoked()
-    if not user.is_admin:
+    if require_auto_sync_enabled and not source.auto_sync_enabled:
+        # 调度领取后、真正入队前被关闭：锁内复核，静默放弃（不建 auto 快照）。
+        raise project_sources.AutoSyncDisabled()
+    if user is not None and not user.is_admin:
         raise project_sources.ProjectSourceNotFound()
     # 先修定 base：当前 active（或最近 ready）。行锁保证单写者。
     base_id = source.active_snapshot_id
@@ -271,6 +320,7 @@ def enqueue_project_sync(db: DBSession, source_id: uuid.UUID, user: User) -> Pro
     snap = ProjectSnapshot(
         source_id=source_id,
         status=ProjectSnapshotStatus.PENDING.value,
+        trigger_source=trigger_source,
         base_snapshot_id=base_id,
         attempts=0,
         available_at=_now(),
@@ -319,6 +369,7 @@ def recover_stale_jobs(max_recover: int | None = None) -> int:
     """
     max_recover = max_recover or getattr(settings, "PROJECT_RECOVER_BATCH", 64)
     recovered = 0
+    failed_auto_ids: list[uuid.UUID] = []
     with SessionLocal() as db:
         now = _now()
         stale_ids = db.scalars(
@@ -358,6 +409,8 @@ def recover_stale_jobs(max_recover: int | None = None) -> int:
                 snap.finished_at = _now()
                 snap.error_code = "max-attempts"
                 snap.error_message = "超过最大重试次数"
+                if snap.trigger_source == "auto":
+                    failed_auto_ids.append(snap.id)
             else:
                 snap.status = ProjectSnapshotStatus.PENDING.value
                 snap.lease_id = None
@@ -367,6 +420,10 @@ def recover_stale_jobs(max_recover: int | None = None) -> int:
                 snap.available_at = now + backoff
             recovered += 1
         db.commit()
+    # 恢复扫描把自动任务判为“超过最大重试次数”也是一次终态失败；锁已释放后
+    # 再回写源上的安全错误码，避免在恢复事务内二次开事务/嵌套锁。
+    for snap_id in failed_auto_ids:
+        _record_auto_source_result(snap_id, ProjectSnapshotStatus.FAILED.value)
     return recovered
 
 
@@ -723,6 +780,28 @@ def _scan_for_snapshot(anchor, source_root_fp: str, store: BlobStore) -> ScanRep
     if not report.is_success:
         raise ProjectScanError("扫描未能正常收敛，拒绝发布")
     return report
+
+
+def _auto_stability_retry_seconds(report: ScanReport) -> int | None:
+    """自动同步安静窗口：返回需延后的秒数（None=文件已稳定，可继续）。
+
+    仅看本次**纳入索引**文件的最晚 mtime（同一核验 FD 的 fstat）：距现在不足
+    window 秒说明仍有写入，延后到窗口末尾重试；远未来 mtime（跨机器时钟偏差）
+    直接忽略去抖并告警，避免自动同步被永久饿死。window<=0 表示关闭去抖。
+    """
+    window = int(settings.PROJECT_AUTO_SYNC_QUIET_SECONDS)
+    if window <= 0 or report.newest_mtime_ns is None:
+        return None
+    age_ns = time.time_ns() - report.newest_mtime_ns
+    window_ns = window * 1_000_000_000
+    if age_ns >= window_ns:
+        return None
+    if age_ns <= -window_ns:
+        logger.warning("项目文件 mtime 远在未来，疑似时钟偏差，忽略安静窗口去抖")
+        return None
+    # ceil((window_ns - age_ns) / 1e9)（此时差值恒为正）。
+    remaining = (window_ns - age_ns + 999_999_999) // 1_000_000_000
+    return max(1, min(window, remaining))
 
 
 def _persist_manifest(db: DBSession, snap: ProjectSnapshot, report: ScanReport,
@@ -1422,6 +1501,7 @@ def _run_sync_phases(snapshot_id: uuid.UUID, lease_id: uuid.UUID,
             "created_by": source.created_by,
             "collection_name": kb.collection_name,
             "base_snapshot_id": snap.base_snapshot_id,
+            "trigger_source": snap.trigger_source,
             "has_manifest": snap.manifest_fingerprint is not None,
             "has_any_files": db.scalar(
                 select(ProjectSnapshotFile.snapshot_id).where(
@@ -1434,6 +1514,11 @@ def _run_sync_phases(snapshot_id: uuid.UUID, lease_id: uuid.UUID,
     config_fp = compute_config_fingerprint()
     _ensure_manifest(snapshot_id, lease_id, vals, config_fp, store)
     hb.update(10, _snapshot_count(snapshot_id, lease_id), _snapshot_bytes(snapshot_id, lease_id))
+
+    # 自动同步的短路判定必须在 manifest 落库之后、逐文件解析/嵌入之前：
+    # unchanged 与“空清单保护”都不应消耗解析/嵌入，也绝不推进 active。
+    if _settle_auto_noop(snapshot_id, lease_id):
+        return
 
     version_ids = _list_snapshot_version_ids(snapshot_id, lease_id)
     total = len(version_ids)
@@ -1539,6 +1624,13 @@ def _ensure_manifest(snapshot_id: uuid.UUID, lease_id: uuid.UUID, vals: dict,
 
         # 扫描 + 持久化 manifest（点 5：截断/超限绝不可发布），同一 anchor 全程 pin。
         report = _scan_for_snapshot(anchor, vals["source_root_fingerprint"], store)
+        # 自动同步安静窗口：必须先于 manifest 落库抛出延后信号——否则下次领取
+        # 会因 has_manifest=True 复用本次半成品 manifest 而绕过重扫，把编辑器
+        # 分步保存的中间态直接发布。手动同步（非 auto）完全不受影响。
+        if vals.get("trigger_source") == "auto":
+            retry_after = _auto_stability_retry_seconds(report)
+            if retry_after is not None:
+                raise ProjectScanUnstable(retry_after)
         with SessionLocal() as db:
             pair = _lock_snapshot_source(db, snapshot_id, lease_id)
             if pair is None:
@@ -1547,6 +1639,160 @@ def _ensure_manifest(snapshot_id: uuid.UUID, lease_id: uuid.UUID, vals: dict,
             _persist_manifest(db, snap, report, config_fp, store)
             db.commit()
         return False
+
+
+def _settle_auto_deferred(snapshot_id: uuid.UUID, lease_id: uuid.UUID,
+                          retry_after_seconds: int) -> str | None:
+    """自动同步安静窗口延后：把快照退回 pending，择时重试（不算失败尝试）。
+
+    仅在租约校验通过（仍 processing、持本租约、心跳未过期、未取消）且快照确为
+    auto 时生效：``available_at`` 顺延 retry 秒，清空 lease/heartbeat，
+    ``attempts`` 回退 1（去抖延期不消耗重试预算），也绝不写源上的错误字段。
+    返回 "pending"；租约校验失败/非 auto 时 rollback 并返回 None，由调用方按
+    实际落库状态如实返回。
+    """
+    with SessionLocal() as db:
+        pair = _lock_snapshot_source(db, snapshot_id, lease_id)
+        if pair is None:
+            db.rollback()
+            return None
+        snap, _ = pair
+        if snap.trigger_source != "auto":
+            db.rollback()
+            return None
+        snap.status = ProjectSnapshotStatus.PENDING.value
+        snap.lease_id = None
+        snap.heartbeat_at = None
+        snap.available_at = _now() + timedelta(seconds=int(retry_after_seconds))
+        snap.attempts = max(0, snap.attempts - 1)
+        db.commit()
+        return "pending"
+
+
+def _settle_auto_noop(snapshot_id: uuid.UUID, lease_id: uuid.UUID) -> bool:
+    """自动同步的 unchanged / 空清单保护（短事务，租约条件写）。
+
+    仅在 ``trigger_source == "auto"`` 且本次 ``base_snapshot_id`` 仍是同源、ready、
+    且就是当前 active 时生效：
+
+    - manifest/config 指纹与 base 完全一致 -> ``status=unchanged``（不解析、不嵌入、
+      不 CAS active），返回 True；
+    - 扫描得到 0 个文件而 base 有文件 -> ``status=failed / auto-empty``，保留旧
+      active，返回 True。
+
+    手动同步完全不进入该保护（同内容仍按既有行为正常发布）。
+    """
+    with SessionLocal() as db:
+        pair = _lock_snapshot_source(db, snapshot_id, lease_id)
+        if pair is None:
+            return False
+        snap, source = pair
+        if snap.trigger_source != "auto":
+            db.rollback()
+            return False
+        base = (
+            db.get(ProjectSnapshot, snap.base_snapshot_id)
+            if snap.base_snapshot_id is not None
+            else None
+        )
+        if (
+            base is None
+            or base.source_id != snap.source_id
+            or base.status != ProjectSnapshotStatus.READY.value
+            or source.active_snapshot_id != base.id
+        ):
+            db.rollback()
+            return False
+
+        now = _now()
+        if (
+            snap.manifest_fingerprint is not None
+            and snap.manifest_fingerprint == base.manifest_fingerprint
+            and snap.config_fingerprint == base.config_fingerprint
+        ):
+            # 内容与配置都与当前 active 一致：只记录一次检查，不发布新版本。
+            snap.status = ProjectSnapshotStatus.UNCHANGED.value
+            snap.progress = 100
+            snap.lease_id = None
+            snap.heartbeat_at = None
+            snap.finished_at = now
+            snap.error_code = AUTO_UNCHANGED_CODE
+            snap.error_message = AUTO_UNCHANGED_MESSAGE
+            db.commit()
+            logger.info("自动同步内容未变化，跳过发布 sid=%s", snapshot_id)
+            return True
+
+        if snap.file_count == 0 and base.file_count > 0:
+            # 空清单几乎总是误配置/临时不可见；绝不发布空快照覆盖旧 active。
+            snap.status = ProjectSnapshotStatus.FAILED.value
+            snap.progress = 0
+            snap.lease_id = None
+            snap.heartbeat_at = None
+            snap.finished_at = now
+            snap.error_code = AUTO_EMPTY_CODE
+            snap.error_message = AUTO_EMPTY_MESSAGE
+            db.commit()
+            logger.warning("自动同步得到空清单，保留当前版本 sid=%s", snapshot_id)
+            return True
+
+        db.rollback()
+        return False
+
+
+def _safe_auto_error_code(code: str | None) -> str:
+    """只接受稳定错误码形态；未知/脏字符一律收敛为通用安全码。"""
+    value = str(code) if code is not None else ""
+    if _SAFE_ERROR_CODE.fullmatch(value):
+        return value
+    return AUTO_FAILED_CODE
+
+
+def _record_auto_source_result(snapshot_id: uuid.UUID, status: str) -> None:
+    """自动任务到终态时回写源上的最近结果（只写稳定码与固定安全文案）。
+
+    - ready/unchanged：清空上次错误（成功）；
+    - failed：记录快照稳定 error_code + 固定安全消息（绝不写路径/正文）；
+    - cancelled：不误报成功（保留上次错误不动）；
+    - pending/processing/停止回退：不是终态，不写。
+    本函数任何异常只记日志，绝不影响 worker 主流程或任务返回状态。
+    """
+    if status not in {
+        ProjectSnapshotStatus.READY.value,
+        ProjectSnapshotStatus.UNCHANGED.value,
+        ProjectSnapshotStatus.FAILED.value,
+        ProjectSnapshotStatus.CANCELLED.value,
+    }:
+        return
+    try:
+        with SessionLocal() as db:
+            snap = db.get(ProjectSnapshot, snapshot_id)
+            if snap is None or snap.trigger_source != "auto":
+                db.rollback()
+                return
+            source = db.get(ProjectSource, snap.source_id)
+            if source is None or source.revoked_at is not None:
+                db.rollback()
+                return
+            # 只按**实际落库终态**回写：丢失租约/被接管时调用方可能先返回 failed，
+            # 但快照仍 processing（或已被别方推进）——绝不能据此误报成功/失败。
+            if snap.status != status:
+                db.rollback()
+                return
+            if status in (
+                ProjectSnapshotStatus.READY.value,
+                ProjectSnapshotStatus.UNCHANGED.value,
+            ):
+                source.auto_sync_last_error_code = None
+                source.auto_sync_last_error_message = None
+            elif status == ProjectSnapshotStatus.FAILED.value:
+                source.auto_sync_last_error_code = _safe_auto_error_code(snap.error_code)
+                source.auto_sync_last_error_message = AUTO_FAILED_MESSAGE
+            else:
+                db.rollback()
+                return
+            db.commit()
+    except Exception:  # noqa: BLE001 - 结果回写失败不得影响任务/进程
+        logger.exception("记录自动同步结果失败 sid=%s", snapshot_id)
 
 
 def run_project_sync(claim: Claim, stop_event: threading.Event) -> str:
@@ -1560,6 +1806,12 @@ def run_project_sync(claim: Claim, stop_event: threading.Event) -> str:
     snapshot_id = claim.snapshot_id
     lease = claim.lease_id
     hb = Heartbeat(claim, stop_event)
+
+    def finish(status: str) -> str:
+        # 自动任务终态回写源状态（稳定错误码/固定安全文案）；失败只记日志。
+        _record_auto_source_result(snapshot_id, status)
+        return status
+
     try:
         hb.start()
         _run_sync_phases(snapshot_id, lease, stop_event, hb, claim)
@@ -1569,28 +1821,37 @@ def run_project_sync(claim: Claim, stop_event: threading.Event) -> str:
             # 也不得自报成功（点 5：心跳掉了绝不能继续 publish）。
             if not hb.hb_ok():
                 if snap is None:
-                    return "failed"
+                    return finish("failed")
                 # 如实在返回前按当前状态：cancel/pending/failed 都可能。
                 status = snap.status
                 if stop_event.is_set() and status != ProjectSnapshotStatus.READY.value:
-                    return "pending"
-                return status or "failed"
+                    return finish("pending")
+                return finish(status or "failed")
             if snap is None or snap.lease_id != lease:
                 # 租约已变（停止/取消/接管）：如实返回当前落库状态。
                 if snap is None:
-                    return "failed"
+                    return finish("failed")
                 if snap.status == ProjectSnapshotStatus.READY.value:
-                    return "ready"
+                    return finish("ready")
                 if snap.status == ProjectSnapshotStatus.CANCELLED.value:
-                    return "cancelled"
+                    return finish("cancelled")
                 if snap.status == ProjectSnapshotStatus.PENDING.value:
-                    return "pending"
-                return snap.status or "failed"
+                    return finish("pending")
+                return finish(snap.status or "failed")
             if stop_event.is_set() and snap.status != ProjectSnapshotStatus.READY.value:
-                return "pending"
-            return snap.status
+                return finish("pending")
+            return finish(snap.status)
+    except ProjectScanUnstable as exc:
+        # 安静窗口延后重试：退回 pending 择时重跑，不是失败，不写源错误字段。
+        status = _settle_auto_deferred(snapshot_id, lease, exc.retry_after_seconds)
+        if status is None:
+            # 租约校验失败/非 auto：按当前落库状态如实取（快照不存在则 failed）。
+            with SessionLocal() as db:
+                snap = db.get(ProjectSnapshot, snapshot_id)
+                status = (snap.status if snap is not None else None) or "failed"
+        return finish(status)
     except (ProjectScanError, ValueError) as exc:
         _fail_snapshot_db(snapshot_id, lease, "sync-error", str(exc)[:2000])
-        return "failed"
+        return finish("failed")
     finally:
         hb.stop()

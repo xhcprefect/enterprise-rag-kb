@@ -54,6 +54,19 @@ _FOUNDATION_COLUMNS: dict[str, dict[str, str]] = {
     "knowledge_bases": {
         "kind": "VARCHAR(16) NOT NULL DEFAULT 'upload'",
     },
+    "project_sources": {
+        # 可选定时自动同步（默认关闭）；老库补列时由 server default 回填。
+        "auto_sync_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "auto_sync_interval_seconds": "INTEGER NOT NULL DEFAULT 300",
+        "auto_sync_next_check_at": "TIMESTAMPTZ",
+        "auto_sync_last_checked_at": "TIMESTAMPTZ",
+        "auto_sync_last_error_code": "VARCHAR(64)",
+        "auto_sync_last_error_message": "TEXT",
+    },
+    "project_snapshots": {
+        # 触发来源（manual/auto）；不要使用保留字 trigger 作列名。
+        "trigger_source": "VARCHAR(16) NOT NULL DEFAULT 'manual'",
+    },
 }
 
 

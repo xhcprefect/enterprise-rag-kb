@@ -218,6 +218,8 @@ def scan_project(
     file_count = 0
     iterations = 0
     truncated = False
+    # 本次扫描纳入索引文件的最晚 mtime（同一核验 FD 的 fstat，无额外 I/O）。
+    newest_mtime_ns: int | None = None
 
     def _check_deadline() -> None:
         """真实墙钟 deadline：超时即 fail closed，绝不静默返回部分成功清单。"""
@@ -283,7 +285,7 @@ def scan_project(
                 yield (entry.name, is_dir, is_file, is_linkort, st_size)
 
     def visit(rel_dir: tuple[str, ...]) -> None:
-        nonlocal total_bytes, file_count, iterations
+        nonlocal total_bytes, file_count, iterations, newest_mtime_ns
         if len(rel_dir) > MAX_DEPTH:
             _record_limit(f"扫描超过最大深度 {MAX_DEPTH}")
             return
@@ -358,6 +360,13 @@ def scan_project(
                 return
             file_count += 1
             total_bytes += _blob_ref.size
+            # 自动同步去抖用的最晚修改时间：取同一核验 FD 复制前的 fstat 身份，
+            # >0 才计入；仅提供上层判断“文件是否仍在写入”，不参与 is_success。
+            identity_mtime_ns = int(getattr(_identity, "st_mtime_ns", 0) or 0)
+            if identity_mtime_ns > 0 and (
+                newest_mtime_ns is None or identity_mtime_ns > newest_mtime_ns
+            ):
+                newest_mtime_ns = identity_mtime_ns
             entries.append(
                 ManifestEntry(
                     relative_path=rel_path,
@@ -386,6 +395,7 @@ def scan_project(
         started_ms=started,
         ended_ms=ended,
         unknown_reason=tuple(unknown),
+        newest_mtime_ns=newest_mtime_ns,
     )
 
 

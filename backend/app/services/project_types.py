@@ -106,6 +106,9 @@ class ScanReport:
     started_ms: int | None = None
     ended_ms: int | None = None
     unknown_reason: tuple[str, ...] = field(default_factory=tuple)
+    # 本次扫描**纳入索引**文件的最晚修改时间（来自同一核验 FD 的 fstat，纳秒）。
+    # 仅供上层自动同步做安静窗口去抖；不参与 ``is_success`` 判定。
+    newest_mtime_ns: int | None = None
 
     @property
     def is_success(self) -> bool:

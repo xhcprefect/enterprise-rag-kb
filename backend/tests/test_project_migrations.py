@@ -174,6 +174,65 @@ class ProjectMigrationTests(unittest.TestCase):
         self.assertEqual(ProjectSnapshotStatus.READY.value, "ready")
         self.assertEqual(ProjectSnapshotStatus.FAILED.value, "failed")
         self.assertEqual(ProjectSnapshotStatus.CANCELLED.value, "cancelled")
+        self.assertEqual(ProjectSnapshotStatus.UNCHANGED.value, "unchanged")
+
+    # ---- 自动同步列：老库幂等补列并回填安全默认值 ----
+    def test_auto_sync_columns_are_added_idempotently_and_backfilled(self):
+        src_id = self.make_source()
+        snap_id = self.make_snapshot(src_id, status="ready")
+        # 模拟未包含自动同步列的老库：删列后既有行（src/snap）必须保留。
+        with engine.begin() as conn:
+            for name in (
+                "auto_sync_enabled", "auto_sync_interval_seconds",
+                "auto_sync_next_check_at", "auto_sync_last_checked_at",
+                "auto_sync_last_error_code", "auto_sync_last_error_message",
+            ):
+                conn.execute(text(f"ALTER TABLE project_sources DROP COLUMN IF EXISTS {name}"))
+            conn.execute(
+                text("ALTER TABLE project_snapshots DROP COLUMN IF EXISTS trigger_source")
+            )
+        init_db(create_admin=False)
+        init_db(create_admin=False)
+        with engine.connect() as conn:
+            source_columns = {
+                row[0] for row in conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = 'project_sources'"
+                ))
+            }
+            snapshot_columns = {
+                row[0] for row in conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = 'project_snapshots'"
+                ))
+            }
+        self.assertTrue({
+            "auto_sync_enabled", "auto_sync_interval_seconds",
+            "auto_sync_next_check_at", "auto_sync_last_checked_at",
+            "auto_sync_last_error_code", "auto_sync_last_error_message",
+        } <= source_columns)
+        self.assertIn("trigger_source", snapshot_columns)
+        with SessionLocal() as db:
+            source = db.get(ProjectSource, src_id)
+            self.assertIsNotNone(source, "老库既有源行不得丢失")
+            self.assertFalse(source.auto_sync_enabled)
+            self.assertEqual(source.auto_sync_interval_seconds, 300)
+            self.assertIsNone(source.auto_sync_next_check_at)
+            self.assertIsNone(source.auto_sync_last_checked_at)
+            self.assertIsNone(source.auto_sync_last_error_code)
+            self.assertIsNone(source.auto_sync_last_error_message)
+            snap = db.get(ProjectSnapshot, snap_id)
+            self.assertIsNotNone(snap, "老库既有快照行不得丢失")
+            self.assertEqual(snap.trigger_source, "manual")
+
+    def test_auto_sync_new_row_defaults(self):
+        src_id = self.make_source()
+        snap_id = self.make_snapshot(src_id)
+        with SessionLocal() as db:
+            source = db.get(ProjectSource, src_id)
+            self.assertFalse(source.auto_sync_enabled)
+            self.assertEqual(source.auto_sync_interval_seconds, 300)
+            self.assertEqual(db.get(ProjectSnapshot, snap_id).trigger_source, "manual")
 
     # ---- 文件版本身份：同内容同路径同配置唯一；改内容可以多版本 ----
     def test_file_version_identity_rules(self):

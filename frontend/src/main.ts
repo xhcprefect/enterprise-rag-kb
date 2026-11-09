@@ -4,7 +4,7 @@ import { i18n } from './i18n'
 import {
   ArrowDown, ArrowLeft, ArrowRight, ChatDotRound, ChatLineRound, CircleCheck,
   CircleCheckFilled, CircleClose, Coin, DataLine, Delete, Document, DocumentCopy, EditPen, Expand,
-  Files, Fold, Folder, InfoFilled, Loading, Lock, MagicStick, MoreFilled, Plus,
+  Files, Fold, Folder, FolderOpened, InfoFilled, Loading, Lock, MagicStick, MoreFilled, Plus,
   Promotion, Reading, Refresh, Search, Setting, SwitchButton, Tickets, TrendCharts, Unlock, Upload,
   UploadFilled, User, UserFilled, VideoPause
 } from '@element-plus/icons-vue'
@@ -23,7 +23,7 @@ const app = createApp(App)
 const icons = {
   ArrowDown, ArrowLeft, ArrowRight, ChatDotRound, ChatLineRound, CircleCheck,
   CircleCheckFilled, CircleClose, Coin, DataLine, Delete, Document, DocumentCopy, EditPen, Expand,
-  Files, Fold, Folder, InfoFilled, Loading, Lock, MagicStick, MoreFilled, Plus,
+  Files, Fold, Folder, FolderOpened, InfoFilled, Loading, Lock, MagicStick, MoreFilled, Plus,
   Promotion, Reading, Refresh, Search, Setting, SwitchButton, Tickets, TrendCharts, Unlock, Upload,
   UploadFilled, User, UserFilled, VideoPause
 }

@@ -132,3 +132,5 @@ bash deploy/tests/test-alerting.sh
 第一项检查 UID 65534 的配置读取、真实 promtool 规则单元测试、启动和关闭的 lifecycle。第二项通过合成指标从 1 降到 0，让真实 Prometheus → Alertmanager → 本地 fixture 投递同一探针的 firing 与 resolved；另行制造连接拒绝，通过通知失败计数确认已发生投递失败，再检查该版本失败日志是否暴露合成 URL 标记。此项实测不代表所有上游版本、所有错误路径都能自动脱敏，升级镜像时必须重新验证。
 
 两项回归均已接入 [CI](../../.github/workflows/checks.yml)。本地回归通过只证明合成链路；上线仍需部署方用真实接收器验收触发、恢复、重试与值班响应。
+
+Prometheus/Alertmanager 的 `/-/ready` 可由部署验收 CLI 只读检查（`--prometheus-url`、`--alertmanager-url`，只接受 origin，CLI 自动拼接 `/-/ready`；未提供时对应检查为 `unknown`）。ready 只证明进程就绪，**不等于**规则已触发或通知已送达；真实 firing/resolved 与接收者回执仍需填入验收证据，见 [部署验收指南](../acceptance/README.md)。

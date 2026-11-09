@@ -96,3 +96,15 @@ test('a poll from an older entry cannot act on the current one', () => {
   assert.equal(isStalePoll('a', 'a', 3, 3, true), true)
   assert.equal(isStalePoll(null, 'a', 3, 3), true)
 })
+
+// ---------- 治理字段之后的补充：query 与治理无耦合，只确认全字段比较 ----------
+import { queryParams as qp } from '../src/utils/documentList.ts'
+
+test('list params carry page size and optional filters only', () => {
+  assert.deepEqual(qp(makeQuery({ q: ' 合同 ', page: 3, pageSize: 10, status: 'ready' })), {
+    page: 3,
+    page_size: 10,
+    status: 'ready',
+    q: '合同'
+  })
+})

@@ -236,7 +236,7 @@ class ProjectPipelineTests(unittest.TestCase):
         with db_session.SessionLocal() as db:
             reservation = chat_turns.claim_turn(
                 db, user_id=self.user_id, conversation_id=uuid.UUID(conv_id), kb_id=self.kb_id,
-                mode="rag", question="正在生成", top_k=6,
+                mode="rag", question="正在生成", top_k=6, auth_token_version=0,
             )
         try:
             busy = self.client.patch(f"/api/v1/chat/conversations/{conv_id}/project-snapshot", headers=self.headers,

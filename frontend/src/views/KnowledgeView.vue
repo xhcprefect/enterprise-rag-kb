@@ -56,13 +56,15 @@
     <section class="library" aria-labelledby="library-title">
       <div class="section-head">
         <div>
-          <h3 id="library-title">{{ t('knowledge.listTitle') }}</h3>
+          <div class="section-title">
+            <h3 id="library-title">{{ t('knowledge.listTitle') }}</h3>
+            <span class="count-badge">{{ formatNumber(filteredKbs.length) }}</span>
+          </div>
           <p v-if="keyword">
             {{ t('knowledge.listMatch', { count: formatNumber(filteredKbs.length) }, filteredKbs.length) }}
           </p>
           <p v-else>{{ t('knowledge.listHint') }}</p>
         </div>
-        <span class="count-badge">{{ formatNumber(filteredKbs.length) }}</span>
       </div>
 
       <div v-loading="loading" class="kb-area">
@@ -95,6 +97,9 @@
                     <!-- 项目索引库没有命名字段/可见性：编辑入口改为跳项目页；删除语义是撤销 -->
                     <el-dropdown-item v-if="!isProjectKb(kb)" command="edit">
                       <el-icon><EditPen /></el-icon>{{ t('common.edit') }}
+                    </el-dropdown-item>
+                    <el-dropdown-item v-if="!isProjectKb(kb)" command="diagnostics">
+                      <el-icon><DataLine /></el-icon>{{ t('knowledge.diagnostics.menu') }}
                     </el-dropdown-item>
                     <el-dropdown-item command="delete" divided>
                       <el-icon><Delete /></el-icon>
@@ -211,6 +216,8 @@
         <el-button type="primary" :loading="submitting" @click="submit">{{ t('common.save') }}</el-button>
       </template>
     </el-dialog>
+
+    <RetrievalDiagnosticsDialog v-model="diagnosticsOpen" :kb="diagnosticsKb" />
   </div>
 </template>
 
@@ -221,6 +228,7 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import { isProjectKb, kbApi, type KnowledgeBase } from '@/api'
+import RetrievalDiagnosticsDialog from '@/components/RetrievalDiagnosticsDialog.vue'
 import { useUserStore } from '@/stores/user'
 import { formatNumber } from '@/i18n/format'
 
@@ -234,6 +242,8 @@ const keyword = ref('')
 const dialogVisible = ref(false)
 const submitting = ref(false)
 const editing = ref<KnowledgeBase | null>(null)
+const diagnosticsOpen = ref(false)
+const diagnosticsKb = ref<KnowledgeBase | null>(null)
 const formRef = ref<FormInstance>()
 
 const form = reactive({ name: '', description: '', is_public: true })
@@ -310,6 +320,13 @@ async function onCommand(cmd: string, kb: KnowledgeBase) {
       return
     }
     openEdit(kb)
+    return
+  }
+  if (cmd === 'diagnostics') {
+    // 项目索引库的文档不可通过普通文档范围筛选，诊断入口不展示也不执行。
+    if (isProjectKb(kb)) return
+    diagnosticsKb.value = kb
+    diagnosticsOpen.value = true
     return
   }
   if (cmd !== 'delete') return
@@ -474,6 +491,12 @@ onMounted(load)
   justify-content: space-between;
   gap: 16px;
   padding: 2px 2px 0;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
 }
 
 .section-head h3 {

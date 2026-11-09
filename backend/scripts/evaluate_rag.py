@@ -47,6 +47,33 @@ def _default_documents_dir(dataset_path):
     return sibling if sibling.is_dir() else None
 
 
+def _precheck_regression_cases(parser, args, cases):
+    """单条反馈回归协议预检：在任何网络或身份计算前拒绝不匹配的参数。
+
+    旧问题集没有 regression_protocol 标记时完全不受影响；存在标记时必须恰好一个
+    case、显式 run ID、模式一致、禁止 --kb-id 覆盖且不得携带 conversation_id。
+    """
+    marked = any("regression_protocol" in case for case in cases)
+    if not marked:
+        return
+    if len(cases) != 1:
+        parser.error("反馈回归评测必须恰好包含 1 个 case")
+    case = cases[0]
+    if type(case.get("regression_protocol")) is not int or case.get("regression_protocol") != 1:
+        parser.error("反馈回归 case 的 regression_protocol 必须为 1")
+    if args.run_id is None:
+        parser.error("反馈回归评测必须显式指定 --run-id")
+    if args.kb_id is not None:
+        parser.error("反馈回归评测禁止使用 --kb-id 覆盖知识库")
+    mode = case.get("regression_mode")
+    if mode not in ("offline", "live"):
+        parser.error("反馈回归 case 的 regression_mode 必须为 offline 或 live")
+    if bool(args.live) != (mode == "live"):
+        parser.error("--live/--responses 必须与 case 的 regression_mode 一致")
+    if "conversation_id" in case:
+        parser.error("反馈回归 case 不能包含 conversation_id")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default=str(Path(__file__).resolve().parents[1] / "evaluation/cases.example.jsonl"))
@@ -82,7 +109,10 @@ def main(argv=None):
     if args.comparison_output and not args.baseline:
         parser.error("--comparison-output 需要同时提供 --baseline")
     try:
-        cases = validate_cases(read_jsonl(args.dataset))[:args.max_cases]
+        validated_cases = validate_cases(read_jsonl(args.dataset))
+        # 单条反馈回归协议预检必须在读取响应、配置身份或发起网络请求之前完成。
+        _precheck_regression_cases(parser, args, validated_cases)
+        cases = validated_cases[:args.max_cases]
         if not cases:
             raise EvaluationError("问题集为空")
         if args.require_reviewed:

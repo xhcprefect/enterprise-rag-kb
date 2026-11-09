@@ -17,9 +17,16 @@ export interface ProjectSource {
   active_snapshot_id: string | null
   revoked_at: string | null
   created_at: string
+  /** 服务端定时检查受控目录（默认关闭）。 */
+  auto_sync_enabled: boolean
+  auto_sync_interval_seconds: number
+  auto_sync_next_check_at: string | null
+  auto_sync_last_checked_at: string | null
+  auto_sync_last_error_code: string | null
+  auto_sync_last_error_message: string | null
 }
 
-export type ProjectSnapshotStatus = 'pending' | 'processing' | 'ready' | 'failed' | 'cancelled'
+export type ProjectSnapshotStatus = 'pending' | 'processing' | 'ready' | 'failed' | 'cancelled' | 'unchanged'
 
 export interface ProjectSnapshot {
   id: string
@@ -37,6 +44,8 @@ export interface ProjectSnapshot {
   started_at: string | null
   finished_at: string | null
   created_at: string
+  /** 快照由手动同步还是服务端自动同步触发。 */
+  trigger_source: 'manual' | 'auto' | string
 }
 
 export type ProjectFileParseStatus = 'pending' | 'ready' | 'failed' | 'fallback'
@@ -105,6 +114,12 @@ export interface ProjectSourceCreate {
   relative_dir: string
 }
 
+export interface ProjectAutoSyncUpdate {
+  enabled: boolean
+  /** 60–86400 秒；后端默认 300。 */
+  interval_seconds: number
+}
+
 const PAGE_SIZE = 100
 
 export const projectApi = {
@@ -123,6 +138,10 @@ export const projectApi = {
   /** 软撤销（仅管理员）；已撤销源后续读取返回 410。 */
   revoke: (sourceId: string, signal?: AbortSignal) =>
     client.delete<null>(`/projects/${sourceId}`, { signal }),
+
+  /** 配置服务端自动同步（仅管理员）；返回更新后的源。启用后由 worker 定时检查。 */
+  updateAutoSync: (sourceId: string, payload: ProjectAutoSyncUpdate, signal?: AbortSignal) =>
+    client.patch<ProjectSource>(`/projects/${sourceId}/auto-sync`, payload, { signal }),
 
   /** 手动同步入队（仅管理员，幂等）；返回当前快照，未就绪不代表可搜索。 */
   sync: (sourceId: string, signal?: AbortSignal) =>

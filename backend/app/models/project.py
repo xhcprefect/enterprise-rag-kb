@@ -44,6 +44,9 @@ class ProjectSnapshotStatus(str, enum.Enum):
     READY = "ready"            # 校验通过，可切为 active
     FAILED = "failed"          # 失败（error_code），保持上一可用版本
     CANCELLED = "cancelled"    # 明确取消
+    # 自动同步检查到内容/配置与当前 active 完全一致：不发布、不推进 active，
+    # 仅作为一次“已检查”的历史记录（默认从版本历史列表过滤）。
+    UNCHANGED = "unchanged"
 
     __str__ = enum.Enum.__str__
 
@@ -93,6 +96,22 @@ class ProjectSource(Base, TimestampMixin):
     )
     # 删除源先事务内 revoked，使后续引用读取返回 410，再标记可回收（GC 后移）。
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ---- 可选开启的定时自动同步（默认关闭；启用后由 project worker 轮询入队）----
+    auto_sync_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    auto_sync_interval_seconds: Mapped[int] = mapped_column(
+        Integer, default=300, server_default="300", nullable=False
+    )
+    auto_sync_next_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    auto_sync_last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 只允许稳定错误码与固定安全消息，绝不写绝对路径/文件正文。
+    auto_sync_last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    auto_sync_last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -140,6 +159,11 @@ class ProjectSnapshot(Base, TimestampMixin):
     )
     status: Mapped[str] = mapped_column(
         String(16), default=ProjectSnapshotStatus.PENDING.value, index=True, nullable=False
+    )
+    # 触发来源：manual（API/测试手动）或 auto（定时调度）。仅作展示与自动取消过滤，
+    # 绝不参与发布判定（发布只看 ready/manifest/CAS）。
+    trigger_source: Mapped[str] = mapped_column(
+        String(16), default="manual", server_default="'manual'", nullable=False
     )
     # 本次同步基于的快照（CAS 依据）：增量只对比上一步，避免重扫全部字节。
     base_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(

@@ -87,6 +87,12 @@ export const workspaceRoute: RouteRecordRaw = {
       meta: { titleKey: 'nav.audit', roles: ['admin'], menu: { icon: 'Tickets' } }
     },
     {
+      path: '/feedback',
+      name: 'feedback',
+      component: () => import('@/views/FeedbackView.vue'),
+      meta: { titleKey: 'nav.feedback', roles: ['admin'], menu: { icon: 'ChatLineRound' } }
+    },
+    {
       path: '/profile',
       name: 'profile',
       component: () => import('@/views/ProfileView.vue'),

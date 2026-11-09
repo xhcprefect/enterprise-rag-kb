@@ -4,13 +4,22 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session as DBSession
 
 from app.api.deps import get_current_user, require_admin, write_audit
 from app.core.security import hash_password, verify_password
 from app.db.session import get_db
-from app.models import User
+from app.models import (
+    ChatTurn,
+    Conversation,
+    Document,
+    KnowledgeBase,
+    Message,
+    ProjectSnapshot,
+    ProjectSource,
+    User,
+)
 from app.schemas.common import ApiResponse, PageResult
 from app.schemas.user import (
     ChangePassword,
@@ -196,6 +205,18 @@ def update_user(
     return ApiResponse(data=user, message="用户已更新")
 
 
+def _lock_sorted(db: DBSession, model, condition):
+    """按主键 UUID 顺序锁一组行（`FOR UPDATE` + 强制从 DB 重读）。
+
+    只接受可被索引限制的谓词（owner_id / user_id / uploaded_by / created_by /
+    conversation_id / kb_id 上的等值或 IN），绝不整表加锁。
+    """
+    return db.scalars(
+        select(model).where(condition).order_by(model.id)
+        .with_for_update().execution_options(populate_existing=True)
+    ).all()
+
+
 @router.delete("/{user_id}", response_model=ApiResponse[None], summary="删除用户（管理员）")
 def delete_user(
     user_id: uuid.UUID,
@@ -203,11 +224,80 @@ def delete_user(
     db: DBSession = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
+    """删除用户：按全库统一锁序锁定**有限且稳定**的受影响集合后再删。
+
+    目标用户行锁先取得（``FOR UPDATE``）：任何并发请求要新建指向该用户的
+    FK 引用（会话/轮次/上传者/创建者）都必须先取该行的 KEY SHARE，因此会被
+    挡住；锁住之后查到的集合就是删除时真正会变的行。
+
+    锁序 ``User -> KnowledgeBase(UUID) -> ProjectSource(UUID) ->
+    ProjectSnapshot(UUID) -> Conversation(UUID) -> ChatTurn(UUID) ->
+    Message(UUID) -> Document(UUID)``，与最终发布/撤销事务一致，避免交叉成环：
+
+    - 目标 ``owner_id`` 的知识库（``SET NULL``），以及其中的源/快照/文档；
+    - 目标自己创建的项目源、目标在**他人**知识库上传的文档；
+    - 目标自己的会话，以及挂在目标知识库下的**他人**会话 —— 后者不被删除，
+      但其 ``kb_id`` 所属库的属主变更必须与最终发布的 KB 锁互斥。
+    """
     if user_id == admin.id:
         raise HTTPException(status_code=400, detail="不能删除自己")
-    user = db.get(User, user_id)
+
+    version = getattr(request.state, "auth_token_version", None)
+    if type(version) is not int or version < 0:
+        raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
+    # 管理员与目标用户一次按 UUID 排序锁定，两个管理员互删也不会反向取 User 锁。
+    locked_users = {row.id: row for row in _lock_sorted(db, User, User.id.in_([admin.id, user_id]))}
+    admin = locked_users.get(admin.id)
+    if admin is None or not admin.is_active or not admin.is_admin:
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    if version != admin.token_version:
+        raise HTTPException(status_code=401, detail="登录状态已失效，请重新登录")
+    request.state.user = admin
+    user = locked_users.get(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
+
+    # 目标知识库（属主将被置空）。等锁后一切判断只用锁到的新鲜行。
+    owned_kbs = _lock_sorted(db, KnowledgeBase, KnowledgeBase.owner_id == user.id)
+    kb_ids = [kb.id for kb in owned_kbs]
+
+    # 目标创建的项目源，以及目标知识库下的源；随后是其快照。
+    source_conditions = [ProjectSource.created_by == user.id]
+    if kb_ids:
+        source_conditions.append(ProjectSource.kb_id.in_(kb_ids))
+    sources = _lock_sorted(db, ProjectSource, or_(*source_conditions))
+    source_ids = [source.id for source in sources]
+    if source_ids:
+        _lock_sorted(db, ProjectSnapshot, ProjectSnapshot.source_id.in_(source_ids))
+
+    # 会话：目标自己的会话（将被级联删除）与目标知识库下的他人会话。
+    conversation_conditions = [Conversation.user_id == user.id]
+    if kb_ids:
+        conversation_conditions.append(Conversation.kb_id.in_(kb_ids))
+    conversations = _lock_sorted(db, Conversation, or_(*conversation_conditions))
+    conversation_ids = [conversation.id for conversation in conversations]
+
+    # 轮次：目标发起的（任意会话，含会话已删除后保留的 tombstone）以及上述
+    # 会话里的全部轮次。即使目标没有存活会话也要锁 —— 这些行同样随用户级联删除。
+    turn_conditions = [ChatTurn.user_id == user.id]
+    if conversation_ids:
+        turn_conditions.append(ChatTurn.conversation_id.in_(conversation_ids))
+    _lock_sorted(db, ChatTurn, or_(*turn_conditions))
+
+    # 消息：上述会话内全部 + 目标轮次的消息（防御会话绑定缺失的历史行）。
+    # 用子查询而不是把 turn id 拉成 Python 列表：锁语句本身保持有界。
+    message_conditions = [
+        Message.turn_id.in_(select(ChatTurn.id).where(ChatTurn.user_id == user.id)),
+    ]
+    if conversation_ids:
+        message_conditions.append(Message.conversation_id.in_(conversation_ids))
+    _lock_sorted(db, Message, or_(*message_conditions))
+
+    # 上传文档最后锁（统一类内顺序）：目标上传的，以及目标知识库内的。
+    document_conditions = [Document.uploaded_by == user.id]
+    if kb_ids:
+        document_conditions.append(Document.kb_id.in_(kb_ids))
+    _lock_sorted(db, Document, or_(*document_conditions))
 
     username = user.username
     db.delete(user)

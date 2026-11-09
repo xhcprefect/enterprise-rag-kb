@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from sqlalchemy import and_, false, or_, select
 
 from app.models import Document, DocumentStatus
+from app.services.document_lifecycle import is_retrievable, retrievable_conditions, utc_now
 
 MAX_SCOPE_DOCUMENTS = 5
 
@@ -28,18 +29,28 @@ def resolve_scope(db, kb_id, identifiers, *, expected_versions: dict[str, int] |
         return []
     if kb_id is None:
         raise HTTPException(400, "普通对话不支持文档范围")
-    statement = select(Document).where(Document.kb_id == kb_id, Document.id.in_(requested)).order_by(Document.id)
+    # 统一按 UUID 排序加锁，避免并发请求以不同顺序取行锁造成死锁。
+    # 治理谓词与检索侧共用同一实现：禁用/已替代/未生效/已过期文档不可能进入范围。
+    statement = (select(Document)
+                 .where(Document.kb_id == kb_id, Document.id.in_(requested), *retrievable_conditions())
+                 .order_by(Document.id))
     if lock:
         statement = statement.with_for_update(read=True)
     rows = db.scalars(statement.execution_options(populate_existing=True)).all()
     found = {str(row.id): row for row in rows}
     if any(str(identifier) not in found for identifier in requested):
         raise HTTPException(404, "范围内文档不存在或不属于当前知识库，请重新选择或取消范围")
+    # SQL 谓词里的时刻是在等行锁之前取的；锁可能一直等到 valid_until 之后。
+    # 所有行锁返回后必须重新取 UTC，逐行用同一 is_retrievable 对象级复核，
+    # 否则已过期文档会被陈旧时刻放行。坏类型/缺字段同样 fail closed。
+    moment = utc_now()
     result = []
     for identifier in requested:
         row = found[str(identifier)]
         if row.status != DocumentStatus.READY.value or row.cancel_requested:
             raise HTTPException(409, "范围内文档尚未就绪或已取消，请重新选择或取消范围")
+        if not is_retrievable(row, now=moment):
+            raise HTTPException(409, "范围内文档已失效或不在生效期，请重新选择或取消范围")
         if expected_versions is not None and expected_versions.get(str(identifier)) != row.index_version:
             raise HTTPException(409, "范围内文档已重新索引，请重新选择以使用最新版本，或取消范围")
         result.append({"document_id": str(row.id), "filename": row.filename, "index_version": row.index_version})

@@ -30,6 +30,18 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "lease_id": "UUID",
         # 服务端真实内容摘要；老数据保持 NULL，由 backfill 脚本按需补齐。
         "content_sha256": "VARCHAR(64)",
+        # ---- 文档治理（T3 冻结契约）----
+        # 全部带真实 server DEFAULT：已有行在 ALTER 时自动补齐，且绕过 ORM 的写入
+        # 也得到确定值。superseded_by_id 的 FK 由 ensure_document_governance_fk 单独
+        # 兜底（列已存在但缺 FK 的老库也能补上），这里只建裸列避免重复约束。
+        "maintainer": "VARCHAR(200) NOT NULL DEFAULT ''",
+        "last_reviewed_at": "TIMESTAMPTZ",
+        "valid_from": "TIMESTAMPTZ",
+        "valid_until": "TIMESTAMPTZ",
+        "enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+        "superseded_at": "TIMESTAMPTZ",
+        "superseded_by_id": "UUID",
+        "governance_revision": "INTEGER NOT NULL DEFAULT 0",
     },
     "conversations": {
         # 普通对话模式新增；老会话默认按知识库问答解释，行为与升级前一致
@@ -62,6 +74,73 @@ _INIT_LOCK_KEY = 742_193_551
 
 def _create_all(conn) -> None:
     Base.metadata.create_all(bind=conn)
+
+
+# 文档治理列的真实 server default：列已存在（老库迁移补列）时也强制对齐，
+# 保证任何绕过 ORM 的 INSERT 都得到确定值而不是 NULL。
+_GOVERNANCE_SERVER_DEFAULTS = {
+    "maintainer": "''",
+    "enabled": "TRUE",
+    "governance_revision": "0",
+}
+
+_SUPERSEDED_FK_NAME = "fk_documents_superseded_by_id_documents"
+
+
+def _ensure_document_governance_constraints(conn) -> None:
+    """补齐治理列的 server default 与自引用外键（幂等）。
+
+    两种场景都要覆盖：
+    - 新库：create_all 已建好列与外键，这里全是空操作。
+    - 老库：列可能是上一版迁移补的（无 DEFAULT），或列已存在但 FK 缺失；
+      这里补 DEFAULT / 补 FK，绝不删改任何原用户内容。
+    """
+    existing = {
+        row[0]
+        for row in conn.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'documents'"
+            )
+        )
+    }
+    if "superseded_by_id" not in existing:
+        return
+    for column, default in _GOVERNANCE_SERVER_DEFAULTS.items():
+        if column in existing:
+            conn.execute(text(f"ALTER TABLE documents ALTER COLUMN {column} SET DEFAULT {default}"))
+    # FK 存在性判定必须锚定当前 schema 里实际 documents 表的 OID：
+    # 其他 schema 内同名 documents 的 FK（哪怕也是自引用 SET NULL）不能算数；
+    # 复合外键（conkey 多于 1 列）或指向非 id 列同样不算所需的单列自 FK。
+    table_oid = conn.execute(
+        text(
+            "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = 'documents' AND n.nspname = current_schema() LIMIT 1"
+        )
+    ).scalar()
+    if table_oid is None:
+        return
+    has_fk = conn.execute(
+        text(
+            "SELECT 1 FROM pg_constraint c "
+            "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1] "
+            "JOIN pg_attribute ra ON ra.attrelid = c.confrelid AND ra.attnum = c.confkey[1] "
+            "WHERE c.contype = 'f' AND c.conrelid = :table_oid "
+            "AND cardinality(c.conkey) = 1 AND cardinality(c.confkey) = 1 "
+            "AND a.attname = 'superseded_by_id' AND ra.attname = 'id' "
+            "AND c.conrelid = c.confrelid "
+            "AND c.confdeltype = 'n' LIMIT 1"
+        ),
+        {"table_oid": table_oid},
+    ).first()
+    if has_fk is None:
+        conn.execute(
+            text(
+                "ALTER TABLE documents ADD CONSTRAINT "
+                f"{_SUPERSEDED_FK_NAME} FOREIGN KEY (superseded_by_id) "
+                "REFERENCES documents(id) ON DELETE SET NULL"
+            )
+        )
 
 
 def init_db(create_admin: bool = True) -> None:
@@ -97,6 +176,9 @@ def init_db(create_admin: bool = True) -> None:
             for name, ddl in columns.items():
                 if name not in existing:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+        if "documents" in table_names:
+            _ensure_document_governance_constraints(conn)
 
         if "messages" in table_names:
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_turn_role ON messages (turn_id, role)"))

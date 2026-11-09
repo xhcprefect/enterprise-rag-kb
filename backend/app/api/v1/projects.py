@@ -33,6 +33,7 @@ from app.schemas.common import ApiResponse, PageResult
 from app.schemas.project import (
     MAX_SEARCH_QUERY,
     MAX_TOP_K,
+    ProjectAutoSyncUpdate,
     ProjectFileRead,
     ProjectSearchRead,
     ProjectSnapshotRead,
@@ -66,6 +67,7 @@ def _snap_out(snap: ProjectSnapshot) -> ProjectSnapshotRead:
         id=snap.id,
         source_id=snap.source_id,
         status=snap.status,
+        trigger_source=snap.trigger_source,
         base_snapshot_id=snap.base_snapshot_id,
         progress=snap.progress,
         file_count=snap.file_count,
@@ -182,6 +184,38 @@ def revoke_source(
     return ApiResponse(data=None, message="项目源已撤销")
 
 
+@router.patch(
+    "/{source_id}/auto-sync",
+    response_model=ApiResponse[ProjectSourceRead],
+    summary="配置定时自动同步（管理员）",
+)
+def update_auto_sync(
+    source_id: uuid.UUID,
+    payload: ProjectAutoSyncUpdate,
+    db: DBSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """启用/调整/关闭自动同步；关闭时只取消该源 auto 触发的活动任务。"""
+    try:
+        source = project_sources.update_auto_sync(
+            db,
+            source_id,
+            enabled=payload.enabled,
+            interval_seconds=payload.interval_seconds,
+        )
+        db.commit()
+    except project_sources.ProjectSourceNotFound as exc:
+        # 不在此 rollback：会过期同一请求会话里的认证 User，请求日志随后读取
+        # user.username 会触发 DetachedInstanceError，把 404 变成 500。
+        # 依赖注入的 get_db 会在 finally 关闭会话并回滚；close 不会过期已加载属性。
+        raise HTTPException(status_code=404, detail="项目源不存在") from exc
+    except project_sources.ProjectSourceRevoked as exc:
+        # 同上：410 分支同样不得手动 rollback。
+        raise HTTPException(status_code=410, detail="项目源已撤销") from exc
+    db.refresh(source)
+    return ApiResponse(data=project_sources.source_to_read(source))
+
+
 @router.post("/{source_id}/sync", response_model=ApiResponse[ProjectSnapshotRead], summary="手动同步（管理员，幂等）")
 def sync_source(
     source_id: uuid.UUID,
@@ -205,15 +239,19 @@ def sync_source(
 @router.get("/{source_id}/snapshots", response_model=ApiResponse[list[ProjectSnapshotRead]], summary="同步状态/历史")
 def list_snapshots(
     source_id: uuid.UUID,
+    include_unchanged: bool = Query(default=False),
     db: DBSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    """历史默认隐藏 unchanged 检查记录（避免淹没版本历史）；显式 true 时包含。"""
     _source_or_http(db, source_id, user)
+    stmt = select(ProjectSnapshot).where(ProjectSnapshot.source_id == source_id)
+    if not include_unchanged:
+        stmt = stmt.where(
+            ProjectSnapshot.status != ProjectSnapshotStatus.UNCHANGED.value
+        )
     snaps = db.scalars(
-        select(ProjectSnapshot)
-        .where(ProjectSnapshot.source_id == source_id)
-        .order_by(ProjectSnapshot.created_at.desc())
-        .limit(50)
+        stmt.order_by(ProjectSnapshot.created_at.desc()).limit(50)
     ).all()
     return ApiResponse(data=[_snap_out(s) for s in snaps])
 

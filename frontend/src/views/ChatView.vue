@@ -164,6 +164,14 @@
               <div v-if="msg.role === 'assistant' && !msg.streaming && msg.content" class="message-actions">
                 <button class="message-action" type="button" :aria-label="t('chat.list.copyAnswerAria')" :title="t('chat.list.copyAnswer')" @click="copyAnswer(msg)"><el-icon :size="13"><DocumentCopy /></el-icon><span>{{ t('chat.list.copyAnswer') }}</span></button>
                 <button
+                  v-if="canGiveFeedback(msg)"
+                  class="message-action"
+                  type="button"
+                  :aria-label="t('feedback.buttonAria')"
+                  :title="t('feedback.button')"
+                  @click="openFeedback(msg)"
+                ><el-icon :size="13"><ChatLineSquare /></el-icon><span>{{ t('feedback.button') }}</span></button>
+                <button
                   v-if="canRetryMessage(msg)"
                   class="message-action"
                   type="button"
@@ -233,6 +241,13 @@
       :error="scopeError"
       @confirm="applyDocumentScope"
     />
+    <AnswerFeedbackDialog
+      v-model="feedbackDialogVisible"
+      :submitting="feedbackSubmitting"
+      :error="feedbackError"
+      @submit="submitFeedback"
+      @closed="onFeedbackDialogClosed"
+    />
   </div>
 </template>
 
@@ -241,6 +256,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { ChatLineSquare } from '@element-plus/icons-vue'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js/lib/common'
 import 'highlight.js/styles/github.css'
@@ -290,20 +306,26 @@ import { sourceLocationLabels } from '@/utils/sourceLocation'
 import { projectApi, type ProjectSnapshot } from '@/api/projects'
 import SourcePreviewDrawer from '@/components/SourcePreviewDrawer.vue'
 import DocumentScopeDialog from '@/components/DocumentScopeDialog.vue'
+import AnswerFeedbackDialog from '@/components/AnswerFeedbackDialog.vue'
 import ConversationMemoryStatus from '@/components/ConversationMemoryStatus.vue'
+import { buildFeedbackSubmission, getServerMessageId } from '@/utils/feedback'
 import {
   chatApi,
+  feedbackApi,
   kbApi,
   streamChat,
   type ChatMode,
   type Citation,
   type Conversation,
+  type FeedbackCategory,
   type KnowledgeBase
 } from '@/api'
 
 interface ChatMessage {
   /** 稳定的 v-for key：用下标会在消息增删时复用错 DOM */
   id: string
+  /** 后端生成的消息 id；只有它有值时才能提交反馈，临时 UUID 绝不上报。 */
+  serverId?: string | null
   role: 'user' | 'assistant'
   content: string
   citations?: Citation[]
@@ -453,6 +475,14 @@ const controlsLocked = scopeLocked
 const sourceOpen = ref(false)
 const selectedCitation = ref<Citation | null>(null)
 let activeRequestId: string | null = null
+/** 反馈弹窗目标：只保存服务端消息 id 与提交时的会话快照。 */
+const feedbackTarget = ref<{ messageId: string; conversationId: string | null } | null>(null)
+const feedbackDialogVisible = ref(false)
+const feedbackSubmitting = ref(false)
+const feedbackError = ref('')
+let feedbackRequest: AbortController | null = null
+/** 每次打开/关闭/切换会话都递增；迟到的提交结果不得落到新上下文。 */
+let feedbackSeq = 0
 const errorMessage = ref('')
 const scrollRef = ref<HTMLElement>()
 let controller: AbortController | null = null
@@ -787,6 +817,7 @@ async function loadKbs() {
 async function onKbChange() {
   if (controlsLocked.value) return
   sourceOpen.value = false
+  resetFeedbackDialog()
   // 切换知识库会清空视图：在途的会话详情不得再把旧内容放回来
   sessionEpoch.begin()
   resetDocumentScope()
@@ -807,6 +838,7 @@ async function onModeChange(value: string | number | boolean) {
   if (controlsLocked.value || next === appliedMode) return
   appliedMode = next
   sourceOpen.value = false
+  resetFeedbackDialog()
   sessionEpoch.begin()
   resetDocumentScope()
   currentConversationId.value = null
@@ -926,6 +958,7 @@ function onConversationQueryInput() {
 async function loadConversation(id: string) {
   if (controlsLocked.value) return
   sourceOpen.value = false
+  resetFeedbackDialog()
   const loadEpoch = sessionEpoch.begin()
   clearRecovery()
   const { data } = await chatApi.conversation(id)
@@ -955,6 +988,7 @@ async function loadConversation(id: string) {
   }
   messages.value = data.messages.map((m) => ({
     id: m.id,
+    serverId: m.id,
     role: m.role,
     status: m.status,
     content: m.content,
@@ -972,6 +1006,7 @@ function newConversation() {
   if (controlsLocked.value || recoveryLocked.value) return
   closeSidebar()
   sourceOpen.value = false
+  resetFeedbackDialog()
   // 新建会话后，之前点开的详情即使慢回来也不能再把旧消息填进来
   sessionEpoch.begin()
   resetDocumentScope()
@@ -1066,6 +1101,86 @@ async function copyAnswer(msg: ChatMessage) {
   const ok = await copyPlainText(msg.content)
   if (ok) ElMessage.success(t('chat.list.copied'))
   else ElMessage.error(t('chat.list.copyFailed'))
+}
+
+/** 只有拿到服务端消息 id 的已完成回答才允许反馈；临时 UUID 永远不发给后端。 */
+function canGiveFeedback(msg: ChatMessage): boolean {
+  return msg.role === 'assistant'
+    && msg.status === 'completed'
+    && !!msg.content.trim()
+    && !!getServerMessageId(msg)
+}
+
+function openFeedback(msg: ChatMessage) {
+  const messageId = getServerMessageId(msg)
+  if (!messageId || disposed) return
+  feedbackSeq += 1
+  feedbackRequest?.abort()
+  feedbackRequest = null
+  feedbackTarget.value = { messageId, conversationId: currentConversationId.value }
+  feedbackSubmitting.value = false
+  feedbackError.value = ''
+  feedbackDialogVisible.value = true
+}
+
+/**
+ * 关闭并作废待落地的提交：切换会话/切换上下文/卸载时调用。
+ * seq 递增 + abort 让迟到的响应在落地前被丢弃，既不 toast 也不关新会话的弹窗。
+ */
+function resetFeedbackDialog() {
+  feedbackSeq += 1
+  feedbackRequest?.abort()
+  feedbackRequest = null
+  feedbackDialogVisible.value = false
+  feedbackTarget.value = null
+  feedbackSubmitting.value = false
+  feedbackError.value = ''
+}
+
+function onFeedbackDialogClosed() {
+  feedbackError.value = ''
+  feedbackTarget.value = null
+}
+
+async function submitFeedback(payload: { category: FeedbackCategory; note: string }) {
+  const target = feedbackTarget.value
+  if (!target || feedbackSubmitting.value || disposed) return
+  // 提交前固定会话与序号；返回后任何一项变化都说明这份结果已经过期。
+  const conversationId = currentConversationId.value
+  const seq = ++feedbackSeq
+  feedbackRequest?.abort()
+  const request = new AbortController()
+  feedbackRequest = request
+  feedbackSubmitting.value = true
+  feedbackError.value = ''
+  try {
+    // 只发 message_id/category/note，不携带问题、回答或引用正文。
+    await feedbackApi.submit(buildFeedbackSubmission({
+      messageId: target.messageId,
+      category: payload.category,
+      note: payload.note
+    }), request.signal)
+    if (disposed || seq !== feedbackSeq || request.signal.aborted) return
+    if (currentConversationId.value !== conversationId) return
+    // 重复提交时后端 200 返回既有记录，同样按成功处理。
+    ElMessage.success(t('feedback.submitted'))
+    feedbackDialogVisible.value = false
+    feedbackTarget.value = null
+  } catch (err: any) {
+    if (disposed || seq !== feedbackSeq || request.signal.aborted) return
+    if (currentConversationId.value !== conversationId) return
+    const serverMessage = typeof err?.response?.data?.message === 'string'
+      ? err.response.data.message.trim()
+      : ''
+    feedbackError.value = serverMessage
+      ? `${t('feedback.submitFailed')}：${serverMessage}`
+      : t('feedback.submitFailed')
+  } finally {
+    if (!disposed && seq === feedbackSeq) {
+      feedbackSubmitting.value = false
+      feedbackRequest = null
+    }
+  }
 }
 
 /** 事件委托：只读 pre > code 的 textContent，不解析 HTML、不执行任何脚本。 */
@@ -1201,8 +1316,10 @@ function restoreCompletedRequest(target: RecoveryTarget, state: ChatRequestState
   const completion = recoveredCompletion(state)
   currentConversationId.value = state.conversation_id
   target.userMessage.id = state.user_message_id
+  target.userMessage.serverId = state.user_message_id
   target.userMessage.status = 'completed'
   target.assistant.id = state.message.id
+  target.assistant.serverId = state.message.id
   target.assistant.content = state.message.content
   target.assistant.status = 'completed'
   target.assistant.streaming = false
@@ -1418,7 +1535,10 @@ async function send(retry?: RetrySnapshot) {
           if (signal.aborted || disposed || controller !== myController) return
           currentConversationId.value = data.conversation_id
           streamConversationId = data.conversation_id
-          if (data.user_message_id) userMessage.id = data.user_message_id
+          if (data.user_message_id) {
+            userMessage.id = data.user_message_id
+            userMessage.serverId = data.user_message_id
+          }
           syncStreamScope(data)
           // 新会话的真实 ID/版本由服务端在此给出；重试快照据此绑定，绝不靠界面猜。
           retrySnapshot = bindRetrySnapshot(retrySnapshot, {
@@ -1441,6 +1561,8 @@ async function send(retry?: RetrySnapshot) {
           completion = data
           assistant.truncated = data.truncated || data.finish_reason === 'length'
           if (data.message_id) assistant.id = data.message_id
+          // 反馈目标只认服务端 id；done 没带 id 时保持 null，绝不回退临时 UUID。
+          assistant.serverId = data.message_id ?? null
           userMessage.status = 'completed'
           assistant.streaming = false
           syncStreamScope(data)
@@ -1543,6 +1665,10 @@ async function send(retry?: RetrySnapshot) {
 onMounted(loadKbs)
 onBeforeUnmount(() => {
   disposed = true
+  feedbackSeq += 1
+  feedbackRequest?.abort()
+  feedbackRequest = null
+  feedbackSubmitting.value = false
   if (queryTimer) clearTimeout(queryTimer)
   queryTimer = undefined
   listController?.abort()

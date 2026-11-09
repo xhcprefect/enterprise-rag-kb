@@ -15,7 +15,7 @@
 | `responses.platform.missing-metrics.example.jsonl` | 缺少 `first_token_ms` 的缺指标样例 |
 | `baseline.platform.example.json` | 固定 run ID 的离线基线报告（无正文），用于比较门禁 |
 | `thresholds.example.json` | 延迟/费用的相对阈值示例 |
-| `templates/` | 真实业务问题标注模板与人工核验流程（仅模板，无真实资料） |
+| `templates/` | 真实业务问题标注、结果核验 JSON 模板与人工核验流程（仅模板，无真实资料） |
 
 ## 离线回放
 
@@ -45,6 +45,22 @@
 - `expected_sources` 新增可选 `index_version`：旧索引代次的引用即使文件名和片段号相同也判失败。
 - `document_ids`（1–5 个 UUID）只允许出现在 `mode=rag` 且没有 `conversation_id` 的新会话 case；真实模式只在首轮传入，续聊沿用会话已保存的范围。`mode=chat` 携带范围会在校验阶段被拒绝。
 
+### 结果指纹
+
+每条 `results[]` 包含两套独立版本化的指纹，原有结果指纹的 v1 语义不变：
+
+- `result_fingerprint_version`：当前为 `1`。
+- `result_sha256`：对完整实际答案、全部实际引用、实际 HTTP 状态和规范化错误码做规范 JSON SHA-256。引用覆盖文件名/文档身份、`chunk_index`、`index_version`、实际 `snippet` 及范围等全部字段；只排除 `score`、重排分、`*_ms`、抓取/更新时间等易变字段，不覆盖时间或耗时。
+- `machine_fingerprint_version`：独立的机器断言指纹版本，当前为 `1`。
+- `machine_sha256`：对版本号及 `passed`、`failures`、`outcome`、`expected_outcome`、`expected_http_status`、`http_status`、`error_type`、`citation_count` 做规范 JSON SHA-256；同时绑定 `id` 与 `result_sha256`，防止在不同案例或实际结果间移植摘要。缺失的 `error_type` 与显式 `null` 等价。不包含正文、时间、耗时或摘要自身，在机器字段全部确定后生成。
+- `citation_count`：实际引用条数；`expected_http_status` 与 `http_status` 成对记录，预期 4xx 负例必须精确匹配实际状态。
+- 结果指纹变化即表示支持性内容变化。答案、引用片段、索引代次或实际 HTTP 状态任一改变，旧的人工核验即失效，必须重新核验。
+- 默认报告只导出指纹与计数，不导出正文；只有显式 `--include-content` 才在报告和核验模板中携带问题、答案、引用正文与 trace。无正文报告仍可按正常流程得到 `reviewed_pass`，不会强制导出正文。
+
+核验入口始终重算并校验 `machine_sha256`，无正文时也不能直接信任机器字段；有正文时仍额外重算原有 `result_sha256` 并核对引用条数。机器指纹缺失、版本非法或摘要格式非法返回 `report_result_fingerprint_missing`（退出码 `4`）；摘要不匹配返回 `report_result_tampered`（退出码 `4`）。缺少机器绑定的旧报告须重新生成，不能直接进入人工核验。
+
+两种 SHA-256 都是不带密钥的一致性检查，不是签名或真实性证明：能重写整份报告并重新生成摘要的人仍能伪造自洽内容，工具无法据此证明报告来自可信评测执行。报告与人工核验文件仍须受控保存和传递。
+
 ## 数据集身份与基线比较
 
 每份报告包含 schema 2 的 `identity`，指标口径为 `metrics_version=1`：
@@ -55,7 +71,7 @@
 - `config`：仅接受白名单内的公开模型和检索参数，未知键（如 `token`、`base_url`）直接拒绝；模型名称含 URL 或账号信息也拒绝。CLI 根据 `--responses` / `--live` 写入 `mode`，不从配置文件读取模式。
 - `metrics_version`：指标口径版本；变化后旧基线不可比。旧身份 schema 也保持不可比，不隐式升级。
 
-语料最多 5000 个普通文件、合计 1 GiB；每个文件按 1 MiB 分块读取并计算 SHA-256。根目录、子目录或文件为符号链接，或目录无法完整读取时，拒绝生成身份。显式指定的目录不存在也返回配置错误。
+语料最多 5000 个普通文件、合计 1 GiB；每个文件按 1 MiB 分块读取并按原始字节计算 SHA-256。根目录、子目录或文件为符号链接，或目录无法完整读取时，拒绝生成身份。显式指定的目录不存在也返回配置错误。
 
 本地快照与索引清单都是调用者声明，不能证明远端服务实际使用了相同语料或索引；运行前须核对真实知识库内容和入库状态。工具不读取实际 `.env`、数据库或远端配置来补全身份。
 
@@ -231,13 +247,61 @@
 
 可用 `--only llm` / `--only embedding` 单独检查；LLM 默认最大输出 256 token，可用 `--max-tokens` 调整（最多 512）。检查不重试，不输出 API Key、生成正文或向量内容。连通性通过不代表完整问答链路或业务准确率通过。
 
+## 结果人工核验闭环
+
+固定断言只证明可机器检查的引用/短语/状态，**不是语义正确率**。真实业务验收还必须由核验人逐条阅读报告中的实际答案、引用原文和来源代次，并独立判断：
+
+- `answer_correct`：结论是否符合原文与业务口径；
+- `citation_supported`：每个引用是否真的支持对应结论；
+- `outcome_correct`：应回答、应拒答或应澄清的处置是否合理。
+
+三个判断均使用三态 `true` / `false` / `null`。`null` 只表示尚未核验或不适用，不能当作正确；可回答问题必须三项都有明确判断，拒答/澄清的答案正确性与引用支持可为 N/A，但处置合理性必须核验，且 RAG 拒答不得带引用。预期 HTTP 负例不做语义判断，只核对精确机器状态。问题集标注的 `review_state` 与本轮 `human_review` 是两个概念，报告中分别汇总。
+
+### 1. 生成报告与空模板
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m scripts.evaluate_rag --dataset evaluation/cases.platform.example.jsonl --responses evaluation/responses.platform.example.jsonl --output evaluation-results/current.json
+.\.venv\Scripts\python.exe -X utf8 -m scripts.review_evaluation --report evaluation-results/current.json --create-template evaluation-results/current.reviews.json
+```
+
+模板继承报告的 `run_id`、完整 `identity_sha256`、`mode` 和每条 `result_sha256`，所有判断、核验人、日期均为 `null`，不会自动勾选通过，也不会新建伪 run ID。常规模板不含正文；确需附带报告已有正文时显式加 `--template-include-content`（仅对 `--include-content` 报告有效，不会另行读取语料或远端来源）。人工核验文件格式见 [模板](templates/result-reviews.template.json) 与 [核验指南](templates/README.md)。
+
+### 2. 填写并核验
+
+在受控目录填写每条的三个判断、ASCII 核验人代号、有效 `YYYY-MM-DD` 日期；未解决问题写入 `unknowns`，解决后清空。核验文件中的 `run_id`、`identity_sha256`、`mode` 和每条 `result_sha256` 必须与报告一致；报告 `mode` 还必须与 `identity.config.mode` 一致，不能把 `offline` 改成 `live` 来升级验收结论。若核验条目包含 `content`，报告也必须包含同一份正文，且内容必须严格一致；否则视为核验对象已被替换并拒绝。零案例报告不能生成“逐条通过”的结论。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m scripts.review_evaluation --report evaluation-results/current.json --reviews C:/private/current.reviews.json --output evaluation-results/current.review-summary.json
+```
+
+退出码：`0` 全部核验且机器断言通过（`reviewed_pass`）；`1` 人工判错或机器断言失败；`2` 输入/结构错误；`4` run/identity/mode/指纹/案例集合不可比；`5` 缺核验、`null` 判断或 `unknowns` 未清空。只有 `reviewed_pass` 才能称“本轮机器断言与人工逐条核验均通过”，不能称准确率或真实业务验收通过。机器断言失败不能由人工 `true` 覆盖。
+
+核验摘要只输出计数、失败原因码和结论，不回显问题、答案、引用正文、核验人或 `unknowns` 原文。写入输出前会检查与报告/核验文件/模板的路径冲突（含符号链接解析）；已存在的输出必须显式 `--overwrite`。输入报告、核验文件和模板永远不会被覆盖。报告或核验文件中的字符串及对象键若包含孤立 UTF-16 代理，按输入错误退出 `2` 且不生成输出；合法代理对（emoji）规范化为实际字符后接受。
+
+### 3. 缺项阻断与基线
+
+- 缺失案例、重复案例、额外案例、旧报告无结果或机器指纹、错误 run/identity/mode、任一 `result_sha256` 不匹配或机器绑定不一致都 fail closed，不生成通过结论。
+- 未核验、`null`、开放 `unknowns`、缺核验人或日期都计为未知，阻止 `reviewed_pass`；未核验不计入正确。
+- 先完成本轮结果核验，再以相同问题集、完整语料快照、公开配置和显式声明的索引清单重建基线并比较；`offline` 回放不能称真实业务/生产验收通过。
+
+## 单条反馈回归协议
+
+管理员把一条已核实反馈显式纳入回归后，服务端只准备一条 case，不自动执行脚本或调用模型。新 case 带顶层 `regression_protocol: 1` 与 `regression_mode: offline|live` 标记；旧问题集没有该标记时行为完全不变。
+
+存在该标记时，CLI 在读取响应、计算配置身份或发起任何网络请求之前预检：必须恰好 1 个 case、显式传 `--run-id`、`--kb-id` 为空、`--live`/`--responses` 与实际模式一致，且 case 不得包含 `conversation_id`。任一不符退出码为 `2`。每次重新准备都会生成新的 run UUID，必须使用该轮返回的新 `--run-id` 和准备提示中的 `--require-reviewed`，不能沿用上一轮 run ID 或旧报告；同一 run 只用于恢复本轮。
+
+- `offline` 是用 `--responses` 的本地回放，只验证固定断言与绑定，不证明修复后的系统实际重新回答；`live` 也只表示执行方声明的真实调用，报告本身不认证远端执行真实性。
+- 默认无正文报告只做一致性校验（`consistency_only`）：校验 run、模式、单条 case、数据集摘要和机器指纹后采用报告声明结果；通过时只能称“报告声明通过（未重算断言）”。
+- 只有显式 `--include-content` 的报告才携带问题序列与正文（`content_regraded`）：导入时逐项核对问题顺序，并用 `grade_case` 对当前 case 重算断言；一致时采用重算结果，通过时称“断言复算通过（待人工复核）”。
+- 报告最大 2 MiB，按严格 JSON 解析（拒绝重复键、NaN/Infinity、非法编码、过深结构和畸形结构），且必须恰好包含 1 条与当前 case 同 ID 的结果。报告正文只在本次校验中使用，不进入列表、日志或审计；所有 SHA-256 都是无密钥一致性检查，不是报告真实性证明。
+
 ## 人工检查与故障场景
 
 固定断言不验证所有事实。请人工抽查“每项结论是否被引用原文支持”，并在专用测试库验证：同一会话并发、请求重放、断连/取消、文档删除或重新索引后的引用失效、私有知识库权限。真实数据库回归通过 `TEST_DATABASE_URL` 启用，数据库名必须以 `_test` 结尾且可清空；测试会清理该库数据。
 
 ## 真实业务问题与人工核验
 
-[字段模板](templates/business-questions.template.jsonl) 与 [人工核验指南](templates/README.md) 给出真实业务问题的标注流程。该目录只有模板，不含真实资料；原始模板可通过默认结构校验，但不能通过严格核验。
+[字段模板](templates/business-questions.template.jsonl)、[结果核验模板](templates/result-reviews.template.json) 与 [人工核验指南](templates/README.md) 给出真实业务问题的标注和本轮结果核验流程。该目录只有模板，不含真实资料；原始问题集模板可通过默认结构校验，但不能通过严格核验。结果核验必须从本轮报告用 `review_evaluation --create-template` 生成并逐条填写，不能用模板里的占位值伪造绑定。
 
 为私有业务问题集添加 `--require-reviewed`。它在创建 HTTP 客户端之前拒绝缺少有效 `verified_by` / `verified_at`、显式 `reviewed: false`、仍有 `unknowns`，或含明确模板标记的样本。合法的普通技术文本，如 `str.replace` 或 `TODO`，不会仅因这些词被当成模板。`unknowns` 是正式输入字段，保留未解决问题即可；问题解决后设为空列表，不必删除该字段。
 

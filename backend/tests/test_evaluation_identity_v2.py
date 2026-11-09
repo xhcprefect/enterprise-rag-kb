@@ -18,6 +18,18 @@ ROOT = Path(__file__).parents[1] / "evaluation"
 RUN_ID = "00000000-0000-4000-8000-000000000010"
 
 
+def _lf_documents_copy(temp):
+    """基线按 LF 语料生成；Windows 工作区用临时副本复现，不改真实语料。"""
+    target = Path(temp) / "documents-lf"
+    for source in sorted((ROOT / "documents").rglob("*")):
+        if not source.is_file():
+            continue
+        destination = target / source.relative_to(ROOT / "documents")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes().replace(b"\r\n", b"\n"))
+    return target
+
+
 def _cases(name="cases.platform.example.jsonl"):
     return ev.validate_cases(ev.read_jsonl(ROOT / name))
 
@@ -377,6 +389,7 @@ class CliRegressionTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             code = main(["--dataset", str(ROOT / "cases.platform.example.jsonl"),
                          "--responses", str(ROOT / "responses.platform.example.jsonl"),
+                         "--documents-dir", str(_lf_documents_copy(temp)),
                          "--baseline", str(ROOT / "baseline.platform.example.json"),
                          "--output", str(Path(temp) / "r.json")])
         client.assert_not_called()

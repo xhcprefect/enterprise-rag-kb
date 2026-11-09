@@ -129,6 +129,7 @@ const rules = computed<FormRules>(() => ({
     { required: true, min: 6, message: t('profile.validation.newMin'), trigger: 'blur' }
   ],
   confirm: [
+    { required: true, message: t('profile.validation.confirmRequired'), trigger: 'blur' },
     {
       validator: (_rule, value, callback) => {
         if (value !== form.new_password) callback(new Error(t('profile.validation.mismatch')))

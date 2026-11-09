@@ -85,6 +85,21 @@ class HistoricalSourceTests(unittest.TestCase):
             self.assertEqual(vector_store.load_ready_citations("kb_current", invalid), [])
         store.assert_not_called()
 
+    def test_source_kind_only_defaults_when_the_key_is_absent(self):
+        """旧引用没有该键才按 document 兼容；显式 None/非 document 一律拒绝。"""
+        legacy = {key: value for key, value in self.citation.items() if key != "source_kind"}
+        result, _ = self.load([legacy], [("原文", self.metadata)])
+        self.assertEqual(len(result), 1)
+        for kind in (None, "project", "unknown", "", "Document"):
+            with self.subTest(kind=kind), patch.object(vector_store, "get_vector_store") as store:
+                self.assertEqual(
+                    vector_store.load_ready_citations("kb_current", [{**self.citation, "source_kind": kind}]), [])
+            store.assert_not_called()
+
+    def test_explicit_document_kind_still_loads(self):
+        result, _ = self.load([{**self.citation, "source_kind": "document"}], [("原文", self.metadata)])
+        self.assertEqual(len(result), 1)
+
     def test_missing_collection_and_missing_original_do_not_return_old_snippets(self):
         self.store.get_collection.return_value = None
         result, db = self.load([self.citation], [])

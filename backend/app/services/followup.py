@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.config import settings
+from app.services import answer_sources
 from app.services.cloud_models import complete_short_chat
 from app.services.context_window import complete_turns, estimate_message_tokens, trim_history
 
@@ -62,6 +63,34 @@ class RetrievalPlan:
     clarification: str | None = None
     citations: list[dict] = field(default_factory=list)
     topic: str | None = None
+    # 真正影响本轮规划/改写的来源身份快照（answer_sources.parse_source 规范化的完整身份）。
+    # 与 citations 的区别：citations 只是被明确核验引用的来源；planning_sources 还包括
+    # 旧轮历史中实际参与改写或确定性规划但未（或尚不能）作为引用发布的来源。
+    planning_sources: list[dict] = field(default_factory=list)
+
+    def with_fields(self, **overrides) -> "RetrievalPlan":
+        """以本计划为基底按字段重建（只允许覆盖文本/状态，不触碰来源集合）。"""
+        fields = {"query": self.query, "status": self.status, "clarification": self.clarification,
+                  "citations": list(self.citations), "topic": self.topic,
+                  "planning_sources": list(self.planning_sources)}
+        unknown = set(overrides) - set(fields)
+        if unknown:
+            raise ValueError(f"RetrievalPlan 字段不存在: {sorted(unknown)}")
+        if "planning_sources" in overrides and list(overrides["planning_sources"]) != fields["planning_sources"]:
+            # 规划依赖只能通过严格收集器增补（with_sources），重建不得随意覆盖。
+            raise ValueError("with_fields 不能覆盖 planning_sources")
+        fields.update({key: value for key, value in overrides.items() if key != "planning_sources"})
+        return RetrievalPlan(**fields)
+
+    def with_sources(self, sources) -> "RetrievalPlan":
+        """以本计划的既有字段重建，并附加规划依赖（与已有来源并集、严格规范化）。"""
+        merged = answer_sources.sources_from_history(
+            [{"role": "assistant", "source_provenance": {
+                "source_snapshot_version": answer_sources.SOURCE_SNAPSHOT_VERSION,
+                "supplied_sources": [*self.planning_sources, *sources], "history_sources": []}}],
+            mode=answer_sources.CONVERSATION_MODE_RAG)
+        return RetrievalPlan(self.query, self.status, self.clarification, list(self.citations),
+                             self.topic, list(merged))
 
 
 def _number(text: str) -> int:
@@ -104,10 +133,14 @@ def _reference_plan(question: str, turns: list[tuple[dict, dict]]) -> RetrievalP
     available = {citation.get("source_index") or position: citation
                  for position, citation in enumerate(assistant.get("citations") or [], start=1)}
     if any(index not in available for index in indices):
-        return RetrievalPlan(question, "clarify", "上一轮回答没有您指定的引用来源，请确认来源编号或提供文档名称。")
+        # 缺失编号分支确实读取了上一轮引用列表并据此提示用户；该轮快照必须随计划。
+        return RetrievalPlan(question, "clarify", "上一轮回答没有您指定的引用来源，请确认来源编号或提供文档名称。",
+                             planning_sources=_turn_sources(assistant))
     citations = [{**available[index], "source_index": index, "source_message_id": assistant.get("id")}
                  for index in indices]
-    return RetrievalPlan(question, "reference", citations=citations)
+    # 成功 reference 分支实际核验的就是上一轮引用；完整快照（含未引用传递来源）随计划。
+    return RetrievalPlan(question, "reference", citations=citations,
+                         planning_sources=_turn_sources(assistant))
 
 
 def _is_clarification(assistant: dict) -> bool:
@@ -203,14 +236,26 @@ def _contextual_question(question: str, documents: dict[str, dict]) -> bool:
                                                   or _named_choices(text, documents) or _BARE_OPTION.fullmatch(text))
 
 
-def _pending_question(turns: list[tuple[dict, dict]], documents: dict[str, dict] | None = None, anchor: int | None = None) -> str:
+def _turn_sources(assistant: dict) -> list[dict]:
+    """单轮严格来源快照；缺失/坏 provenance 直接抛 SourceSnapshotError（不静默降级）。"""
+    return list(answer_sources.sources_from_history([assistant], mode=answer_sources.CONVERSATION_MODE_RAG))
+
+
+def _pending_question(turns: list[tuple[dict, dict]], documents: dict[str, dict] | None = None,
+                      anchor: int | None = None) -> tuple[str, list[dict]]:
+    """返回 (派生主题文本, 真正被采用为依赖的 assistant 轮列表)。
+
+    saved topic 派生依赖锚定轮与之后用户的追问轮；上下文回溯派生依赖回溯到的
+    锚定轮。调用方必须用返回的轮次集合（而非下标切片）作为来源依赖。
+    """
     start = len(turns) - 1 if anchor is None else anchor
     saved = turns[start][1].get("followup_topic")
     if isinstance(saved, str) and saved.strip():
-        return "\n".join(dict.fromkeys([saved, *(user["content"] for user, _ in turns[start + 1:])]))
+        text = "\n".join(dict.fromkeys([saved, *(user["content"] for user, _ in turns[start + 1:])]))
+        return text, [turns[start][1]]
     while start > 0 and _contextual_question(turns[start][0]["content"], documents or {}):
         start -= 1
-    return "\n".join(dict.fromkeys(user["content"] for user, _ in turns[start:]))
+    return "\n".join(dict.fromkeys(user["content"] for user, _ in turns[start:])), [turns[start][1]]
 
 
 def _source_followup(question: str, turns: list[tuple[dict, dict]]) -> RetrievalPlan | None:
@@ -226,21 +271,41 @@ def _source_followup(question: str, turns: list[tuple[dict, dict]]) -> Retrieval
         text = recent[index][0]["content"]
         if not _contextual_question(text, documents):
             return None
+    used_assistants = [recent[anchor][1]]
     chosen = _document_choices(question, documents, recent[-1][1])
+    # 显式文件名选择不需要读澄清轮正文；仅当实际解析了选项顺序/版本时，澄清轮
+    # 的完整快照（含未引用的传递来源）才是真实依赖。
+    if chosen and not _named_choices(question, documents):
+        used_assistants.append(recent[-1][1])
+    # 严格收集时机紧跟实际读取来源的判定：多身份“多份同名”与标题判定都在此处
+    # 已经读取了 anchor/澄清轮正文，其快照必须随计划携带，坏/超限同样传播。
+    def planning_of(assistants):
+        return list(answer_sources.parse_sources(
+            [source for assistant in assistants for source in _turn_sources(assistant)]))
     elaboration = bool(_ELABORATION.fullmatch(question.strip()))
     if not chosen and not elaboration:
         return None
     if chosen and len(chosen) != 1:
-        return RetrievalPlan(question, "clarify", "已引用资料中有多份同名或不同版本的文件，请提供完整版本名或来源编号，以便准确选择。")
-    if elaboration and anchor != len(recent) - 1 and not _BOOK_TITLE.search(recent[-1][1].get("content") or ""):
-        return None
+        return RetrievalPlan(question, "clarify", "已引用资料中有多份同名或不同版本的文件，请提供完整版本名或来源编号，以便准确选择。",
+                             planning_sources=planning_of(used_assistants))
+    if elaboration and anchor != len(recent) - 1:
+        # 该分支实际读取 last assistant 的书名正文决定成立与否；采用即携带其完整快照。
+        if not _BOOK_TITLE.search(recent[-1][1].get("content") or ""):
+            return None
+        if all(existing is not recent[-1][1] for existing in used_assistants):
+            used_assistants.append(recent[-1][1])
     selected = [document for identifier, document in documents.items() if not chosen or identifier in chosen]
     citations = [citation for document in selected for citation in document["citations"]]
     names = "、".join("《" + document["filename"] + "》" for document in selected)
-    topic = _pending_question(recent, documents, anchor)
+    topic, pending_used = _pending_question(recent, documents, anchor)
+    for assistant in pending_used:
+        if all(existing is not assistant for existing in used_assistants):
+            used_assistants.append(assistant)
+    planning = planning_of(used_assistants)
     instruction = "用户已明确选择该文件，请直接继续回答，不要再次要求选择文件。" if chosen else "请分别展开各文件的口径，明确区分，避免混为同一个标准。"
     query = f"围绕原问题和后续要求：\n{topic}\n本轮要求：{question}\n限定已引用文件：{names}\n{instruction}"
-    return RetrievalPlan(query, "document_followup" if chosen else "elaboration", citations=citations, topic=topic)
+    return RetrievalPlan(query, "document_followup" if chosen else "elaboration",
+                         citations=citations, topic=topic, planning_sources=planning)
 
 
 def is_topic_switch(question: str) -> bool:
@@ -253,9 +318,11 @@ def plan_retrieval(question: str, history: list[dict], *, document_scope: list[d
     turns = complete_turns(history)
     reference = _reference_plan(question, turns)
     if reference is not None:
+        # 依赖已在 _reference_plan 内按实际采用分支收集（成功/缺失编号收上一轮，早退为空）。
         return reference
     source_followup = _source_followup(question, turns)
     if source_followup is not None:
+        # 依赖已在 _source_followup 内按实际读取/派生采用的轮次收集。
         return source_followup
     clarification_reply = _clarification_reply(question, turns)
     if not settings.RETRIEVAL_REWRITE_ENABLED or not (_FOLLOWUP.search(question.strip()) or _ELABORATION.fullmatch(question.strip()) or clarification_reply):
@@ -291,6 +358,17 @@ def plan_retrieval(question: str, history: list[dict], *, document_scope: list[d
         history_budget -= overflow + 64
     else:
         return RetrievalPlan(question, "fallback")
+    # 严格来源快照：改写分支的规划依赖就是实际送入模型的裁剪后 recent，必须先于模型
+    # 调用整轮解析；缺失/坏 provenance 是真实故障，整轮失败（不允许用旧正文后再记空）。
+    planning_sources = list(answer_sources.sources_from_history(recent, mode=answer_sources.CONVERSATION_MODE_RAG))
+    window = turns[-settings.RETRIEVAL_REWRITE_HISTORY_TURNS:]
+
+    def pending_dependencies(used_assistants):
+        """派生 topic 真正采用的轮次快照与改写 recent 来源并集（严格规范化、去重）。"""
+        return list(answer_sources.parse_sources(
+            [*planning_sources,
+             *answer_sources.sources_from_history(used_assistants, mode=answer_sources.CONVERSATION_MODE_RAG)]))
+
     try:
         response = complete_short_chat(messages, timeout=settings.RETRIEVAL_REWRITE_TIMEOUT,
                                        max_tokens=settings.RETRIEVAL_REWRITE_MAX_TOKENS)
@@ -304,18 +382,32 @@ def plan_retrieval(question: str, history: list[dict], *, document_scope: list[d
             clarification = result.get("question")
             if not isinstance(clarification, str) or not 1 <= len(clarification.strip()) <= 300:
                 raise ValueError("invalid clarification")
-            return RetrievalPlan(question, "clarify", clarification.strip(),
-                                 topic=_pending_question(turns[-settings.RETRIEVAL_REWRITE_HISTORY_TURNS:]))
+            # 澄清计划的主题来自 saved topic/锚定轮派生；其真正采用的轮次快照与 recent 并集。
+            topic, pending_used = _pending_question(window)
+            return RetrievalPlan(question, "clarify", clarification.strip(), topic=topic,
+                                 planning_sources=pending_dependencies(pending_used))
         query = result.get("query")
         if result.get("action") != "search" or not isinstance(query, str) or not 1 <= len(query.strip()) <= 2000:
             raise ValueError("invalid search query")
         query = query.strip()
+        # 模型只复述原问题时，检索问题由 pending 派生拼接，真正采用的历史轮必须随计划。
         if clarification_reply and query == question:
-            query = _pending_question(turns[-settings.RETRIEVAL_REWRITE_HISTORY_TURNS:]) + "\n用户补充条件：" + question
-        return RetrievalPlan(query, "rewritten" if query != question else "original", topic=query if query != question else None)
+            topic, pending_used = _pending_question(window)
+            query = topic + "\n用户补充条件：" + question
+            planning_sources = pending_dependencies(pending_used)
+        status = "rewritten" if query != question else "original"
+        return RetrievalPlan(query, status, topic=query if query != question else None,
+                             planning_sources=planning_sources if query != question else [])
+    except answer_sources.SourceSnapshotError:
+        # 来源快照故障（缺失/坏/超限）不是模型可回退的问题，必须整轮失败传播。
+        raise
     except Exception as exc:
         # 不记录上游响应或历史正文，避免模型错误内容带出密钥或敏感资料。
         logger.warning("追问补全失败，回退检索问题: %s", type(exc).__name__)
-        query = (_pending_question(turns[-settings.RETRIEVAL_REWRITE_HISTORY_TURNS:]) + "\n用户补充条件：" + question
-                 if clarification_reply else question)
-        return RetrievalPlan(query, "fallback", topic=query if clarification_reply else None)
+        if not clarification_reply:
+            return RetrievalPlan(question, "fallback")
+        # fallback 派生 topic 同样可能采用 saved topic/锚定轮；坏源不降级，直接传播。
+        topic, pending_used = _pending_question(window)
+        query = topic + "\n用户补充条件：" + question
+        return RetrievalPlan(query, "fallback", topic=query,
+                             planning_sources=pending_dependencies(pending_used))

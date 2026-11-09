@@ -1,10 +1,13 @@
 """检索 + 生成。"""
 import logging
 import re
+import time
 from collections.abc import AsyncIterator, Iterable, Iterator
 
 import anyio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from app.services import answer_sources
 
 from langchain_core.documents import Document as LCDocument
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -151,80 +154,143 @@ def finalize_citations(answer: str, candidates: list[dict]) -> list[dict]:
     return citations
 
 
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.perf_counter() - started) * 1000))
+
+
 def retrieve(collection_name: str, question: str, top_k: int, *,
-             document_scope: list[dict] | None = None) -> list[tuple[LCDocument, float]]:
-    """合并两路候选；文档范围在两路 SQL 排名和截断前生效。"""
+             document_scope: list[dict] | None = None,
+             trace: dict | None = None) -> list[tuple[LCDocument, float]]:
+    """合并两路候选；文档范围在两路 SQL 排名和截断前生效。
+
+    ``trace`` 仅供管理员检索诊断：传入 dict 时按阶段写入计数与耗时；
+    不改变候选、顺序或异常语义，``trace=None`` 与原实现完全一致。
+    """
     from app.services import document_scopes
     from app.services.hybrid_search import fuse_results, rerank_results
     from app.services.retrieval_candidates import expand_neighbors, keyword_candidates
 
-    if document_scope is not None:
-        document_scopes.scope_pairs(document_scope)  # 非法身份不能进入关键词降级路径。
-        if not document_scope:
-            return []
-    scope_options = {"document_scope": document_scope} if document_scope is not None else {}
-
-    def in_scope(pairs):
-        return pairs if document_scope is None else [pair for pair in pairs if document_scopes.contains(document_scope, pair[0].metadata)]
-
-    limit = max(1, settings.RETRIEVAL_MAX_PER_DOC)
-    vector_error = None
-    pairs = []
+    total_started = time.perf_counter() if trace is not None else 0.0
     try:
-        store = get_vector_store(collection_name)
-        local_call = ModelCall("embedding", "ollama", settings.EMBEDDING_MODEL) if settings.EMBEDDING_PROVIDER != "cloud" else None
-        try:
-            vector = store.embeddings.embed_query(question)  # 扩大候选池时复用同一查询向量。
-        except BaseException:
-            if local_call:
-                local_call.finish("failed")
-            raise
-        else:
-            if local_call:
-                local_call.finish()  # Ollama embeddings 未返回 token，明确保留未知。
-        size = max(top_k * 10, 40)
-        while True:
-            fetched = in_scope(search_ready_vectors(store, vector, size, **scope_options))
-            if not fetched:
-                break
-            pairs = fetched
-            if len(_pick_with_doc_cap(pairs, top_k, limit)) >= top_k or len(fetched) < size or size >= 400:
-                break
-            size = min(size * 2, 400)
-    except Exception as exc:
-        if not settings.HYBRID_RETRIEVAL_ENABLED:
-            raise
-        vector_error = exc
-        logger.warning("向量检索失败，尝试关键词候选: %s", type(exc).__name__)
+        if document_scope is not None:
+            document_scopes.scope_pairs(document_scope)  # 非法身份不能进入关键词降级路径。
+            if not document_scope:
+                return []
+        scope_options = {"document_scope": document_scope} if document_scope is not None else {}
 
-    if settings.HYBRID_RETRIEVAL_ENABLED:
+        def in_scope(pairs):
+            return pairs if document_scope is None else [pair for pair in pairs if document_scopes.contains(document_scope, pair[0].metadata)]
+
+        limit = max(1, settings.RETRIEVAL_MAX_PER_DOC)
+        vector_error = None
+        pairs = []
+        vector_started = time.perf_counter() if trace is not None else 0.0
         try:
-            keywords = in_scope(keyword_candidates(collection_name, question, settings.KEYWORD_CANDIDATES, **scope_options))
+            store = get_vector_store(collection_name)
+            local_call = ModelCall("embedding", "ollama", settings.EMBEDDING_MODEL) if settings.EMBEDDING_PROVIDER != "cloud" else None
+            try:
+                vector = store.embeddings.embed_query(question)  # 扩大候选池时复用同一查询向量。
+            except BaseException:
+                if local_call:
+                    local_call.finish("failed")
+                raise
+            else:
+                if local_call:
+                    local_call.finish()  # Ollama embeddings 未返回 token，明确保留未知。
+            size = max(top_k * 10, 40)
+            while True:
+                fetched = in_scope(search_ready_vectors(store, vector, size, **scope_options))
+                if not fetched:
+                    break
+                pairs = fetched
+                if len(_pick_with_doc_cap(pairs, top_k, limit)) >= top_k or len(fetched) < size or size >= 400:
+                    break
+                size = min(size * 2, 400)
         except Exception as exc:
-            if vector_error:
-                raise vector_error from exc
-            logger.warning("关键词检索失败，使用向量候选: %s", type(exc).__name__)
-            keywords = []
-        if vector_error and not keywords:
-            raise vector_error
-        pairs = fuse_results(pairs, keywords, limit=200)
-    if settings.RERANK_ENABLED:
-        reranked = rerank_results(question, pairs[:40], base_url=settings.RERANK_BASE_URL,
-                                 api_key=settings.RERANK_API_KEY, model=settings.RERANK_MODEL,
-                                 timeout=settings.RERANK_TIMEOUT, max_chars=settings.RERANK_MAX_CHARS)
-        pairs = [*reranked, *pairs[40:]]
+            if trace is not None:
+                trace["vector"] = {"status": "error", "ms": _elapsed_ms(vector_started),
+                                   "candidates": len(pairs), "error_type": type(exc).__name__}
+            if not settings.HYBRID_RETRIEVAL_ENABLED:
+                raise
+            vector_error = exc
+            logger.warning("向量检索失败，尝试关键词候选: %s", type(exc).__name__)
+        else:
+            if trace is not None:
+                trace["vector"] = {"status": "ok", "ms": _elapsed_ms(vector_started),
+                                   "candidates": len(pairs), "error_type": None}
 
-    picked = _pick_with_doc_cap(pairs, top_k, limit)
-    seen = {id(doc) for doc, _ in picked}
-    for pair in pairs:
-        if len(picked) >= top_k:
-            break
-        if id(pair[0]) not in seen:
-            picked.append(pair)
-            seen.add(id(pair[0]))
-    order = {id(doc): position for position, (doc, _) in enumerate(pairs)}
-    picked.sort(key=lambda pair: order[id(pair[0])])
-    return in_scope(expand_neighbors(collection_name, picked, settings.RETRIEVAL_NEIGHBOR_CHUNKS))
+        if settings.HYBRID_RETRIEVAL_ENABLED:
+            keyword_started = time.perf_counter() if trace is not None else 0.0
+            try:
+                keywords = in_scope(keyword_candidates(collection_name, question, settings.KEYWORD_CANDIDATES, **scope_options))
+            except Exception as exc:
+                if trace is not None:
+                    trace["keyword"] = {"status": "error", "ms": _elapsed_ms(keyword_started),
+                                        "candidates": 0, "error_type": type(exc).__name__}
+                if vector_error:
+                    raise vector_error from exc
+                logger.warning("关键词检索失败，使用向量候选: %s", type(exc).__name__)
+                keywords = []
+            else:
+                if trace is not None:
+                    trace["keyword"] = {"status": "ok", "ms": _elapsed_ms(keyword_started),
+                                        "candidates": len(keywords), "error_type": None}
+            if vector_error and not keywords:
+                raise vector_error
+            fusion_started = time.perf_counter() if trace is not None else 0.0
+            pairs = fuse_results(pairs, keywords, limit=200)
+            if trace is not None:
+                trace["fusion"] = {"status": "ok", "ms": _elapsed_ms(fusion_started),
+                                   "candidates": len(pairs)}
+        elif trace is not None:
+            trace["keyword"] = {"status": "skipped", "ms": 0, "candidates": 0, "error_type": None}
+            trace["fusion"] = {"status": "skipped", "ms": 0, "candidates": len(pairs)}
+        if settings.RERANK_ENABLED:
+            rerank_started = time.perf_counter() if trace is not None else 0.0
+            configured = bool(settings.RERANK_BASE_URL) and bool(settings.RERANK_MODEL)
+            reranked = rerank_results(question, pairs[:40], base_url=settings.RERANK_BASE_URL,
+                                      api_key=settings.RERANK_API_KEY, model=settings.RERANK_MODEL,
+                                      timeout=settings.RERANK_TIMEOUT, max_chars=settings.RERANK_MAX_CHARS)
+            pairs = [*reranked, *pairs[40:]]
+            if trace is not None:
+                if configured:
+                    applied = any(isinstance(getattr(doc, "metadata", None), dict)
+                                  and "rerank_score" in doc.metadata for doc, _ in reranked[:40])
+                    trace["rerank"] = {"status": "ok" if applied else "fallback",
+                                       "ms": _elapsed_ms(rerank_started), "candidates": len(pairs),
+                                       "applied": applied, "reason": None}
+                else:
+                    trace["rerank"] = {"status": "skipped", "ms": 0, "candidates": len(pairs),
+                                       "applied": False, "reason": "not_configured"}
+        elif trace is not None:
+            trace["rerank"] = {"status": "skipped", "ms": 0, "candidates": len(pairs),
+                               "applied": False, "reason": "disabled"}
+
+        select_started = time.perf_counter() if trace is not None else 0.0
+        picked = _pick_with_doc_cap(pairs, top_k, limit)
+        seen = {id(doc) for doc, _ in picked}
+        for pair in pairs:
+            if len(picked) >= top_k:
+                break
+            if id(pair[0]) not in seen:
+                picked.append(pair)
+                seen.add(id(pair[0]))
+        order = {id(doc): position for position, (doc, _) in enumerate(pairs)}
+        picked.sort(key=lambda pair: order[id(pair[0])])
+        if trace is not None:
+            trace["select"] = {"status": "ok", "ms": _elapsed_ms(select_started),
+                               "candidates": len(picked)}
+
+        neighbors_started = time.perf_counter() if trace is not None else 0.0
+        result = in_scope(expand_neighbors(collection_name, picked, settings.RETRIEVAL_NEIGHBOR_CHUNKS))
+        if trace is not None:
+            trace["neighbors"] = {"status": "ok", "ms": _elapsed_ms(neighbors_started),
+                                  "candidates": len(result),
+                                  "dropped": max(0, len(picked) - len(result))}
+        return result
+    finally:
+        if trace is not None:
+            trace["total_ms"] = _elapsed_ms(total_started)
 
 
 def supplement_sources(collection_name: str, query: str, anchors: list[tuple[LCDocument, float]],
@@ -307,6 +373,7 @@ class PreparedAnswer:
     pairs: list[tuple[LCDocument, float]]
     input_tokens: int
     input_budget: int
+    history_sources: list[dict] = field(default_factory=list)
 
 
 def _anchor_only(doc: LCDocument) -> LCDocument:
@@ -385,7 +452,8 @@ def prepare_answer(
     estimated = estimate_message_tokens(messages)
     if estimated > budget:
         raise ContextBudgetError("上下文超过模型输入预算，请缩短问题或调整模型上下文配置。")
-    return PreparedAnswer(messages, selected, estimated, budget)
+    historical = answer_sources.sources_from_history(bounded_history, mode=mode)
+    return PreparedAnswer(messages, selected, estimated, budget, [dict(item) for item in historical])
 
 
 def _split_lowtrust_summary(history: list[dict]) -> tuple[list[dict], list[dict]]:
