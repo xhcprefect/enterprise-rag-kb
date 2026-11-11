@@ -43,6 +43,9 @@ if TEST_URL:
         FeedbackRegression,
         FeedbackRegressionRun,
         Message,
+        ProjectChunk,
+        ProjectFileVersion,
+        ProjectSnapshot,
         User,
     )
     from app.services.evaluation import (
@@ -133,6 +136,34 @@ class FeedbackRegressionTests(_Helpers, unittest.TestCase):
             chunk_count=1,
             enabled=True,
         )
+
+    def complete_project_binding(self, *, relative_path="src/main.py", chunks=1):
+        """在共享 fixture 上补齐真实 manifest/config、解析状态与已嵌入 chunk。"""
+        kb_id, snapshot_id, file_version_id = self.project_binding(
+            revoked=False,
+            public=True,
+            owner_id=self.owner_id,
+            relative_path=relative_path,
+        )
+        with SessionLocal() as db:
+            snapshot = db.get(ProjectSnapshot, snapshot_id)
+            snapshot.manifest_fingerprint = "d" * 64
+            snapshot.config_fingerprint = "e" * 64
+            version = db.get(ProjectFileVersion, file_version_id)
+            version.parse_status = "ready"
+            version.parse_done = True
+            for index in range(chunks):
+                db.add(
+                    ProjectChunk(
+                        file_version_id=file_version_id,
+                        chunk_index=index,
+                        content=f"项目分块{index}",
+                        search_text=f"项目分块{index}",
+                        embedded=True,
+                    )
+                )
+            db.commit()
+        return kb_id, snapshot_id, file_version_id
 
     def verified_feedback(
         self,
@@ -535,6 +566,31 @@ class FeedbackRegressionTests(_Helpers, unittest.TestCase):
         self.assertEqual(case["expected_sources"], [])
         self.assertEqual(case["regression_mode"], "offline")
 
+    def test_stale_original_citation_does_not_block_corrected_expected_source(self):
+        # 反馈可针对“原引用错误/旧资料”：新执行只用原问题序列与本次临时历史，
+        # 不能因为旧回答引用现已不可检索就拒绝一条标注正确的反馈。
+        missing_source = {
+            "document_id": str(uuid.uuid4()),
+            "filename": "deleted-source.md",
+            "chunk_index": 0,
+            "index_version": 0,
+        }
+        target = self.add_answer(citations=[missing_source])
+        feedback_id = self.submit_ok(target.message_id)
+        self.assertEqual(
+            self.review(feedback_id, expected_sources=[{"document_id": str(self.doc_id)}]).status_code,
+            200,
+        )
+        data = self.enroll_ok(feedback_id)
+        self.assertTrue(data["available"])
+        prepared = self.prepare_ok(feedback_id, revision=1)
+        case = json.loads(prepared["jsonl"])
+        self.assertEqual(
+            [source["document_id"] for source in case["expected_sources"]],
+            [str(self.doc_id)],
+        )
+        self.assertNotIn("deleted-source.md", prepared["jsonl"])
+
     def test_get_reports_reason_for_non_enrollable_feedback(self):
         # 历史行存在但当前资格已不满足时，GET 必须给出对应 reason（不 500）。
         pending_id = self.submit_ok(self.add_answer().message_id)
@@ -582,15 +638,71 @@ class FeedbackRegressionTests(_Helpers, unittest.TestCase):
         self.assertEqual(pending["unavailable_reason"], "feedback_not_verified")
         project = self.get_regression(project_feedback).json()["data"]
         self.assertFalse(project["available"])
-        self.assertEqual(project["unavailable_reason"], "project_unsupported")
+        self.assertEqual(project["unavailable_reason"], "project_snapshot_invalid")
 
-    def test_enrollment_blocks_project_scope_turns_ambiguity_and_incomplete(self):
-        # 项目库/项目快照。
-        project_kb_id, snapshot_id, file_version_id = self.project_binding(
-            revoked=False,
-            public=True,
-            owner_id=self.owner_id,
-            relative_path="src/main.py",
+    def test_large_library_manual_regression_ignores_online_manifest_cap(self):
+        """旧 manual 回归不冻结整库执行清单，257 份可检索文档仍应完整可用。
+
+        在线执行入口仍必须在该规模显式 manifest_overflow，不能截断或退化为全库。
+        """
+        with SessionLocal() as db:
+            for index in range(256):
+                db.add(self._new_document(db, self.kb_id, f"bulk-{index:03d}.md"))
+            db.commit()
+            total = db.scalar(
+                select(func.count())
+                .select_from(Document)
+                .where(Document.kb_id == self.kb_id)
+            )
+        self.assertEqual(total, 257)
+
+        feedback_id, _ = self.verified_feedback()
+        enrolled = self.enroll_ok(feedback_id)
+        self.assertTrue(enrolled["available"])
+        self.assertIsNone(enrolled["unavailable_reason"])
+
+        # 纳入后 GET 不得因整库规模变为不可用。
+        detail = self.get_regression(feedback_id).json()["data"]
+        self.assertTrue(detail["available"])
+        self.assertIsNone(detail["unavailable_reason"])
+
+        prepared = self.prepare_ok(feedback_id, revision=1)
+        exported = self.export_run(feedback_id, prepared["run"]["run_id"])
+        self.assertEqual(exported.status_code, 200, exported.text)
+        self.assertEqual(exported.json()["data"]["jsonl"], prepared["jsonl"])
+
+        report = self.build_report(prepared)
+        imported = self.import_report(
+            feedback_id,
+            prepared["run"]["run_id"],
+            revision=prepared["regression_revision"],
+            body=self.report_bytes(report),
+        )
+        self.assertEqual(imported.status_code, 200, imported.text)
+        self.assertEqual(imported.json()["data"]["run"]["state"], "imported")
+
+        # 大库幂等重放仍成功（不触 256 上限）。
+        replay = self.enroll(feedback_id)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertTrue(replay.json()["data"]["available"])
+
+        # 在线执行上下文默认冻结整库清单：同规模必须显式拒绝，绝不截断。
+        from app.services import feedback_regression_context as context
+
+        with SessionLocal() as db:
+            with self.assertRaises(context.RegressionContextError) as raised:
+                context.build_batch_contexts(
+                    db,
+                    admin_id=self.admin_id,
+                    auth_token_version=0,
+                    feedback_ids=[feedback_id],
+                )
+        self.assertEqual(raised.exception.reason, "manifest_overflow")
+        self.assertEqual(raised.exception.status_code, 409)
+
+    def test_project_feedback_enrolls_offline_and_rejects_old_live_cli(self):
+        project_kb_id, snapshot_id, file_version_id = self.complete_project_binding(
+            relative_path="src/main.py", chunks=2
         )
         project_answer = self.add_answer(
             kb_id=project_kb_id, project_snapshot_id=snapshot_id
@@ -602,25 +714,92 @@ class FeedbackRegressionTests(_Helpers, unittest.TestCase):
                 {
                     "document_id": str(file_version_id),
                     "filename": "src/main.py",
+                    "chunk_index": 1,
                 }
             ],
         )
         self.assertEqual(reviewed.status_code, 200, reviewed.text)
-        project = self.enroll(project_feedback)
-        self.assertEqual(project.status_code, 409, project.text)
-        self.assertIn("project_unsupported", project.json()["message"])
+        data = self.enroll_ok(project_feedback)
+        self.assertTrue(data["available"])
 
-        # 曾变更文档范围。
+        prepared = self.prepare_ok(project_feedback, revision=1, mode="offline")
+        case = json.loads(prepared["jsonl"])
+        self.assertEqual(case["project_identity"]["snapshot_id"], str(snapshot_id))
+        self.assertEqual(case["project_identity"]["source_id"], str(
+            self._project_source_id(snapshot_id)
+        ))
+        self.assertEqual(case["expected_sources"][0]["source_kind"], "project")
+        self.assertEqual(
+            case["expected_sources"][0]["file_version_id"], str(file_version_id)
+        )
+        self.assertEqual(
+            case["expected_sources"][0]["relative_path"], "src/main.py"
+        )
+        self.assertNotIn("document_scope", case)
+
+        live = self.prepare(
+            project_feedback, revision=prepared["regression_revision"], mode="live"
+        )
+        self.assertEqual(live.status_code, 409, live.text)
+        self.assertIn("live_fixed_scope_unsupported", live.json()["message"])
+
+        exported = self.export_run(project_feedback, prepared["run"]["run_id"])
+        self.assertEqual(exported.status_code, 200, exported.text)
+        self.assertEqual(
+            json.loads(exported.json()["data"]["jsonl"])["regression_mode"], "offline"
+        )
+
+    def test_limited_scope_enrolls_and_rejects_out_of_scope_sources(self):
         scoped = self.add_answer()
         with SessionLocal() as db:
+            db.get(Conversation, scoped.conversation_id).document_scope = [
+                {"document_id": str(self.doc_id), "index_version": 0}
+            ]
             db.get(Conversation, scoped.conversation_id).scope_revision = 1
             db.commit()
         scoped_feedback = self.submit_ok(scoped.message_id)
         self.assertEqual(self.review(scoped_feedback).status_code, 200)
-        scope = self.enroll(scoped_feedback)
-        self.assertEqual(scope.status_code, 409, scope.text)
-        self.assertIn("scope_unsupported", scope.json()["message"])
+        self.enroll_ok(scoped_feedback)
+        prepared = self.prepare_ok(scoped_feedback, revision=1, mode="offline")
+        case = json.loads(prepared["jsonl"])
+        self.assertEqual(
+            case["document_scope"],
+            [{"document_id": str(self.doc_id), "index_version": 0}],
+        )
+        live = self.prepare(
+            scoped_feedback, revision=prepared["regression_revision"], mode="live"
+        )
+        self.assertEqual(live.status_code, 409, live.text)
+        self.assertIn("live_fixed_scope_unsupported", live.json()["message"])
 
+        # 标注来源越过原限定范围必须被拒绝。
+        with SessionLocal() as db:
+            other = self._new_document(db, self.kb_id, "outside.md")
+            db.add(other)
+            db.flush()
+            other_id = other.id
+            db.commit()
+        outside_answer = self.add_answer()
+        outside_feedback = self.submit_ok(outside_answer.message_id)
+        with SessionLocal() as db:
+            conversation = db.get(Conversation, outside_answer.conversation_id)
+            conversation.document_scope = [
+                {"document_id": str(self.doc_id), "index_version": 0}
+            ]
+            conversation.scope_revision = 1
+            db.commit()
+        self.assertEqual(
+            self.review(
+                outside_feedback,
+                expected_sources=[{"document_id": str(other_id)}],
+            ).status_code,
+            200,
+        )
+        outside = self.enroll(outside_feedback)
+        self.assertEqual(outside.status_code, 409, outside.text)
+        self.assertIn("source_invalid", outside.json()["message"])
+
+    def test_enrollment_blocks_turns_ambiguity_and_incomplete(self):
         # 超过 10 轮。
         many = self.create_multi_turn([f"回归问题{i}" for i in range(1, 12)])
         many_feedback = self.submit_ok(many.message_id)
@@ -649,6 +828,13 @@ class FeedbackRegressionTests(_Helpers, unittest.TestCase):
         incomplete = self.enroll(incomplete_feedback)
         self.assertEqual(incomplete.status_code, 409, incomplete.text)
         self.assertIn("annotation_incomplete", incomplete.json()["message"])
+
+    @staticmethod
+    def _project_source_id(snapshot_id):
+        from app.models import ProjectSnapshot as _ProjectSnapshot
+
+        with SessionLocal() as db:
+            return db.get(_ProjectSnapshot, snapshot_id).source_id
 
     # ------------------------------------------------------------ prepare/export
 

@@ -36,6 +36,8 @@ from unittest.mock import patch
 
 from sqlalchemy import func, select
 
+from fastapi import Request
+
 from tests import _memory_project_test_gate as gate
 
 # 导入期绝不改 env / 不硬写 URL/owner；全部取自已设好的启动环境。
@@ -137,7 +139,10 @@ class ProjectUploadGuardPgTests(unittest.TestCase):
         self.app.dependency_overrides.clear()
         self._conn.close()
 
-    def _override_user(self):
+    def _override_user(self, request: Request):
+        # 认证依赖在生产中把原始令牌版本写到请求状态；覆盖依赖同样必须提供，
+        # 否则维护写入口会按 fail-closed 直接 401（而不是被测的项目库 400）。
+        request.state.auth_token_version = self.admin.token_version
         return self.admin
 
     def _override_get_db(self):

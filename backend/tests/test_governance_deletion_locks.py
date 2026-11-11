@@ -18,6 +18,7 @@ loopback ``*_test`` 库时整类 skip，绝不连接业务库。
 """
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -28,7 +29,7 @@ from tests._pg_lock_wait import wait_for_blocking
 from datetime import datetime, timezone
 from pathlib import Path
 
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from sqlalchemy import delete, event, select, text
 from sqlalchemy.dialects import postgresql
@@ -44,6 +45,7 @@ from app.models import (
     Conversation,
     Document,
     KnowledgeBase,
+    KnowledgeBaseMember,
     Message,
     ProjectSnapshot,
     ProjectSource,
@@ -69,21 +71,32 @@ def _all_waits(engine) -> list[tuple]:
 class DocumentDeletionLockSqlTests(unittest.TestCase):
     """不依赖数据库也必须验证真实路由发出的 PostgreSQL 锁序。"""
 
-    def test_delete_document_locks_kb_before_document_and_cleans_file(self):
+    def _db(self, *, user, kb, doc):
+        """按表名分派的最小会话替身；只记录访问顺序，不连数据库。"""
+        db = MagicMock()
+        db.scalar.side_effect = lambda statement: {
+            "users": user, "knowledge_bases": kb, "documents": doc,
+        }[statement.get_final_froms()[0].name]
+        return db
+
+    def test_delete_document_locks_user_then_kb_then_document_and_cleans_file(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "replacement.txt"
             path.write_text("payload", encoding="utf-8")
             kb_id, doc_id = uuid.uuid4(), uuid.uuid4()
-            kb = SimpleNamespace(kind="upload", collection_name="offline", name="kb")
+            user = SimpleNamespace(id=uuid.uuid4(), username="deleter", is_active=True,
+                                   role="admin", token_version=0)
+            kb = SimpleNamespace(id=kb_id, kind="upload", collection_name="offline",
+                                 name="kb", is_public=False, owner_id=user.id)
             doc = SimpleNamespace(id=doc_id, filename=path.name, stored_path=str(path))
-            db = Mock()
-            db.scalar.side_effect = [kb, doc]
+            db = self._db(user=user, kb=kb, doc=doc)
             with patch.object(knowledge, "delete_document_vectors") as vectors, \
                     patch.object(knowledge, "write_audit"):
-                knowledge.delete_document(kb_id, doc_id, _Request(), db, SimpleNamespace())
+                knowledge.delete_document(kb_id, doc_id, _Request(), db, user)
             statements = [call.args[0] for call in db.scalar.call_args_list]
+            # 统一锁序 User -> KnowledgeBase -> Document，一级都不可省。
             self.assertEqual([stmt.get_final_froms()[0].name for stmt in statements],
-                             ["knowledge_bases", "documents"])
+                             ["users", "knowledge_bases", "documents"])
             for statement in statements:
                 sql = str(statement.compile(dialect=postgresql.dialect()))
                 self.assertTrue(sql.endswith("FOR UPDATE"), sql)
@@ -94,12 +107,18 @@ class DocumentDeletionLockSqlTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
     def test_delete_document_still_rejects_project_before_document_lookup(self):
-        db = Mock()
-        db.scalar.return_value = SimpleNamespace(kind="project")
+        user = SimpleNamespace(id=uuid.uuid4(), username="deleter", is_active=True,
+                               role="admin", token_version=0)
+        project_kb = SimpleNamespace(id=uuid.uuid4(), kind="project", is_public=False,
+                                     owner_id=user.id, name="proj", collection_name="p")
+        db = self._db(user=user, kb=project_kb, doc=None)
         with self.assertRaises(HTTPException) as error:
-            knowledge.delete_document(uuid.uuid4(), uuid.uuid4(), _Request(), db, SimpleNamespace())
+            knowledge.delete_document(uuid.uuid4(), uuid.uuid4(), _Request(), db, user)
         self.assertEqual(error.exception.status_code, 400)
-        db.scalar.assert_called_once()
+        # 只锁到 User + KB：项目库在查文档之前就被拒绝。
+        self.assertEqual([stmt.get_final_froms()[0].name for stmt in
+                          [call.args[0] for call in db.scalar.call_args_list]],
+                         ["users", "knowledge_bases"])
         db.delete.assert_not_called()
         db.commit.assert_not_called()
 
@@ -467,6 +486,250 @@ class DeletionLockOrderTests(unittest.TestCase):
         self.assertEqual(sorted(outcomes), [200, 403])
         with db_session.SessionLocal() as db:
             self.assertEqual(len(db.scalars(select(User).where(User.id.in_(ids))).all()), 1)
+
+    def test_delete_user_bumps_revision_only_for_kbs_with_membership_rows(self):
+        """FK 级联删除成员，但 revision 必须同事务递增；且不扩大 owned 资源锁。
+
+        三个 KB：
+        - owned：目标拥有（owner_id），且有目标成员行 -> 锁、revision+1；
+        - member_only：他人拥有、目标只是成员 -> 只参与成员级联，revision+1；
+        - unrelated：目标既不拥有也无成员 -> 不得被锁/改版本。
+        """
+        with db_session.SessionLocal() as db:
+            admin = self._user(db, admin=True)
+            target = self._user(db)
+            other = self._user(db)
+            owned_kb = self._kb(db, target)
+            member_kb = self._kb(db, other)
+            unrelated_kb = self._kb(db, other)
+            db.add(KnowledgeBaseMember(kb_id=owned_kb.id, user_id=target.id, role="reader"))
+            db.add(KnowledgeBaseMember(kb_id=member_kb.id, user_id=target.id, role="maintainer"))
+            db.add(KnowledgeBaseMember(kb_id=member_kb.id, user_id=other.id, role="reader"))
+            db.add(KnowledgeBaseMember(kb_id=unrelated_kb.id, user_id=other.id, role="reader"))
+            # 无关 KB 上他人的私人资源：删除目标用户不得锁它们。
+            unrelated_conv = self._conversation(db, other, unrelated_kb)
+            path = Path(self.temp.name) / "unrelated.txt"
+            path.write_text("payload", encoding="utf-8")
+            unrelated_doc = self._document(db, unrelated_kb, other, path)
+            db.commit()
+            ids = dict(
+                admin=admin.id, target=target.id, other=other.id,
+                owned=owned_kb.id, member=member_kb.id, unrelated=unrelated_kb.id,
+                unrelated_conv=unrelated_conv.id, unrelated_doc=unrelated_doc.id,
+                member_revision=member_kb.membership_revision,
+            )
+
+        def acquire(holder):
+            # 只持目标用户行锁：删除必须先等这里，再进入 KB/成员锁。
+            holder.scalar(select(User.id).where(User.id == ids["target"]).with_for_update())
+
+        def do_delete(db):
+            users_api.delete_user(ids["target"], _Request(), db, db.get(User, ids["admin"]))
+
+        def probe():
+            # 无关 KB 及其私人资源必须能立刻加锁（不因成员集合被误锁）。
+            with db_session.SessionLocal() as db:
+                db.scalar(select(KnowledgeBase.id)
+                          .where(KnowledgeBase.id == ids["unrelated"])
+                          .with_for_update(nowait=True))
+                db.scalar(select(Conversation.id)
+                          .where(Conversation.id == ids["unrelated_conv"])
+                          .with_for_update(nowait=True))
+                db.scalar(select(Document.id)
+                          .where(Document.id == ids["unrelated_doc"])
+                          .with_for_update(nowait=True))
+                db.rollback()
+
+        self._run_while_held(acquire, do_delete, relation="users", probe=probe,
+                             commit_holder=True)
+
+        with db_session.SessionLocal() as db:
+            self.assertIsNone(db.get(User, ids["target"]))
+            # 成员行随 FK CASCADE 删除。
+            self.assertIsNone(db.scalar(
+                select(KnowledgeBaseMember).where(KnowledgeBaseMember.user_id == ids["target"])))
+            self.assertIsNotNone(db.get(KnowledgeBase, ids["owned"]), "owned KB 保留（owner 置空）")
+            self.assertIsNone(db.get(KnowledgeBase, ids["owned"]).owner_id)
+            owned = db.get(KnowledgeBase, ids["owned"])
+            member_kb = db.get(KnowledgeBase, ids["member"])
+            unrelated = db.get(KnowledgeBase, ids["unrelated"])
+            self.assertEqual(owned.membership_revision, 1, "owned 库有成员行 -> +1")
+            self.assertEqual(member_kb.membership_revision, ids["member_revision"] + 1)
+            self.assertEqual(unrelated.membership_revision, 0, "无关库不得被改 revision")
+            # 他人成员关系保留。
+            self.assertIsNotNone(db.scalar(
+                select(KnowledgeBaseMember).where(
+                    KnowledgeBaseMember.kb_id == ids["member"],
+                    KnowledgeBaseMember.user_id == ids["other"])))
+
+    def test_delete_user_without_membership_rows_does_not_bump_revision(self):
+        with db_session.SessionLocal() as db:
+            admin = self._user(db, admin=True)
+            target = self._user(db)
+            other = self._user(db)
+            owned_kb = self._kb(db, target)
+            db.commit()
+            ids = dict(admin=admin.id, target=target.id, kb=owned_kb.id)
+
+        with db_session.SessionLocal() as db:
+            users_api.delete_user(ids["target"], _Request(), db, db.get(User, ids["admin"]))
+
+        with db_session.SessionLocal() as db:
+            kb = db.get(KnowledgeBase, ids["kb"])
+            self.assertIsNone(kb.owner_id)
+            self.assertEqual(kb.membership_revision, 0, "无成员行时不应无谓递增 revision")
+
+    def test_member_write_rechecks_admin_role_and_token_after_waiting(self):
+        """等待 User 锁期间被降权/禁用/换令牌：按锁定后的新鲜行拒绝，且无写入。"""
+        for field, value, expected in (("role", "user", 403),
+                                       ("is_active", False, 403),
+                                       ("token_version", 1, 401)):
+            with self.subTest(field=field):
+                with db_session.SessionLocal() as db:
+                    admin = self._user(db, admin=True)
+                    target = self._user(db)
+                    kb = self._kb(db, admin)
+                    db.commit()
+                    admin_id, target_id, kb_id = admin.id, target.id, kb.id
+
+                holder = db_session.SessionLocal()
+                holder.scalar(
+                    select(User).where(User.id == admin_id).with_for_update())
+                holder_pid = holder.execute(text("SELECT pg_backend_pid()")).scalar_one()
+                started = threading.Event()
+                result = {}
+
+                def member_write():
+                    from app.api.v1 import kb_members as kb_members_api
+
+                    with db_session.SessionLocal() as db:
+                        db.execute(text("SET LOCAL statement_timeout = '15s'"))
+                        started.set()
+                        try:
+                            kb_members_api.upsert_kb_member(
+                                kb_id, target_id,
+                                SimpleNamespace(role="reader", expected_revision=0),
+                                _Request(0), db, db.get(User, admin_id),
+                            )
+                            result["status"] = 200
+                        except HTTPException as exc:
+                            db.rollback()
+                            result["status"] = exc.status_code
+
+                worker = threading.Thread(target=member_write, daemon=True)
+                try:
+                    worker.start()
+                    self.assertTrue(started.wait(10), "成员写线程未启动")
+                    self.assertTrue(
+                        self._wait_for_blocked_users_lock(holder_pid, timeout=10),
+                        "未观察到成员写在管理员 User 行上的锁等待")
+                    holder.execute(
+                        text(f"UPDATE users SET {field} = :value WHERE id = :uid"),
+                        {"value": value, "uid": admin_id})
+                    holder.commit()
+                    worker.join(timeout=30)
+                finally:
+                    try:
+                        holder.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if worker.is_alive():
+                        worker.join(timeout=30)
+                    holder.close()
+                self.assertFalse(worker.is_alive(), "放锁后成员写仍未结束")
+                self.assertEqual(result.get("status"), expected)
+                with db_session.SessionLocal() as db:
+                    self.assertEqual(db.get(KnowledgeBase, kb_id).membership_revision, 0)
+                    self.assertIsNone(db.get(KnowledgeBaseMember, (kb_id, target_id)))
+
+    def test_member_write_and_user_delete_share_user_then_kb_lock_order(self):
+        """真实竞争：用户删除先赢 User 锁；等待中的成员写不得给已删除用户重新授权。
+
+        删除事务按 ``User UUID`` 排序同时锁 admin+target，再持锁启动成员 PUT。真实
+        ``pg_blocking_pids`` 证明成员写阻塞在 User 行上；随后删除方调用生产
+        ``delete_user`` 并提交。成员写恢复后必须 404，目标及 FK 成员行已级联删除，
+        KB revision 与级联结果一致，整个过程有界结束、没有反向锁环。
+        """
+        with db_session.SessionLocal() as db:
+            admin = self._user(db, admin=True)
+            target = self._user(db)
+            other = self._user(db)
+            kb = self._kb(db, other)
+            db.add(KnowledgeBaseMember(kb_id=kb.id, user_id=target.id, role="maintainer"))
+            kb.membership_revision = 1
+            db.commit()
+            ids = dict(admin=admin.id, target=target.id, kb=kb.id)
+
+        def acquire(holder):
+            # 必须与生产成员写/删除路径同序：一次按 UUID 排序锁 admin + target。
+            holder.scalars(
+                select(User).where(User.id.in_([ids["admin"], ids["target"]]))
+                .order_by(User.id).with_for_update()
+            ).all()
+
+        def member_write(db):
+            from app.api.v1 import kb_members as kb_members_api
+
+            try:
+                kb_members_api.upsert_kb_member(
+                    ids["kb"], ids["target"],
+                    SimpleNamespace(role="reader", expected_revision=1),
+                    _Request(0), db, db.get(User, ids["admin"]),
+                )
+            except HTTPException as exc:
+                db.rollback()
+                return exc.status_code
+            return 200
+
+        def delete_target(holder):
+            users_api.delete_user(
+                ids["target"], _Request(0), holder, holder.get(User, ids["admin"])
+            )
+
+        def probe():
+            # waiter 已阻塞在 User 锁时，KB 必须仍可立即锁定：禁止先拿 KB 再等 User。
+            with db_session.SessionLocal() as db:
+                db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.id == ids["kb"])
+                          .with_for_update(nowait=True))
+                db.rollback()
+
+        status = self._run_while_held(
+            acquire,
+            member_write,
+            relation="users",
+            probe=probe,
+            on_release=delete_target,
+            commit_holder=True,
+        )
+        self.assertEqual(status, 404, "删除提交后成员写必须看不到目标用户")
+        with db_session.SessionLocal() as db:
+            self.assertIsNone(db.get(User, ids["target"]))
+            self.assertIsNone(db.get(KnowledgeBaseMember, (ids["kb"], ids["target"])),
+                              "FK CASCADE 必须移除成员，等待中的 PUT 不能重建")
+            self.assertEqual(db.get(KnowledgeBase, ids["kb"]).membership_revision, 2,
+                             "删除用户对真实受影响 KB 恰好递增一次 revision")
+
+    def _wait_for_blocked_users_lock(self, holder_pid, *, timeout=10):
+        """确认有请求后端阻塞在 holder 持有的 users FOR UPDATE 上。
+
+        成员写必须先锁 ``admin+target`` 两个 User 行：阻塞中的语句是 users 查询，
+        不能用成员表名去找。只认 ``wait_event_type='Lock'`` 的 active 后端。
+        """
+        statement = text(
+            "SELECT pid, state, wait_event_type, query FROM pg_stat_activity "
+            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+            "AND :holder_pid = ANY(pg_blocking_pids(pid))"
+        )
+        with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as observer:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                for row in observer.execute(statement, {"holder_pid": holder_pid}).all():
+                    query = (row.query or "").upper()
+                    if (row.wait_event_type == "Lock" and row.state == "active"
+                            and "FOR UPDATE" in query and "USERS" in query):
+                        return True
+                time.sleep(0.05)
+        return False
 
     # ---------------- 项目源撤销 / 取消 ----------------
 

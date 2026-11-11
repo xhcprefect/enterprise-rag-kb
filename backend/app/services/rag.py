@@ -159,10 +159,13 @@ def _elapsed_ms(started: float) -> int:
 
 
 def retrieve(collection_name: str, question: str, top_k: int, *,
-             document_scope: list[dict] | None = None,
+             document_scope: list[dict] | tuple[dict, ...] | None = None,
              trace: dict | None = None) -> list[tuple[LCDocument, float]]:
     """合并两路候选；文档范围在两路 SQL 排名和截断前生效。
 
+    用户会话范围最多 5 份；内部冻结检索清单（在线回归）最多
+    ``MAX_INTERNAL_SCOPE_DOCUMENTS``（256）份。只在这里的检索范围校验使用内部上限，
+    不改变生成/普通 chat 的控制流。``None`` 表示不限制，显式 ``[]`` 表示空范围。
     ``trace`` 仅供管理员检索诊断：传入 dict 时按阶段写入计数与耗时；
     不改变候选、顺序或异常语义，``trace=None`` 与原实现完全一致。
     """
@@ -173,13 +176,19 @@ def retrieve(collection_name: str, question: str, top_k: int, *,
     total_started = time.perf_counter() if trace is not None else 0.0
     try:
         if document_scope is not None:
-            document_scopes.scope_pairs(document_scope)  # 非法身份不能进入关键词降级路径。
+            # 非法身份/超限清单不能进入任一检索或降级路径；257 份明确拒绝，不截断。
+            document_scopes.scope_pairs(
+                document_scope, max_documents=document_scopes.MAX_INTERNAL_SCOPE_DOCUMENTS)
             if not document_scope:
                 return []
         scope_options = {"document_scope": document_scope} if document_scope is not None else {}
 
         def in_scope(pairs):
-            return pairs if document_scope is None else [pair for pair in pairs if document_scopes.contains(document_scope, pair[0].metadata)]
+            if document_scope is None:
+                return pairs
+            return [pair for pair in pairs if document_scopes.contains(
+                document_scope, pair[0].metadata,
+                max_documents=document_scopes.MAX_INTERNAL_SCOPE_DOCUMENTS)]
 
         limit = max(1, settings.RETRIEVAL_MAX_PER_DOC)
         vector_error = None
@@ -294,9 +303,10 @@ def retrieve(collection_name: str, question: str, top_k: int, *,
 
 
 def supplement_sources(collection_name: str, query: str, anchors: list[tuple[LCDocument, float]],
-                       top_k: int, document_scope: list[dict]) -> list[tuple[LCDocument, float]]:
+                       top_k: int,
+                       document_scope: list[dict] | tuple[dict, ...]) -> list[tuple[LCDocument, float]]:
     """重新检索所选文件，保留已核验锚点，并补充未覆盖的新原文而非旧答案。"""
-    from app.services.document_scopes import contains
+    from app.services.document_scopes import MAX_INTERNAL_SCOPE_DOCUMENTS, contains
 
     fresh = retrieve(collection_name, query, top_k, document_scope=document_scope)
     result, covered = [], set()
@@ -304,7 +314,7 @@ def supplement_sources(collection_name: str, query: str, anchors: list[tuple[LCD
     anchor_limit = min(5, max(1, top_k // 2))
     for doc, score in [*anchors[:anchor_limit], *fresh, *anchors[anchor_limit:]]:
         meta = doc.metadata
-        if not contains(document_scope, meta):
+        if not contains(document_scope, meta, max_documents=MAX_INTERNAL_SCOPE_DOCUMENTS):
             continue
         index = meta.get("chunk_index")
         start, end = meta.get("chunk_start", index), meta.get("chunk_end", index)

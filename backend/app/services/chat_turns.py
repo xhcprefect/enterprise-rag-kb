@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import ChatTurn, Conversation, KnowledgeBase, Message, User
-from app.services import answer_sources, document_scopes, memory_service, project_chat_scope
+from app.services import answer_sources, document_scopes, kb_access, memory_service, project_chat_scope
 from app.services.answer_sources import SourceSnapshotError, SourceVerificationError
 
 logger = logging.getLogger(__name__)
@@ -102,11 +102,14 @@ def _require_token(user: User, auth_token_version) -> None:
         raise HTTPException(401, "登录状态已失效，请重新登录")
 
 
-def _require_kb_acl(kb: KnowledgeBase | None, user: User) -> None:
-    """统一 ACL（与 ``answer_sources`` 一致）：管理员 / 公开库 / 库拥有者。"""
+def _require_kb_acl(db: Session, kb: KnowledgeBase | None, user: User) -> None:
+    """统一 ACL（当前事务状态）：admin/public/owner 兼容 + 显式成员 reader/maintainer。
+
+    必须传当前 Session：不缓存成员角色，也不在缺库时按 admin/public 放行。
+    """
     if kb is None:
         return
-    if not (user.is_admin or kb.is_public or kb.owner_id == user.id):
+    if not kb_access.can_read_kb(db, kb, user):
         raise HTTPException(404, "知识库不存在")
 
 
@@ -120,7 +123,7 @@ def _lock_roots(db: Session, user_id: uuid.UUID, kb_id: uuid.UUID | None,
             raise HTTPException(401, "用户不存在，请重新登录") from exc
         raise HTTPException(404, "知识库不存在") from exc
     _require_token(root.user, auth_token_version)
-    _require_kb_acl(root.knowledge_base, root.user)
+    _require_kb_acl(db, root.knowledge_base, root.user)
     return root
 
 
@@ -267,7 +270,7 @@ def _replay(db: Session, previous: ChatTurn, *, key: uuid.UUID, digest: str,
             or question.conversation_id != conv.id or answer.conversation_id != conv.id):
         raise HTTPException(409, "原请求结果已不可用，请使用新的 request_id")
     _require_token(root.user, auth_token_version)
-    _require_kb_acl(root.knowledge_base, root.user)
+    _require_kb_acl(db, root.knowledge_base, root.user)
     result = Reservation(turn.id, key, conv.id, stored_message, user_id,
                          answer.content, answer.citations or [], answer.latency_ms, turn.trace or {}, answer.id,
                          project_snapshot_id=stored_snapshot,
@@ -587,7 +590,7 @@ def complete_turn(db: Session, reservation: Reservation, answer: str, citations:
             or conv.lease_expires_at <= now or turn.status != "processing"):
         raise ChatLeaseLost("该回答已取消或处理租约已失效，请刷新会话后重试")
     _require_token(root.user, reservation.auth_token_version)
-    _require_kb_acl(kb, root.user)
+    _require_kb_acl(db, kb, root.user)
     if (getattr(conv, "scope_revision", None) or 0) != reservation.scope_revision:
         raise ChatLeaseLost("文档范围已改变，请刷新会话后重试")
     if selected:

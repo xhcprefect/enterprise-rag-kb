@@ -27,7 +27,7 @@ from app.schemas.project import (
     ProjectSourceChunkRead,
     ProjectSourcePreviewRead,
 )
-from app.services import project_sources
+from app.services import kb_access, project_sources
 
 # 单次预览的硬界：最多 48 个 chunk、起始不越界、总字符有上限。
 MAX_PREVIEW_CHUNKS = 48
@@ -113,8 +113,8 @@ def _authorized_snapshot_for_file(
     if kb is None:
         raise ProjectSourceNotFound()
     # ACL 先于 revoke：私有已 revoke 源对无权限 stranger 呈 404，而非 410。
-    # 只有授权（管理员/拥有者）才见到 revoke 语义（410），避免对陌生人多泄一次"此处曾存在"。
-    if not user.is_admin and not kb.is_public and kb.owner_id != user.id:
+    # 只有授权（管理员/拥有者/显式成员）才见到 revoke 语义（410），避免对陌生人多泄一次"此处曾存在"。
+    if not kb_access.can_read_kb(db, kb, user):
         raise ProjectSourceNotFound()
     if source.revoked_at is not None:
         raise ProjectSourceRevoked()

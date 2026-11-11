@@ -267,7 +267,7 @@ data/
 
 其他行为：
 
-- **短暂停写**：备份前停止正在运行的写服务（`api`、`worker`，以及启用 profile 时在跑的 `worker-summary`、`worker-project`），
+- **短暂停写**：备份前停止正在运行的写服务（`api`、`worker`，以及启用 profile 时在跑的 `worker-summary`、`worker-project`、`worker-regression`），
   完成后**只重启原本在运行的**那些容器；原本停着的不会被顺手拉起。停写等待上限由 `.env` 的
   `WORKER_STOP_TIMEOUT_SECONDS`（默认 180 秒）与 `API_STOP_TIMEOUT_SECONDS`（默认 30 秒）控制。
 - **维护锁**：`${DATA_DIR}/.maintenance.lock`，同时只允许一个备份/恢复任务；另一个会直接退出。
@@ -395,7 +395,7 @@ docker compose up -d --build      # 只重建有变化的容器
 本次新增 `chat_turns` 请求记录、会话生成租约、消息的问答关联与状态，以及分块的
 结构位置和关键词列。`init_db()` 幂等迁移，保留已有会话、消息与文档；无需清库。
 为了避免旧 API 绕过会话租约、旧 worker 写入缺少新字段的分块，请安排维护窗口，
-先备份并停止旧进程，再统一更新三个服务：
+先备份并停止旧进程，再统一更新 API、各角色 worker 与 web：
 
 ```bash
 ./deploy/backup.sh

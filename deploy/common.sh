@@ -47,10 +47,11 @@ writers=()
 writers_stopped=0
 
 # 会写数据库/上传目录/项目存储的服务。历史版本只有一个 `worker`，新版本按角色拆成
-# `worker`（ingest）+ `worker-summary` + `worker-project`（见 docker-compose.yml）。
+# `worker`（ingest）+ `worker-summary` + `worker-project` + `worker-regression`
+# （见 docker-compose.yml）。
 # 这里按**容器标签**识别，而不是 `docker compose config --services`：后者会隐藏
-# profile 服务（worker-summary/worker-project），导致启用后维护时漏停。
-WRITER_CANDIDATES=(api worker worker-summary worker-project)
+# profile 服务（worker-summary/worker-project/worker-regression），导致启用后维护时漏停。
+WRITER_CANDIDATES=(api worker worker-summary worker-project worker-regression)
 
 compose_project() {
   if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then

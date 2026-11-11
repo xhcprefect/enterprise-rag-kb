@@ -23,7 +23,7 @@ from sqlalchemy.engine import make_url
 from app.core.security import create_access_token
 from app.db.init_db import init_db
 from app.db.session import SessionLocal, engine
-from app.models import Conversation, KnowledgeBase, User
+from app.models import Conversation, KnowledgeBase, KnowledgeBaseMember, User
 
 
 
@@ -150,6 +150,10 @@ class ConversationManagementTests(unittest.TestCase):
         rag_other = self.add(title="B", mode="rag", kb_id=self.private_kb_id)
         chat = self.add(title="C", mode="chat", kb_id=None)
         self.add(title="D", mode="rag", kb_id=self.kb_id, user_id=self.other_id)
+        # 私有库成员授权后才可见：列表 SQL 在 total/分页前按当前成员 EXISTS 过滤。
+        with SessionLocal() as db:
+            db.add(KnowledgeBaseMember(kb_id=self.private_kb_id, user_id=self.user_id, role="reader"))
+            db.commit()
 
         by_kb = self.page(kb_id=str(self.kb_id)).json()["data"]
         self.assertEqual(by_kb["total"], 1)
@@ -278,10 +282,22 @@ class ConversationManagementTests(unittest.TestCase):
 
     def test_rag_conversation_rechecks_knowledge_base_permission(self):
         conv = self.add(title="私有库会话", kb_id=self.private_kb_id)
-        # 会话属于本人，但知识库是别人的私有库：元数据操作同样要过 KB 权限
+        # 会话属于本人，但知识库是别人的私有库且无成员授权：保留既有 403 契约。
         self.assertEqual(self.patch(conv, {"title": "改不了"}).status_code, 403)
         with SessionLocal() as db:
             self.assertEqual(db.get(Conversation, conv).title, "私有库会话")
+        # 成员授权后可以操作；撤销后立即恢复 403，且不改动标题。
+        with SessionLocal() as db:
+            db.add(KnowledgeBaseMember(kb_id=self.private_kb_id, user_id=self.user_id, role="reader"))
+            db.commit()
+        self.assertEqual(self.patch(conv, {"title": "成员可改"}).status_code, 200)
+        with SessionLocal() as db:
+            db.execute(text("DELETE FROM knowledge_base_members WHERE kb_id = :kb AND user_id = :user"),
+                       {"kb": self.private_kb_id, "user": self.user_id})
+            db.commit()
+        self.assertEqual(self.patch(conv, {"title": "撤权后不可见"}).status_code, 403)
+        with SessionLocal() as db:
+            self.assertEqual(db.get(Conversation, conv).title, "成员可改")
 
     # ---------- PATCH 字段校验 ----------
 

@@ -15,6 +15,7 @@ from app.models import (
     Conversation,
     Document,
     KnowledgeBase,
+    KnowledgeBaseMember,
     Message,
     ProjectSnapshot,
     ProjectSource,
@@ -257,9 +258,25 @@ def delete_user(
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
 
-    # 目标知识库（属主将被置空）。等锁后一切判断只用锁到的新鲜行。
-    owned_kbs = _lock_sorted(db, KnowledgeBase, KnowledgeBase.owner_id == user.id)
+    # 目标知识库（属主将被置空）∪ 目标当前显式成员 KB：一次按 UUID 稳定锁定。
+    # 成员行读取发生在目标 User 行锁之后——成员写入口（PUT/DELETE）必须先锁目标
+    # User，因此这里的成员集合不会被同目标的并发写入改变；集合大小由该用户的
+    # 成员记录数决定，有界。
+    member_kb_ids = set(db.scalars(
+        select(KnowledgeBaseMember.kb_id).where(KnowledgeBaseMember.user_id == user.id)
+    ).all())
+    kb_condition = KnowledgeBase.owner_id == user.id
+    if member_kb_ids:
+        kb_condition = or_(kb_condition, KnowledgeBase.id.in_(member_kb_ids))
+    locked_kbs = _lock_sorted(db, KnowledgeBase, kb_condition)
+    # 只保留原“属主 KB”集合供后续源/会话/文档处理；成员 KB 不混入这份资源边界。
+    owned_kbs = [kb for kb in locked_kbs if kb.owner_id == user.id]
     kb_ids = [kb.id for kb in owned_kbs]
+    # FK CASCADE 会删除成员行：为确有成员行的 KB 同步 revision，避免成员列表
+    # 已变而 CAS 版本不动。无成员行的 KB（只是成员集合里的旧 ID）不碰。
+    for kb in locked_kbs:
+        if kb.id in member_kb_ids:
+            kb.membership_revision = int(kb.membership_revision) + 1
 
     # 目标创建的项目源，以及目标知识库下的源；随后是其快照。
     source_conditions = [ProjectSource.created_by == user.id]

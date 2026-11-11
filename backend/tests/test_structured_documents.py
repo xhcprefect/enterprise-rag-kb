@@ -124,6 +124,32 @@ class StructuredDocumentTests(unittest.TestCase):
         self.assertEqual({chunk.metadata["page_start"] for chunk in chunks}, {1, 2})
         self.assertTrue(all(chunk.metadata["page_start"] == chunk.metadata["page_end"] for chunk in chunks))
 
+    def test_pdf_blank_page_is_skipped_without_renumbering(self):
+        import pymupdf
+        path = self.root / "blank-page.pdf"
+        document = pymupdf.open()
+        document.new_page().insert_text((50, 50), "first page evidence")
+        document.new_page()  # 真正空白页：跳过但后续页号不重编
+        document.new_page().insert_text((50, 50), "third page evidence")
+        document.save(path)
+        document.close()
+        chunks = self.chunks(path)
+        self.assertEqual({chunk.metadata["page_start"] for chunk in chunks}, {1, 3})
+
+    def test_pdf_scan_only_file_fails_with_ocr_hint(self):
+        import pymupdf
+        path = self.root / "scanned.pdf"
+        pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 24, 24), 0)
+        pixmap.clear_with(120)
+        document = pymupdf.open()
+        document.new_page().insert_image(pymupdf.Rect(50, 50, 250, 250),
+                                        stream=pixmap.tobytes("png"))
+        document.save(path)
+        document.close()
+        with self.assertRaises(ValueError) as error:
+            list(iter_structured_chunks(path, 80, 10))
+        self.assertIn("OCR", str(error.exception))
+
     def test_empty_nul_and_unsupported_files_are_handled_explicitly(self):
         for name, text in [("empty.txt", " \n\x00"), ("bad.bin", "content")]:
             path = self.root / name

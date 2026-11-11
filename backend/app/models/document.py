@@ -47,6 +47,11 @@ class KnowledgeBase(Base, TimestampMixin):
     # 资源类型：'upload'（上传文档库，默认） / 'project'（项目源码库）。
     # 项目库禁止普通上传/分片 complete/reindex/cancel 等旁路；普通 KB PATCH 改不了 kind。
     kind: Mapped[str] = mapped_column(String(16), default="upload", server_default="'upload'", nullable=False)
+    # 显式成员列表的 CAS 版本：任何成员变更（含用户删除导致的 FK 级联）都 +1。
+    # 老库由 migrations.ensure_kb_membership_schema 幂等补列，DEFAULT 0 回填既有行。
+    membership_revision: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
 
     owner: Mapped["User | None"] = relationship()
     documents: Mapped[list["Document"]] = relationship(
@@ -58,6 +63,12 @@ class KnowledgeBase(Base, TimestampMixin):
         # ProjectSource.kb_id NOT NULL FK ON DELETE CASCADE：让 DB 级联，避免 ORM 先置 NULL。
         passive_deletes=True,
         uselist=False,
+    )
+    # 显式成员（reader/maintainer）；删除 KB 时由 FK CASCADE 清理，不在 ORM 里逐行删。
+    members: Mapped[list["KnowledgeBaseMember"]] = relationship(
+        back_populates="knowledge_base",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 

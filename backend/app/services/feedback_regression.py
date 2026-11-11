@@ -36,6 +36,11 @@ from app.models.feedback_regression import (
     FeedbackRegression,
     FeedbackRegressionRun,
 )
+from app.models.feedback_regression_job import (
+    ACTIVE_JOB_STATUSES,
+    EXECUTION_KIND_ONLINE,
+    FeedbackRegressionJob,
+)
 from app.schemas.feedback_regression import (
     FeedbackRegressionCreateRequest,
     FeedbackRegressionPrepareRequest,
@@ -59,6 +64,20 @@ _REASON_MESSAGES = {
     "chunk_missing": "期望来源的实际分块不存在",
     "version_mismatch": "期望来源的索引代次不匹配",
     "sample_changed": "回归样例已变化，请重新纳入或重新准备",
+    "owner_inactive": "反馈所有者已禁用，不能按原权限重跑",
+    "owner_access_revoked": "反馈所有者已无权访问该知识库",
+    "root_plan_changed": "反馈根身份在等锁期间发生变化，请重试",
+    "manifest_overflow": "执行清单超过 256 项上限，已拒绝",
+    "manifest_invalid": "执行清单结构不合法",
+    "scope_invalid": "会话限定文档范围已失效或不一致",
+    "project_snapshot_invalid": "项目快照已失效或未就绪",
+    "project_snapshot_changed": "项目快照身份与入队时冻结值不一致",
+    "live_fixed_scope_unsupported": "旧 live CLI 不能承载固定文档范围或项目快照，请使用作业执行",
+    "auth_invalid": "登录状态已失效，请重新登录",
+    "admin_required": "需要管理员权限",
+    "invalid_batch": "批量回归请求不合法",
+    "regression_job_active": "该反馈存在进行中的在线回归作业，请等待完成或取消",
+    "online_run_not_importable": "在线回归轮次只能通过作业比较/核验，不能人工导出或导入",
 }
 
 _VALID_MODES = ("offline", "live")
@@ -83,10 +102,11 @@ def _fail(status_code: int, reason: str, message: str | None = None):
 class _Unavailable(Exception):
     """适配层或服务前置检查给出的可用性阻断。"""
 
-    def __init__(self, reason: str, message: str | None = None):
+    def __init__(self, reason: str, message: str | None = None, status_code: int = 409):
         super().__init__(reason)
         self.reason = reason
         self.message = message or _REASON_MESSAGES.get(reason) or "回归操作被阻断"
+        self.status_code = status_code
 
 
 @dataclass
@@ -160,54 +180,70 @@ def _locked_regression(db: DBSession, feedback_id: uuid.UUID) -> FeedbackRegress
     return regression
 
 
-def _build_case(
-    db: DBSession, admin: User, feedback: AnswerFeedback, *, cause: str
-) -> _CaseContext:
-    message = db.get(Message, feedback.message_id)
-    conversation = db.get(Conversation, feedback.conversation_id)
-    if message is None or conversation is None:
-        raise _Unavailable("feedback_stale", "原回答已不存在")
-    if feedback.status != FEEDBACK_STATUS_VERIFIED:
-        raise _Unavailable("feedback_not_verified")
-    if answer_feedback.feedback_stale(db, feedback, message):
-        raise _Unavailable("feedback_stale")
+def _context_service():
+    """延迟导入上下文服务（它依赖适配层，但本模块保持可静态导入）。"""
+    from app.services import feedback_regression_context
 
-    kb = None
-    if conversation.kb_id is not None:
-        kb = db.get(KnowledgeBase, conversation.kb_id)
-        if kb is None and conversation.mode == "rag":
-            raise _Unavailable("source_invalid", "知识库不存在")
-    if conversation.mode == "rag" and kb is None:
-        raise _Unavailable("source_invalid", "知识库不存在")
-    if kb is not None and kb.kind == "project":
-        raise _Unavailable("project_unsupported")
-    if conversation.project_snapshot_id is not None:
-        raise _Unavailable("project_unsupported")
-    if (conversation.scope_revision or 0) > 0 or conversation.document_scope:
-        raise _Unavailable("scope_unsupported")
+    return feedback_regression_context
 
-    adapter = _adapter()
+
+def _gate_roots(
+    db: DBSession,
+    admin: User,
+    feedback_id: uuid.UUID,
+    auth_token_version: int,
+):
+    """统一根门禁：先规划全部根，再按全局顺序加锁。
+
+    旧 manual 回归（enroll/prepare/export/import）只锁/校验标注来源与非空限定范围
+    所需的根，不枚举或冻结整库，也不套用在线执行清单的 256 项上限；在线作业入口
+    应直接使用 ``feedback_regression_context.build_batch_contexts`` 的冻结节。
+    """
+    service = _context_service()
     try:
-        case = adapter.build_base_case(
-            db, admin, feedback, message, conversation, cause=cause
+        plan = service.plan_roots(db, [feedback_id])
+        return service.lock_roots(
+            db,
+            plan,
+            admin_id=admin.id,
+            auth_token_version=auth_token_version,
+            freeze_manifests=False,
         )
-    except adapter.RegressionUnavailable as exc:
-        reason = getattr(exc, "reason", "source_invalid")
-        message_text = getattr(exc, "message", None)
-        raise _Unavailable(str(reason), message_text) from None
-    # 绑定必须与 case 内已稳定化的来源逐项一致；不要再次解析，避免并发下
-    # 解析结果与 case 漂移。
-    resolved = case.get("expected_sources") or []
+    except service.RegressionContextError as exc:
+        raise _Unavailable(exc.reason, exc.message, exc.status_code) from None
 
-    kb_id = str(conversation.kb_id) if conversation.kb_id is not None else None
+
+def _execution_from_locked(db: DBSession, locked, feedback_id: uuid.UUID):
+    service = _context_service()
+    try:
+        batch = service.build_contexts(db, locked)
+    except service.RegressionContextError as exc:
+        raise _Unavailable(exc.reason, exc.message, exc.status_code) from None
+    for execution in batch.contexts:
+        if execution.feedback_id == str(feedback_id):
+            return execution
+    raise _Unavailable("root_plan_changed", "执行上下文缺少目标反馈")
+
+
+def _case_context_from_execution(
+    db: DBSession, execution, *, cause: str
+) -> _CaseContext:
+    feedback = db.get(AnswerFeedback, uuid.UUID(execution.feedback_id))
+    message = db.get(Message, uuid.UUID(execution.message_id))
+    conversation = db.get(Conversation, uuid.UUID(execution.conversation_id))
+    if feedback is None or message is None or conversation is None:
+        raise _Unavailable("feedback_stale", "原回答已不存在")
+    case = execution.case
+    resolved = [dict(source) for source in execution.resolved_sources]
+    adapter = _adapter()
     try:
         binding = adapter.binding_sha256(
             adapter.base_binding_payload(
                 case,
                 feedback=feedback,
                 resolved_sources=resolved,
-                kb_id=kb_id,
-                mode=conversation.mode,
+                kb_id=execution.kb_id,
+                mode=execution.mode,
                 cause=cause,
             )
         )
@@ -223,13 +259,25 @@ def _build_case(
         conversation=conversation,
         case=case,
         resolved_sources=resolved,
-        kb_id=kb_id,
-        mode=conversation.mode,
+        kb_id=execution.kb_id,
+        mode=execution.mode,
         cause=cause,
         case_sha256=fingerprints["case_sha256"],
         dataset_sha256=fingerprints["dataset_sha256"],
         binding_sha256=binding,
     )
+
+
+def _inspect_case(
+    db: DBSession, feedback_id: uuid.UUID, *, cause: str
+) -> _CaseContext:
+    """只读可用性探测；不加锁、不要求管理员 token。"""
+    service = _context_service()
+    try:
+        execution = service.inspect_context(db, feedback_id)
+    except service.RegressionContextError as exc:
+        raise _Unavailable(exc.reason, exc.message, exc.status_code) from None
+    return _case_context_from_execution(db, execution, cause=cause)
 
 
 def _enrollment_matches(regression: FeedbackRegression, ctx: _CaseContext) -> bool:
@@ -244,7 +292,7 @@ def _availability(
     db: DBSession, admin: User, feedback: AnswerFeedback, regression: FeedbackRegression
 ) -> tuple[_CaseContext | None, _Unavailable | None]:
     try:
-        ctx = _build_case(db, admin, feedback, cause=regression.cause)
+        ctx = _inspect_case(db, feedback.id, cause=regression.cause)
     except _Unavailable as exc:
         return None, exc
     if not _enrollment_matches(regression, ctx):
@@ -258,14 +306,24 @@ def _availability(
 
 
 def _run_read(
-    run: FeedbackRegressionRun, *, current_attempt_no: int, state: str
+    run: FeedbackRegressionRun,
+    *,
+    current_attempt_no: int,
+    state: str,
+    job: FeedbackRegressionJob | None = None,
 ) -> dict:
     failures = run.failures if isinstance(run.failures, list) else []
+    execution_kind = getattr(run, "execution_kind", "manual") or "manual"
     return {
         "run_id": run.id,
         "attempt_no": run.attempt_no,
         "is_current": run.attempt_no == current_attempt_no,
         "state": state,
+        "execution_kind": execution_kind,
+        "can_import": execution_kind != EXECUTION_KIND_ONLINE,
+        "job_id": job.id if job is not None else None,
+        "job_status": job.status if job is not None else None,
+        "job_revision": job.revision if job is not None else None,
         "requested_mode": run.requested_mode,
         "protocol_version": run.protocol_version,
         "case_sha256": run.case_sha256,
@@ -302,6 +360,48 @@ def _current_run(
     )
 
 
+def _job_for_run(
+    db: DBSession, run: FeedbackRegressionRun
+) -> FeedbackRegressionJob | None:
+    return db.scalar(
+        select(FeedbackRegressionJob).where(FeedbackRegressionJob.run_id == run.id)
+    )
+
+
+def _jobs_for_runs(
+    db: DBSession, runs: list[FeedbackRegressionRun]
+) -> dict[uuid.UUID, FeedbackRegressionJob]:
+    run_ids = [run.id for run in runs]
+    if not run_ids:
+        return {}
+    return {
+        job.run_id: job
+        for job in db.scalars(
+            select(FeedbackRegressionJob).where(
+                FeedbackRegressionJob.run_id.in_(run_ids)
+            )
+        ).all()
+    }
+
+
+def _current_run_read(
+    db: DBSession,
+    admin: User,
+    feedback: AnswerFeedback,
+    regression: FeedbackRegression,
+) -> dict | None:
+    current = _current_run(db, regression)
+    if current is None:
+        return None
+    state = _run_states(db, admin, feedback, regression, [current])[current.id]
+    return _run_read(
+        current,
+        current_attempt_no=regression.current_attempt_no,
+        state=state,
+        job=_job_for_run(db, current),
+    )
+
+
 def _run_states(
     db: DBSession,
     admin: User,
@@ -309,12 +409,26 @@ def _run_states(
     regression: FeedbackRegression,
     runs: list[FeedbackRegressionRun],
 ) -> dict[uuid.UUID, str]:
-    """按当前绑定实时判定历史轮次状态；不修改任何行。"""
+    """按当前绑定实时判定历史轮次状态；不修改任何行。
+
+    online 轮次不是“待导入”工件，固定返回 online；其实际执行状态由关联作业
+    （``job_status``）表达，不能与旧 manual 的 awaiting_report/imported 混淆。
+    """
+    manual_runs = [
+        run
+        for run in runs
+        if (getattr(run, "execution_kind", "manual") or "manual")
+        != EXECUTION_KIND_ONLINE
+    ]
     states = {
         run.id: ("awaiting_report" if run.imported_at is None else "stale")
-        for run in runs
+        for run in manual_runs
     }
-    imported = [run for run in runs if run.imported_at is not None]
+    manual_ids = {run.id for run in manual_runs}
+    for run in runs:
+        if run.id not in manual_ids:
+            states[run.id] = "online"
+    imported = [run for run in manual_runs if run.imported_at is not None]
     if not imported:
         return states
 
@@ -456,15 +570,7 @@ def get_regression(
         return None
 
     ctx, unavailable = _availability(db, admin, feedback, regression)
-    current = _current_run(db, regression)
-    current_read = None
-    if current is not None:
-        state = _run_states(db, admin, feedback, regression, [current])[current.id]
-        current_read = _run_read(
-            current,
-            current_attempt_no=regression.current_attempt_no,
-            state=state,
-        )
+    current_read = _current_run_read(db, admin, feedback, regression)
     return {
         "feedback_id": regression.feedback_id,
         "revision": regression.revision,
@@ -489,8 +595,16 @@ def enroll(
     admin: User,
     feedback_id: uuid.UUID,
     payload: FeedbackRegressionCreateRequest,
+    *,
+    auth_token_version: int,
 ) -> dict:
-    feedback = _locked_feedback(db, feedback_id)
+    try:
+        locked = _gate_roots(db, admin, feedback_id, auth_token_version)
+    except _Unavailable as exc:
+        _fail(exc.status_code, exc.reason, exc.message)
+    feedback = db.get(AnswerFeedback, feedback_id)
+    if feedback is None:
+        _fail(404, "feedback_not_found", "反馈不存在")
     if feedback.revision != payload.expected_feedback_revision:
         _fail(409, "revision_conflict", "反馈已被他人处理，请刷新")
 
@@ -504,9 +618,10 @@ def enroll(
         _fail(409, "regression_exists", "该反馈已按其他原因纳入回归")
 
     try:
-        ctx = _build_case(db, admin, feedback, cause=payload.cause)
+        execution = _execution_from_locked(db, locked, feedback_id)
+        ctx = _case_context_from_execution(db, execution, cause=payload.cause)
     except _Unavailable as exc:
-        _fail(409, exc.reason, exc.message)
+        _fail(exc.status_code, exc.reason, exc.message)
 
     regression = FeedbackRegression(
         feedback_id=feedback.id,
@@ -525,6 +640,11 @@ def enroll(
         db.commit()
     except IntegrityError:
         db.rollback()
+        # 唯一冲突后的重放也必须重新规划/加锁/复核原认证快照与当前 ACL。
+        try:
+            _gate_roots(db, admin, feedback_id, auth_token_version)
+        except _Unavailable as exc:
+            _fail(exc.status_code, exc.reason, exc.message)
         existing = _regression_for_feedback(db, feedback_id)
         if existing is None:
             raise
@@ -545,15 +665,7 @@ def _regression_read(
     regression: FeedbackRegression,
 ) -> dict:
     ctx, unavailable = _availability(db, admin, feedback, regression)
-    current = _current_run(db, regression)
-    current_read = None
-    if current is not None:
-        state = _run_states(db, admin, feedback, regression, [current])[current.id]
-        current_read = _run_read(
-            current,
-            current_attempt_no=regression.current_attempt_no,
-            state=state,
-        )
+    current_read = _current_run_read(db, admin, feedback, regression)
     return {
         "feedback_id": regression.feedback_id,
         "revision": regression.revision,
@@ -573,6 +685,16 @@ def _regression_read(
 # ---------------------------------------------------------------------------
 
 
+def _assert_live_capability(execution, mode: str) -> None:
+    """旧 live CLI 不能承载固定范围/项目；在生成或导出 JSONL 前明确拒绝。"""
+    if mode == "live" and execution.has_fixed_execution:
+        _fail(
+            409,
+            "live_fixed_scope_unsupported",
+            "旧 live CLI 不能承载固定文档范围或项目快照，请使用作业执行",
+        )
+
+
 def _prepare_existing(
     db: DBSession,
     admin: User,
@@ -580,15 +702,17 @@ def _prepare_existing(
     regression: FeedbackRegression,
     run: FeedbackRegressionRun,
     requested_mode: str,
+    execution,
 ) -> dict:
     if run.requested_mode != requested_mode:
         _fail(409, "prepare_mode_conflict", "该准备请求已按其他模式创建")
     if run.attempt_no != regression.current_attempt_no:
         _fail(409, "run_not_current", "该准备请求对应的轮次已不是当前轮")
+    _assert_live_capability(execution, requested_mode)
     try:
-        ctx = _build_case(db, admin, feedback, cause=regression.cause)
+        ctx = _case_context_from_execution(db, execution, cause=regression.cause)
     except _Unavailable as exc:
-        _fail(409, exc.reason, exc.message)
+        _fail(exc.status_code, exc.reason, exc.message)
     if not _enrollment_matches(regression, ctx):
         _fail(409, "sample_changed", "回归样例已变化，请重新纳入")
     mode_case, fingerprints, binding = _mode_case(ctx, requested_mode)
@@ -606,11 +730,17 @@ def prepare_run(
     admin: User,
     feedback_id: uuid.UUID,
     payload: FeedbackRegressionPrepareRequest,
+    *,
+    auth_token_version: int,
 ) -> dict:
-    regression = _locked_regression(db, feedback_id)
+    try:
+        locked = _gate_roots(db, admin, feedback_id, auth_token_version)
+    except _Unavailable as exc:
+        _fail(exc.status_code, exc.reason, exc.message)
     feedback = db.get(AnswerFeedback, feedback_id)
     if feedback is None:
         _fail(404, "feedback_not_found", "反馈不存在")
+    regression = _locked_regression(db, feedback_id)
 
     existing = db.scalar(
         select(FeedbackRegressionRun).where(
@@ -619,17 +749,34 @@ def prepare_run(
         )
     )
     if existing is not None:
+        try:
+            execution = _execution_from_locked(db, locked, feedback_id)
+        except _Unavailable as exc:
+            _fail(exc.status_code, exc.reason, exc.message)
         return _prepare_existing(
-            db, admin, feedback, regression, existing, payload.requested_mode
+            db, admin, feedback, regression, existing, payload.requested_mode, execution
         )
 
     if regression.revision != payload.expected_revision:
         _fail(409, "revision_conflict", "回归记录已被更新，请刷新")
 
+    active_job = db.scalar(
+        select(FeedbackRegressionJob.id)
+        .where(
+            FeedbackRegressionJob.regression_id == regression.id,
+            FeedbackRegressionJob.status.in_(ACTIVE_JOB_STATUSES),
+        )
+        .limit(1)
+    )
+    if active_job is not None:
+        _fail(409, "regression_job_active", "该反馈存在进行中的在线回归作业，请等待完成或取消")
+
     try:
-        ctx = _build_case(db, admin, feedback, cause=regression.cause)
+        execution = _execution_from_locked(db, locked, feedback_id)
+        ctx = _case_context_from_execution(db, execution, cause=regression.cause)
     except _Unavailable as exc:
-        _fail(409, exc.reason, exc.message)
+        _fail(exc.status_code, exc.reason, exc.message)
+    _assert_live_capability(execution, payload.requested_mode)
     if not _enrollment_matches(regression, ctx):
         _fail(409, "sample_changed", "回归样例已变化，请重新纳入")
 
@@ -641,6 +788,7 @@ def prepare_run(
         prepare_request_id=payload.prepare_request_id,
         protocol_version=REGRESSION_PROTOCOL_VERSION,
         requested_mode=payload.requested_mode,
+        execution_kind="manual",
         feedback_revision=feedback.revision,
         feedback_result_sha256=feedback.result_sha256,
         case_sha256=fingerprints["case_sha256"],
@@ -657,7 +805,14 @@ def prepare_run(
         db.commit()
     except IntegrityError:
         db.rollback()
-        # 并发同键：按唯一约束重查后走同一套幂等规则。
+        # 并发同键重放：rollback 已释放全部根锁，必须重新鉴权/加锁。
+        try:
+            locked = _gate_roots(db, admin, feedback_id, auth_token_version)
+        except _Unavailable as exc:
+            _fail(exc.status_code, exc.reason, exc.message)
+        feedback = db.get(AnswerFeedback, feedback_id)
+        if feedback is None:
+            _fail(404, "feedback_not_found", "反馈不存在")
         regression = _locked_regression(db, feedback_id)
         existing = db.scalar(
             select(FeedbackRegressionRun).where(
@@ -667,11 +822,12 @@ def prepare_run(
         )
         if existing is None:
             _fail(409, "prepare_conflict", "回归准备发生并发冲突，请重试")
-        feedback = db.get(AnswerFeedback, feedback_id)
-        if feedback is None:
-            _fail(404, "feedback_not_found", "反馈不存在")
+        try:
+            execution = _execution_from_locked(db, locked, feedback_id)
+        except _Unavailable as exc:
+            _fail(exc.status_code, exc.reason, exc.message)
         return _prepare_existing(
-            db, admin, feedback, regression, existing, payload.requested_mode
+            db, admin, feedback, regression, existing, payload.requested_mode, execution
         )
     db.refresh(run)
     db.refresh(regression)
@@ -684,8 +840,17 @@ def prepare_run(
 
 
 def export_run(
-    db: DBSession, admin: User, feedback_id: uuid.UUID, run_id: uuid.UUID
+    db: DBSession,
+    admin: User,
+    feedback_id: uuid.UUID,
+    run_id: uuid.UUID,
+    *,
+    auth_token_version: int,
 ) -> dict:
+    try:
+        locked = _gate_roots(db, admin, feedback_id, auth_token_version)
+    except _Unavailable as exc:
+        _fail(exc.status_code, exc.reason, exc.message)
     feedback = db.get(AnswerFeedback, feedback_id)
     if feedback is None:
         _fail(404, "feedback_not_found", "反馈不存在")
@@ -695,13 +860,20 @@ def export_run(
     run = db.get(FeedbackRegressionRun, run_id)
     if run is None or run.regression_id != regression.id:
         _fail(404, "run_not_found", "重跑轮次不存在")
+    if getattr(run, "execution_kind", "manual") == EXECUTION_KIND_ONLINE:
+        _fail(409, "online_run_not_importable")
     if run.attempt_no != regression.current_attempt_no:
         _fail(409, "run_not_current", "仅当前轮可以导出")
 
     try:
-        ctx = _build_case(db, admin, feedback, cause=regression.cause)
+        execution = _execution_from_locked(db, locked, feedback_id)
     except _Unavailable as exc:
-        _fail(409, exc.reason, exc.message)
+        _fail(exc.status_code, exc.reason, exc.message)
+    _assert_live_capability(execution, run.requested_mode)
+    try:
+        ctx = _case_context_from_execution(db, execution, cause=regression.cause)
+    except _Unavailable as exc:
+        _fail(exc.status_code, exc.reason, exc.message)
     if not _enrollment_matches(regression, ctx):
         _fail(409, "sample_changed", "回归样例已变化，请重新准备")
     mode_case, fingerprints, binding = _mode_case(ctx, run.requested_mode)
@@ -752,11 +924,13 @@ def list_runs(
         ).all()
     )
     states = _run_states(db, admin, feedback, regression, runs)
+    jobs = _jobs_for_runs(db, runs)
     return int(total), [
         _run_read(
             run,
             current_attempt_no=regression.current_attempt_no,
             state=states[run.id],
+            job=jobs.get(run.id),
         )
         for run in runs
     ]
@@ -798,12 +972,17 @@ def import_report(
     *,
     expected_revision: int,
     raw: bytes,
+    auth_token_version: int,
 ) -> dict:
     if len(raw) > REPORT_MAX_BYTES:
         _fail(413, "report_too_large", f"评测报告不能超过 {REPORT_MAX_BYTES} 字节")
     if not raw.strip():
         _fail(400, "report_empty", "评测报告为空")
 
+    try:
+        locked = _gate_roots(db, admin, feedback_id, auth_token_version)
+    except _Unavailable as exc:
+        _fail(exc.status_code, exc.reason, exc.message)
     regression = _locked_regression(db, feedback_id)
     feedback = db.get(AnswerFeedback, feedback_id)
     if feedback is None:
@@ -811,16 +990,23 @@ def import_report(
     run = db.get(FeedbackRegressionRun, run_id)
     if run is None or run.regression_id != regression.id:
         _fail(404, "run_not_found", "重跑轮次不存在")
+    if getattr(run, "execution_kind", "manual") == EXECUTION_KIND_ONLINE:
+        _fail(409, "online_run_not_importable")
     if run.attempt_no != regression.current_attempt_no:
         _fail(409, "run_not_current", "仅当前轮可以导入报告")
     if run.requested_mode not in _VALID_MODES:
         _fail(400, "report_invalid", "重跑轮次的执行模式不合法")
 
+    try:
+        execution = _execution_from_locked(db, locked, feedback_id)
+    except _Unavailable as exc:
+        _fail(exc.status_code, exc.reason, exc.message)
+
     def _validated_summary() -> dict:
         try:
-            ctx = _build_case(db, admin, feedback, cause=regression.cause)
+            ctx = _case_context_from_execution(db, execution, cause=regression.cause)
         except _Unavailable as exc:
-            _fail(409, exc.reason, exc.message)
+            _fail(exc.status_code, exc.reason, exc.message)
         if not _enrollment_matches(regression, ctx):
             _fail(409, "sample_changed", "回归样例已变化，请重新准备")
         mode_case, fingerprints, binding = _mode_case(ctx, run.requested_mode)

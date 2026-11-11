@@ -95,8 +95,11 @@
   --el-border-radius-base: 8px;
   --el-border-radius-small: 6px;
   --el-component-size: 36px;
-  --el-font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
-    'Microsoft YaHei', 'Hiragino Sans GB', sans-serif;
+  /* 中文优先使用现代无衬线字体（思源黑体/MiSans/HarmonyOS），都没有时才回落到
+     系统默认的微软雅黑；这些字体按需命中本机已安装项，不额外加载网络字体。 */
+  --el-font-family: 'Inter', 'MiSans', 'HarmonyOS Sans SC', 'Source Han Sans CN',
+    '思源黑体 CN', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI',
+    'PingFang SC', 'Microsoft YaHei UI', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif;
 }
 
 /* Element Plus 官方暗色变量之外，补齐应用配色与品牌语义。 */

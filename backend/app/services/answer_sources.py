@@ -73,6 +73,7 @@ from app.models import (
     ProjectSource,
     User,
 )
+from app.services import kb_access
 from app.services.document_lifecycle import is_retrievable, retrievable_conditions
 
 # 快照格式版本。旧 RAG 轮次没有该字段（或值不是 1）一律整轮排除，不能当空来源。
@@ -559,19 +560,21 @@ def _snapshot_ids(sources) -> list[uuid.UUID]:
     return sorted(result)
 
 
-def _authorized(kb: KnowledgeBase, user: User) -> bool:
-    """统一 ACL：用户必须启用，且管理员/公开库/库拥有者之一。"""
-    if getattr(user, "is_active", None) is not True:
-        return False
-    return bool(user.is_admin or kb.is_public or kb.owner_id == user.id)
+def _authorized(db: Session, kb: KnowledgeBase, user: User) -> bool:
+    """统一 ACL（当前 Session 状态）：admin/public/owner 兼容 + 显式成员 reader/maintainer。
+
+    必须显式传当前 ``db``：不接受 ``db=None`` 时按 admin/public/owner 放行，也不通过
+    ``object_session`` 或跨请求缓存补连接。disabled 用户恒拒绝。
+    """
+    return bool(kb_access.can_read_kb(db, kb, user))
 
 
-def _require_acl(kb: KnowledgeBase, user: User) -> None:
-    if not _authorized(kb, user):
+def _require_acl(db: Session, kb: KnowledgeBase, user: User) -> None:
+    if not _authorized(db, kb, user):
         raise SourceVerificationError("无权读取该知识库的来源")
 
 
-def _lock_project_rows(db: Session, snapshot_ids: Sequence[uuid.UUID], *, lock: bool) -> ProjectBinding:
+def _lock_project_rows(db: Session, snapshot_ids: Sequence[uuid.UUID], *, lock: bool, user: User) -> ProjectBinding:
     """按 ``ProjectSource.id`` -> ``ProjectSnapshot.id`` 的全局 UUID 顺序读取（可选加锁）。"""
     if not snapshot_ids:
         return ProjectBinding(snapshots={}, sources={})
@@ -588,6 +591,12 @@ def _lock_project_rows(db: Session, snapshot_ids: Sequence[uuid.UUID], *, lock: 
                        .order_by(ProjectSource.id))
         if lock:
             source_stmt = source_stmt.with_for_update(of=ProjectSource)
+        else:
+            # 只读新鲜绑定也把 KB 成员可见性放进同一 SQL（相关 EXISTS，无笛卡尔积）：
+            # 生成期间的无锁复核不能只信调用点早先的判定。
+            source_stmt = source_stmt.join(KnowledgeBase, KnowledgeBase.id == ProjectSource.kb_id).where(
+                kb_access.visible_kb_predicate(user, KnowledgeBase)
+            )
         source_rows = db.scalars(source_stmt.execution_options(populate_existing=True)).all()
         sources_by_id = {row.id: row for row in source_rows}
         if set(sources_by_id) != set(source_ids):
@@ -625,8 +634,8 @@ def lock_project_binding(
         return ProjectBinding(snapshots={}, sources={})
     if kb.kind != KNOWLEDGE_BASE_KIND_PROJECT:
         raise SourceVerificationError("非项目知识库不能锁定项目绑定")
-    _require_acl(kb, user)
-    binding = _lock_project_rows(db, snapshot_ids, lock=True)
+    _require_acl(db, kb, user)
+    binding = _lock_project_rows(db, snapshot_ids, lock=True, user=user)
     _check_binding_ready(binding, kb)
     return binding
 
@@ -644,8 +653,8 @@ def _read_project_binding(
         return ProjectBinding(snapshots={}, sources={})
     if kb.kind != KNOWLEDGE_BASE_KIND_PROJECT:
         raise SourceVerificationError("非项目知识库不能读取项目绑定")
-    _require_acl(kb, user)
-    binding = _lock_project_rows(db, snapshot_ids, lock=False)
+    _require_acl(db, kb, user)
+    binding = _lock_project_rows(db, snapshot_ids, lock=False, user=user)
     _check_binding_ready(binding, kb)
     return binding
 
@@ -727,7 +736,7 @@ def validate_document_sources(
         raise SourceVerificationError("项目知识库不能按上传文档复核")
     if kb.kind != KNOWLEDGE_BASE_KIND_UPLOAD:
         raise SourceVerificationError("知识库类型不支持上传文档复核")
-    _require_acl(kb, user)
+    _require_acl(db, kb, user)
     if not sources:
         return ()
     if any(source.get("source_kind") != SOURCE_KIND_DOCUMENT for source in sources):
@@ -808,7 +817,7 @@ def validate_project_sources(
     """
     if kb.kind != KNOWLEDGE_BASE_KIND_PROJECT:
         raise SourceVerificationError("非项目知识库不能按项目来源复核")
-    _require_acl(kb, user)
+    _require_acl(db, kb, user)
     if not sources:
         return ()
     if any(source.get("source_kind") != SOURCE_KIND_PROJECT for source in sources):

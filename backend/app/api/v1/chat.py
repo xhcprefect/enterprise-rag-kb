@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, false, func, or_, select, update
 from sqlalchemy.orm import Session as DBSession
 from starlette.requests import ClientDisconnect
 
@@ -26,8 +26,8 @@ from app.schemas.chat import (
 )
 from app.schemas.common import ApiResponse, PageResult
 from app.services import (
-    answer_history, answer_sources, chat_turns, document_scopes, followup, memory_service, project_chat_scope,
-    project_retrieval, project_sources, rag, usage_tracking,
+    answer_history, answer_sources, chat_turns, document_scopes, followup, kb_access, memory_service,
+    project_chat_scope, project_retrieval, project_sources, rag, usage_tracking,
 )
 from app.services.cloud_models import CloudModelError
 from app.services.context_window import ContextBudgetError
@@ -40,17 +40,40 @@ router = APIRouter(prefix="/chat", tags=["问答"])
 logger = logging.getLogger(__name__)
 
 
-def _get_conversation(db: DBSession, conversation_id: uuid.UUID, user: User) -> Conversation:
+def _get_conversation_row(db: DBSession, conversation_id: uuid.UUID, user: User) -> Conversation:
+    """会话行归属（本人或管理员）；内容读取另由 ``_require_conversation_kb_read`` 把关。"""
     conv = db.get(Conversation, conversation_id, populate_existing=True)
-    if conv is None or (conv.user_id != user.id and not user.is_admin):
+    if conv is None or (conv.user_id != user.id and not getattr(user, "is_admin", False)):
         raise HTTPException(status_code=404, detail="会话不存在")
+    return conv
+
+
+def _require_conversation_kb_read(db: DBSession, conv: Conversation, user: User) -> None:
+    """RAG 会话必须仍能读取其知识库；撤权后不返回历史标题/正文/引用。
+
+    调用前必须已确认会话归属（本人或管理员）：陌生会话仍是 404。属主会话在
+    KB 读取权被撤销时保留既有 403 契约（``_get_kb`` 的语义），绝不因会话属于
+    本人就绕过知识库成员授权。真实 ``Conversation.kb_id`` 是 ``ON DELETE
+    CASCADE``，因此 RAG 却没有知识库（含 mock 中只为重放配置的 rag/None）
+    一律按不可读拒绝，不设“无 KB 的 RAG 放行”旁路。
+    """
+    if conv.mode != CONVERSATION_MODE_RAG:
+        return
+    kb = db.get(KnowledgeBase, conv.kb_id) if conv.kb_id is not None else None
+    if kb is None or not kb_access.can_read_kb(db, kb, user):
+        raise HTTPException(status_code=403, detail="无权访问该知识库")
+
+
+def _get_conversation(db: DBSession, conversation_id: uuid.UUID, user: User) -> Conversation:
+    conv = _get_conversation_row(db, conversation_id, user)
+    _require_conversation_kb_read(db, conv, user)
     return conv
 
 
 def _get_owned_conversation(db: DBSession, conversation_id: uuid.UUID, user: User) -> Conversation:
     """元数据写操作只认会话本人；管理员读权限不能扩展到改别人的会话。"""
-    conv = db.get(Conversation, conversation_id, populate_existing=True)
-    if conv is None or conv.user_id != user.id:
+    conv = _get_conversation_row(db, conversation_id, user)
+    if conv.user_id != user.id:
         raise HTTPException(status_code=404, detail="会话不存在")
     return conv
 
@@ -73,6 +96,21 @@ def _conversation_order():
             Conversation.updated_at.desc(), Conversation.id.desc())
 
 
+def _conversation_visibility(user: User):
+    """列表 SQL 谓词：本人会话中，普通对话恒可见、RAG 会话还需当前知识库可见。
+
+    成员 EXISTS 在 ``total``、分页与 ``LIMIT`` 之前进入 SQL，绝不先取一页再在
+    Python 里过滤（否则总量与页码都会泄漏已撤权的私有标题）。会话本人隔离不变。
+    """
+    if not getattr(user, "is_active", False):
+        return false()
+    visible_kb = exists(select(KnowledgeBase.id).where(
+        KnowledgeBase.id == Conversation.kb_id,
+        kb_access.visible_kb_predicate(user),
+    ))
+    return or_(Conversation.mode == CONVERSATION_MODE_CHAT, visible_kb)
+
+
 def _validate_query(q: str | None) -> str | None:
     if q is None:
         return None
@@ -86,7 +124,7 @@ def _get_kb(db: DBSession, kb_id: uuid.UUID, user: User) -> KnowledgeBase:
     kb = db.get(KnowledgeBase, kb_id)
     if kb is None:
         raise HTTPException(status_code=404, detail="知识库不存在")
-    if not user.is_admin and not kb.is_public and kb.owner_id != user.id:
+    if not kb_access.can_read_kb(db, kb, user):
         raise HTTPException(status_code=403, detail="无权访问该知识库")
     return kb
 
@@ -101,7 +139,8 @@ def get_retrieval_config(user: User = Depends(get_current_user)):
 @router.get("/conversations", response_model=ApiResponse[list[ConversationRead]], summary="我的会话列表")
 def list_conversations(kb_id: uuid.UUID | None = None, mode: ChatMode | None = None,
                        db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
-    stmt = select(Conversation).where(Conversation.user_id == user.id)
+    stmt = select(Conversation).where(Conversation.user_id == user.id,
+                                      _conversation_visibility(user))
     if kb_id:
         stmt = stmt.where(Conversation.kb_id == kb_id)
     if mode:
@@ -118,7 +157,8 @@ def page_conversations(q: str | None = Query(None), page: int = Query(1, ge=1),
     # 固定路由必须放在 /conversations/{conversation_id} 之前，否则 "page" 会被当成会话 ID。
     keyword = _validate_query(q)
     clauses = _conversation_filters(kb_id, mode, keyword)
-    base = select(Conversation).where(Conversation.user_id == user.id, *clauses)
+    base = select(Conversation).where(Conversation.user_id == user.id,
+                                     _conversation_visibility(user), *clauses)
     total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
     rows = db.scalars(
         base.order_by(*_conversation_order()).offset((page - 1) * page_size).limit(page_size)
@@ -133,9 +173,8 @@ def update_conversation_metadata(conversation_id: uuid.UUID, payload: Conversati
                                  db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     # 仅会话本人可改；管理员对他人的读权限不延伸到这里。
     conv = _get_owned_conversation(db, conversation_id, user)
+    _require_conversation_kb_read(db, conv, user)
     # RAG 会话沿用知识库访问校验：权限被撤销后不能借元数据接口继续操作。
-    if conv.mode == CONVERSATION_MODE_RAG and conv.kb_id is not None:
-        _get_kb(db, conv.kb_id, user)
     fields = payload.model_fields_set
     values = {}
     if "title" in fields:
@@ -188,6 +227,7 @@ def get_conversation(conversation_id: uuid.UUID, db: DBSession = Depends(get_db)
 def set_document_scope(conversation_id: uuid.UUID, payload: DocumentScopeUpdate,
                        db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     conv = _get_owned_conversation(db, conversation_id, user)
+    _require_conversation_kb_read(db, conv, user)
     if conv.mode != CONVERSATION_MODE_RAG or conv.kb_id is None:
         raise HTTPException(400, "普通对话不支持文档范围")
     kb = _get_kb(db, conv.kb_id, user)
@@ -203,6 +243,7 @@ def set_document_scope(conversation_id: uuid.UUID, payload: DocumentScopeUpdate,
 def set_project_snapshot(conversation_id: uuid.UUID, payload: ProjectSnapshotUpdate,
                          db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     conv = _get_owned_conversation(db, conversation_id, user)
+    _require_conversation_kb_read(db, conv, user)
     if conv.mode != CONVERSATION_MODE_RAG or conv.kb_id is None:
         raise HTTPException(400, "仅项目知识库会话支持项目快照")
     _get_kb(db, conv.kb_id, user)
@@ -219,6 +260,7 @@ def get_conversation_memory(conversation_id: uuid.UUID, db: DBSession = Depends(
                             user: User = Depends(get_current_user)):
     # 只读本人会话的摘要状态；管理员对他人的读权限不延伸到这里的记忆。
     conv = _get_owned_conversation(db, conversation_id, user)
+    _require_conversation_kb_read(db, conv, user)
     return ApiResponse(data=memory_service.read_memory_status(db, conv))
 
 
@@ -228,6 +270,7 @@ def reset_conversation_memory(conversation_id: uuid.UUID, payload: MemoryResetRe
                               db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
     # 仅会话本人可重置（管理员不能重置他人会话）。
     conv = _get_owned_conversation(db, conversation_id, user)
+    _require_conversation_kb_read(db, conv, user)
     if not memory_service.memory_enabled(conv):
         raise HTTPException(400, "该会话未启用记忆摘要")
     # 会话行锁内判定：正在生成答案（有效 active 问答租约）阻重置（409）；
@@ -257,8 +300,10 @@ def reset_conversation_memory(conversation_id: uuid.UUID, payload: MemoryResetRe
 
 @router.delete("/conversations/{conversation_id}", response_model=ApiResponse[None], summary="删除会话")
 def delete_conversation(conversation_id: uuid.UUID, db: DBSession = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_conversation(db, conversation_id, user)
-    # 与完成写回使用同一行锁：删除后保留去重身份，但清掉含问题/来源的诊断。
+    conv = _get_conversation_row(db, conversation_id, user)
+    # 撤权后不能借删除接口读取/清理历史；本人取消在途任务仍走 cancel_request，
+    # 不会因知识库撤权被扩大成读取他人内容。
+    _require_conversation_kb_read(db, conv, user)
     conv = db.scalar(select(Conversation).where(Conversation.id == conversation_id)
                      .with_for_update().execution_options(populate_existing=True))
     if conv is None:
@@ -290,11 +335,11 @@ def get_request_state(request_id: uuid.UUID, db: DBSession = Depends(get_db), us
         raise HTTPException(404, "请求不存在")
     if turn.conversation_id is None:
         raise HTTPException(410, "原会话已删除，请求结果不可用")
-    conv = _get_conversation(db, turn.conversation_id, user)
+    conv = _get_conversation_row(db, turn.conversation_id, user)
     if conv.mode == CONVERSATION_MODE_RAG:
         if conv.kb_id is None:
             raise HTTPException(410, "原知识库已删除，请求结果不可用")
-        _get_kb(db, conv.kb_id, user)  # 权限撤销后不能靠旧请求读取结果。
+        _get_kb(db, conv.kb_id, user)  # 权限撤销后不能靠旧请求读取结果（含成员撤权）。
         if getattr(turn, "project_snapshot_id", None) is not None:
             project_chat_scope.replay_project_check(db, user.id, turn.project_snapshot_id)
     chat_turns.expire_request(db, turn)

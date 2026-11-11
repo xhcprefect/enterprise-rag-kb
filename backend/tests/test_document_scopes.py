@@ -154,3 +154,58 @@ class DocumentScopeTests(unittest.TestCase):
                 chat_turns.claim_turn(self.db, user_id=uuid.uuid4(), conversation_id=None, kb_id=None,
                                       mode="chat", question="q", top_k=6, auth_token_version=0, **options)
         self.db.add.assert_not_called()
+
+
+class InternalScopeLimitTests(unittest.TestCase):
+    """用户会话 5 份与内部检索清单 256 份的有界校验必须分开。"""
+
+    def manifest(self, count):
+        return [{"document_id": str(uuid.uuid4()), "index_version": 0} for _ in range(count)]
+
+    def test_default_still_rejects_six_while_internal_manifest_accepts_six_and_256(self):
+        items = self.manifest(257)
+        self.assertEqual(len(scopes.scope_pairs(items[:5])), 5)
+        with self.assertRaises(ValueError):
+            scopes.scope_pairs(items[:6])
+        self.assertEqual(len(scopes.scope_pairs(
+            items[:6], max_documents=scopes.MAX_INTERNAL_SCOPE_DOCUMENTS)), 6)
+        # 执行上下文提供的是 tuple；内部路径同样接受，用户选择上限仍由默认 5 限制。
+        self.assertEqual(len(scopes.scope_pairs(
+            tuple(items[:256]), max_documents=scopes.MAX_INTERNAL_SCOPE_DOCUMENTS)), 256)
+        with self.assertRaises(ValueError):
+            scopes.scope_pairs(items[:257], max_documents=scopes.MAX_INTERNAL_SCOPE_DOCUMENTS)
+        with self.assertRaises(ValueError):
+            scopes.scope_pairs(tuple(items[:257]), max_documents=scopes.MAX_INTERNAL_SCOPE_DOCUMENTS)
+        # 新增内部上限不得放宽用户选择入口。
+        with self.assertRaises(HTTPException):
+            scopes.scope_ids([item["document_id"] for item in items[:6]])
+
+    def test_internal_manifest_rejects_bad_identity_version_duplicate_and_bad_limit(self):
+        valid = self.manifest(3)
+        bad_scopes = [
+            None, {}, "", [None], [{**valid[0], "document_id": "not-a-uuid"}],
+            [{**valid[0], "index_version": True}], [{**valid[0], "index_version": 1.0}],
+            [{**valid[0], "index_version": -1}], [valid[0], valid[0]],
+        ]
+        for value in bad_scopes:
+            with self.subTest(scope=value), self.assertRaises(ValueError):
+                scopes.scope_pairs(value, max_documents=scopes.MAX_INTERNAL_SCOPE_DOCUMENTS)
+        for limit in [True, 5.0, -1, "256", None]:
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                scopes.scope_pairs(valid, max_documents=limit)
+
+    def test_retrieval_sql_filter_and_contains_use_256_but_user_default_stays_five(self):
+        items = self.manifest(257)
+        self.assertEqual(str(scopes.scope_filter([])), "false")
+        sql = str(scopes.scope_filter(items[:256]).compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        self.assertIn(str(items[0]["document_id"]), sql)
+        self.assertIn(str(items[255]["document_id"]), sql)
+        self.assertIn("documents.index_version = 0", sql)
+        with self.assertRaises(ValueError):
+            scopes.scope_filter(items[:257])
+        metadata = dict(items[256 - 1])
+        self.assertTrue(scopes.contains(items[:256], metadata))
+        self.assertFalse(scopes.contains(items[:256], metadata, max_documents=scopes.MAX_SCOPE_DOCUMENTS))
+        self.assertFalse(scopes.contains(items[:256], {**metadata, "index_version": True},
+                                         max_documents=scopes.MAX_INTERNAL_SCOPE_DOCUMENTS))

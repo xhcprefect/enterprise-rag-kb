@@ -16,9 +16,21 @@ from datetime import timezone
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.models import Document, DocumentChunk, KnowledgeBase, User
+from app.models import (
+    Document,
+    DocumentChunk,
+    KnowledgeBase,
+    ProjectChunk,
+    ProjectFileParseStatus,
+    ProjectFileVersion,
+    ProjectSnapshot,
+    ProjectSnapshotFile,
+    ProjectSnapshotStatus,
+    ProjectSource,
+    User,
+)
 from app.models.feedback import FEEDBACK_STATUS_VERIFIED
-from app.services import answer_feedback, document_lifecycle
+from app.services import answer_feedback, document_lifecycle, document_scopes, kb_access
 from app.services.evaluation import EvaluationError, dataset_identity, grade_case, validate_cases
 from app.services.evaluation_reviews import ReviewError, inspect_report, load_json_bytes
 
@@ -26,6 +38,10 @@ PROTOCOL_VERSION = 1
 MAX_REPORT_BYTES = 2 * 1024 * 1024
 MAX_FAILURES = 64
 REGRESSION_MODES = ("offline", "live")
+_PROJECT_READY_STATUSES = (
+    ProjectFileParseStatus.READY.value,
+    ProjectFileParseStatus.FALLBACK.value,
+)
 
 _FAILURE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 _OUTCOME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,31}")
@@ -107,10 +123,122 @@ def _resolve_single_document(db, kb, source):
     return document
 
 
-def resolve_regression_sources(db, kb, conversation, sources) -> list[dict]:
-    """解析并稳定化期望来源；同库、可检索、代次与分块必须真实存在。
+def _project_snapshot(db, kb, conversation):
+    """返回会话固定的项目快照与项目源；始终使用原快照，不跟随 active 漂移。"""
+    snapshot_id = getattr(conversation, "project_snapshot_id", None)
+    if snapshot_id is None or kb is None or getattr(kb, "kind", "upload") != "project":
+        raise RegressionUnavailable("project_snapshot_invalid", "项目快照已不可用")
+    snapshot = db.get(ProjectSnapshot, snapshot_id)
+    if snapshot is None:
+        raise RegressionUnavailable("project_snapshot_invalid", "项目快照已不可用")
+    source = db.get(ProjectSource, snapshot.source_id)
+    if source is None or source.kb_id != kb.id or source.revoked_at is not None:
+        raise RegressionUnavailable("project_snapshot_invalid", "项目源已撤销或不属于当前知识库")
+    if snapshot.status != ProjectSnapshotStatus.READY.value:
+        raise RegressionUnavailable("project_snapshot_invalid", "项目快照未就绪")
+    if not snapshot.manifest_fingerprint or not snapshot.config_fingerprint:
+        raise RegressionUnavailable("project_snapshot_invalid", "项目快照缺少 manifest/config 指纹")
+    return snapshot, source
 
-    文件名必须在当前可检索文档中唯一；顺序保持，规范化后重复的来源只保留首次。
+
+def _resolve_project_file(db, snapshot, source, item):
+    if item.get("index_version") is not None:
+        _invalid_source("项目来源不能携带上传索引代次")
+    document_id = item.get("document_id")
+    filename = item.get("filename")
+    if filename is not None and not isinstance(filename, str):
+        _invalid_source("来源文件名不合法")
+    if not document_id and not filename:
+        _invalid_source("来源需要 filename 或 document_id")
+    version = None
+    if document_id:
+        try:
+            identity = uuid.UUID(str(document_id))
+        except (ValueError, TypeError, AttributeError):
+            _invalid_source("来源文档标识不合法")
+        version = db.scalar(
+            select(ProjectFileVersion)
+            .join(ProjectSnapshotFile,
+                  ProjectSnapshotFile.file_version_id == ProjectFileVersion.id)
+            .where(ProjectSnapshotFile.snapshot_id == snapshot.id,
+                   ProjectFileVersion.id == identity)
+        )
+        if version is None or version.source_id != source.id:
+            _invalid_source()
+        mapped_path = db.scalar(
+            select(ProjectSnapshotFile.relative_path)
+            .where(ProjectSnapshotFile.snapshot_id == snapshot.id,
+                   ProjectSnapshotFile.file_version_id == version.id)
+            .limit(1)
+        )
+        if mapped_path != version.relative_path:
+            _invalid_source("项目快照映射路径与文件版本不一致")
+    if filename:
+        named = db.scalar(
+            select(ProjectFileVersion)
+            .join(ProjectSnapshotFile,
+                  ProjectSnapshotFile.file_version_id == ProjectFileVersion.id)
+            .where(ProjectSnapshotFile.snapshot_id == snapshot.id,
+                   ProjectSnapshotFile.relative_path == filename,
+                   ProjectFileVersion.relative_path == filename)
+        )
+        if named is None or named.source_id != source.id:
+            _invalid_source()
+        if version is not None and version.id != named.id:
+            _invalid_source("来源文档与文件名不一致")
+        version = named
+    if version is None:
+        _invalid_source()
+    if version.parse_status not in _PROJECT_READY_STATUSES:
+        _invalid_source("项目文件尚未解析完成")
+    canonical = {
+        "source_kind": "project",
+        "document_id": str(version.id),
+        "file_version_id": str(version.id),
+        "snapshot_id": str(snapshot.id),
+        "source_id": str(snapshot.source_id),
+        "relative_path": version.relative_path,
+        "filename": version.relative_path,
+        "manifest_fingerprint": snapshot.manifest_fingerprint,
+        "config_fingerprint": snapshot.config_fingerprint,
+    }
+    chunk_index = item.get("chunk_index")
+    if chunk_index is not None:
+        if type(chunk_index) is not int or chunk_index < 0:
+            _invalid_source("来源片段编号不合法")
+        exists = db.scalar(
+            select(ProjectChunk.id)
+            .where(ProjectChunk.file_version_id == version.id,
+                   ProjectChunk.chunk_index == chunk_index,
+                   ProjectChunk.embedded.is_(True))
+            .limit(1)
+        )
+        if exists is None:
+            raise RegressionUnavailable("chunk_missing", "来源片段已不存在")
+        canonical["chunk_index"] = chunk_index
+    return canonical
+
+
+def _session_scope(conversation):
+    """读取会话限定范围；显式空列表 = 全库。坏结构失败关闭。"""
+    scope = getattr(conversation, "document_scope", None)
+    if not isinstance(scope, list):
+        raise RegressionUnavailable("scope_invalid", "会话限定文档范围已失效")
+    if not scope:
+        return ()
+    try:
+        return document_scopes.scope_pairs(scope)
+    except (ValueError, TypeError, AttributeError):
+        raise RegressionUnavailable("scope_invalid", "会话限定文档范围已失效") from None
+
+
+def resolve_regression_sources(db, kb, conversation, sources) -> list[dict]:
+    """解析并稳定化期望来源；支持上传限定范围与项目固定快照。
+
+    - 上传：同库、可检索、代次与分块必须真实存在；会话有显式范围时来源不得越界。
+    - 项目：使用会话原快照，输出 answer_sources 权威身份字段；真实快照映射、文件
+      版本与（若标注）具体 chunk 都必须存在。
+
     所有失败使用稳定阻断码，不回显文件名、文档标识或分块正文。
     """
     if sources is None:
@@ -119,16 +247,30 @@ def resolve_regression_sources(db, kb, conversation, sources) -> list[dict]:
         _invalid_source("期望来源必须是列表")
     if not sources:
         return []
-    if getattr(conversation, "project_snapshot_id", None) is not None:
-        raise RegressionUnavailable("project_unsupported", "项目库或项目快照暂不支持反馈回归")
+    project = kb is not None and getattr(kb, "kind", "upload") == "project"
+    if getattr(conversation, "project_snapshot_id", None) is not None and not project:
+        _invalid_source("项目快照与知识库类型不一致")
+    if project:
+        snapshot, source = _project_snapshot(db, kb, conversation)
+        resolved: list[dict] = []
+        seen: set[str] = set()
+        for item in sources:
+            if not isinstance(item, dict):
+                _invalid_source("期望来源结构不合法")
+            canonical = _resolve_project_file(db, snapshot, source, item)
+            key = _canonical_json(canonical)
+            if key not in seen:
+                seen.add(key)
+                resolved.append(canonical)
+        return resolved
     if kb is None:
         _invalid_source("普通对话不能标注期望来源")
-    if getattr(kb, "kind", "upload") == "project":
-        raise RegressionUnavailable("project_unsupported", "项目库或项目快照暂不支持反馈回归")
     if getattr(conversation, "kb_id", None) is not None and conversation.kb_id != kb.id:
         _invalid_source("来源与当前会话知识库不一致")
+    scope_pairs = _session_scope(conversation)
+    scope = set(scope_pairs)
 
-    resolved: list[dict] = []
+    resolved = []
     seen: set[str] = set()
     for source in sources:
         if not isinstance(source, dict):
@@ -140,6 +282,8 @@ def resolve_regression_sources(db, kb, conversation, sources) -> list[dict]:
                 _invalid_source("来源索引代次不合法")
             if explicit_version != document.index_version:
                 raise RegressionUnavailable("version_mismatch", "来源索引代次与当前文档不一致")
+        if scope and (document.id, document.index_version) not in scope:
+            _invalid_source("期望来源不在会话限定文档范围内")
         item = {"document_id": str(document.id), "filename": document.filename,
                 "index_version": document.index_version}
         chunk_index = source.get("chunk_index")
@@ -162,10 +306,11 @@ def resolve_regression_sources(db, kb, conversation, sources) -> list[dict]:
     return resolved
 
 
-def build_base_case(db, admin, feedback, message, conversation, *, cause: str) -> dict:
+def build_base_case(db, admin, feedback, message, conversation, *, cause: str, owner=None) -> dict:
     """把已核实反馈转换成不含执行模式的基准评测 case（只读）。
 
-    cause 只参与后续绑定判断，不写入 case，避免原因分类改变数据集身份。
+    权限以**原反馈所有者**的当前状态为准（上下文根门禁已复核；这里再做一次
+    防御性检查），不使用管理员权限替代。cause 只参与后续绑定判断，不写入 case。
     """
     if conversation is None:
         raise RegressionUnavailable("feedback_stale", "原回答与会话信息不一致，反馈结果已过期")
@@ -174,18 +319,20 @@ def build_base_case(db, admin, feedback, message, conversation, *, cause: str) -
         kb = db.get(KnowledgeBase, conversation.kb_id)
         if kb is None:
             _invalid_source("知识库不存在")
-    if conversation.project_snapshot_id is not None or (
-        kb is not None and getattr(kb, "kind", "upload") == "project"
-    ):
-        raise RegressionUnavailable("project_unsupported", "项目库或项目快照暂不支持反馈回归")
-    if getattr(conversation, "document_scope", None) or getattr(conversation, "scope_revision", 0) != 0:
-        raise RegressionUnavailable("scope_unsupported", "曾设置文档范围的会话暂不支持反馈回归")
+    project = kb is not None and getattr(kb, "kind", "upload") == "project"
+    if conversation.project_snapshot_id is not None and not project:
+        raise RegressionUnavailable("project_snapshot_invalid", "项目快照与知识库类型不一致")
+    if project and conversation.project_snapshot_id is None:
+        raise RegressionUnavailable("project_snapshot_invalid", "项目快照已不可用")
+    scope_pairs = _session_scope(conversation) if (kb is not None and not project) else ()
     if conversation.mode == "rag" and kb is None:
         _invalid_source("知识库不存在")
-    if kb is not None and not bool(getattr(admin, "is_admin", False)) \
-            and not bool(getattr(kb, "is_public", True)) \
-            and getattr(kb, "owner_id", None) != getattr(admin, "id", None):
-        _invalid_source("无权访问该知识库")
+    if owner is None:
+        owner = db.get(User, feedback.user_id)
+    if owner is None or not owner.is_active:
+        raise RegressionUnavailable("owner_inactive", "反馈所有者已禁用，不能按原权限重跑")
+    if kb is not None and not kb_access.can_read_kb(db, kb, owner):
+        raise RegressionUnavailable("owner_access_revoked", "反馈所有者已无权访问该知识库")
     if feedback.status != FEEDBACK_STATUS_VERIFIED:
         raise RegressionUnavailable("feedback_not_verified", "仅已核实的反馈可以纳入回归")
     if message is None or conversation is None \
@@ -219,7 +366,6 @@ def build_base_case(db, admin, feedback, message, conversation, *, cause: str) -
     if not 1 <= len(turns) <= 10:
         raise RegressionUnavailable("turns_overflow", "多轮上下文超过回归上限，无法自动重放")
 
-    owner = db.get(User, feedback.user_id)
     if owner is None:
         raise RegressionUnavailable("annotation_incomplete", "反馈用户已不存在，无法确定执行角色")
     reviewed_at = feedback.reviewed_at
@@ -243,6 +389,19 @@ def build_base_case(db, admin, feedback, message, conversation, *, cause: str) -
     }
     if conversation.mode == "rag" and conversation.kb_id is not None:
         case["kb_id"] = str(conversation.kb_id)
+    if project:
+        snapshot, source = _project_snapshot(db, kb, conversation)
+        case["project_identity"] = {
+            "snapshot_id": str(snapshot.id),
+            "source_id": str(snapshot.source_id),
+            "manifest_fingerprint": snapshot.manifest_fingerprint,
+            "config_fingerprint": snapshot.config_fingerprint,
+        }
+    elif scope_pairs:
+        case["document_scope"] = [
+            {"document_id": str(identifier), "index_version": version}
+            for identifier, version in scope_pairs
+        ]
     try:
         validate_cases([case])
     except EvaluationError:
@@ -270,16 +429,33 @@ def base_binding_payload(case, *, feedback, resolved_sources, kb_id, mode: str, 
     """构建与具体回归轮次无关的绑定内容。
 
     不含回归 revision、run UUID 或尝试序号；重新准备同一反馈不会让历史轮次失效。
-    来源清单只保留稳定身份字段（document_id/index_version/chunk_index）。
+    上传来源清单只保留稳定身份字段（document_id/index_version/chunk_index）；项目
+    来源额外保留 snapshot/source/file/relative_path/manifest/config 身份。全库上传
+    执行清单不进入旧 manual case/binding，只有显式限定范围 / 项目身份才进入。
     """
     fingerprints = case_fingerprints(case)
     sources = []
     for source in resolved_sources or []:
+        if source.get("source_kind") == "project":
+            item = {
+                "source_kind": "project",
+                "document_id": str(source["document_id"]),
+                "file_version_id": str(source["file_version_id"]),
+                "snapshot_id": str(source["snapshot_id"]),
+                "source_id": str(source["source_id"]),
+                "relative_path": source["relative_path"],
+                "manifest_fingerprint": source["manifest_fingerprint"],
+                "config_fingerprint": source["config_fingerprint"],
+            }
+            if source.get("chunk_index") is not None:
+                item["chunk_index"] = source["chunk_index"]
+            sources.append(item)
+            continue
         item = {"document_id": str(source["document_id"]), "index_version": source["index_version"]}
         if source.get("chunk_index") is not None:
             item["chunk_index"] = source["chunk_index"]
         sources.append(item)
-    return {
+    payload = {
         "protocol_version": PROTOCOL_VERSION,
         "feedback_id": str(feedback.id),
         "feedback_revision": feedback.revision,
@@ -291,6 +467,12 @@ def base_binding_payload(case, *, feedback, resolved_sources, kb_id, mode: str, 
         "kb_id": None if kb_id is None else str(kb_id),
         "mode": mode,
     }
+    # 旧上传 case 没有这两个键；只有新能力显式出现时才加入，保持旧绑定摘要不变。
+    if case.get("document_scope"):
+        payload["document_scope"] = case["document_scope"]
+    if case.get("project_identity"):
+        payload["project_identity"] = case["project_identity"]
+    return payload
 
 
 def binding_sha256(payload: dict) -> str:

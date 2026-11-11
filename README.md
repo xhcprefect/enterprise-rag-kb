@@ -57,7 +57,7 @@ enterprise-rag-kb/
 │   ├── requirements.txt   # 开发依赖（宽松下限）
 │   ├── requirements.lock  # 生产依赖锁定，供镜像构建
 │   ├── Dockerfile
-│   ├── worker.py          # ingest / summary / project 独立角色入口
+│   ├── worker.py          # ingest / summary / project / regression 独立角色入口
 │   └── run.py
 ├── frontend/
 │   ├── src/
@@ -77,7 +77,7 @@ enterprise-rag-kb/
 │   ├── restore.sh         # 恢复（1–3 个参数，校验清单后恢复）
 │   └── tests/
 │       └── restore-drill.sh   # 隔离恢复演练（专用临时 Compose 项目）
-├── docker-compose.yml     # db / api / worker / web；summary、project 可选 profile
+├── docker-compose.yml     # db / api / worker / web；summary、project、regression 可选 profile
 ├── docker-compose.https.yml   # 可选 HTTPS 覆盖（80 跳转 + 443 站点）
 ├── DEPLOY.md              # 生产部署手册
 ├── start-backend.bat
@@ -121,19 +121,26 @@ npm run dev
 
 ### 独立后台任务
 
-API 和前端启动后，还需在 `backend` 目录的独立终端启动入库 worker；启用摘要或项目功能时，再各自启动对应角色：
+API 和前端启动后，还需在 `backend` 目录的独立终端启动入库 worker；启用摘要、项目或在线回归重跑时，再各自启动对应角色：
 
 ```bash
 python worker.py --role ingest
 python worker.py --role summary
 python worker.py --role project
+python worker.py --role regression
 ```
 
-上面三条命令分别占用一个进程。`ingest` 是默认角色；没有相应 worker 时，文档入库、摘要或项目同步会一直排队。Compose 默认启动入库角色；摘要和项目角色按需启用：
+上面四条命令分别占用一个进程。`ingest` 是默认角色；没有相应 worker 时，文档入库、摘要、项目同步或在线回归作业会一直排队。Compose 默认启动入库角色；其余角色按需启用：
 
 ```bash
-docker compose --profile summary --profile project up -d
+docker compose --profile summary --profile project --profile regression up -d
 ```
+
+`regression` 角色消费管理员显式提交的反馈回归后台重跑作业，没有默认自动入队开关；未启动该进程时作业保持排队。管理员在反馈处理页显式提交、取消，并可凭原 `request_id` 只读找回提交结果（不重放写）；作业完成后可比较新旧答案/引用，人工核验收敛到具体 run 与 result 指纹。新作业 `status` 从 `queued` 开始，人工核验 `review.status` 初始为 `unknown`。**后台重跑会真实调用所配置的模型服务，产生新的模型调用与实际用量记录**；费用按当前单价配置计算，单价缺失时费用保持未知而不是 0。机器断言（答案/引用指纹、对比指标）只说明与旧结果是否一致，不等同于语义正确，两者仍需人工核验区分。旧 manual 轮次的准备/导出/导入保持兼容。在线回归的接口字段以对应后端版本为准。
+
+每个 worker 进程都会在 `worker_heartbeats` 表中登记自己的实例 UUID，并用独立守护线程每 10 秒做一次短事务心跳——空闲、长任务和模型网络等待期间都有效。任务表里的 `heartbeat_at` 只证明“有任务被领取”，进程空闲时无法证明存活，因此不能替代实例心跳。心跳写入失败只记日志，不影响真实任务；退出时有界等待并尽力写入 `stopped_at`。
+
+管理员可在「运维」页或 `GET /api/v1/operations/workers` 查看固定顺序 `ingest` / `summary` / `project` / `regression` 四个角色的实例心跳与任务队列：启用状态、`disabled`/`not_started`/`running`/`stale`/`stopped`/`unknown` 状态、存活实例数（45 秒内有新鲜心跳）、待处理/处理中/心跳超时任务数与最老等待、以及最近一次失败的安全错误码与更新时间。该接口需要管理员权限并返回 `Cache-Control: no-store`；查询失败时 `degraded=true` 且计数为 `null`，不会补零冒充“队列为空”。
 
 普通对话摘要默认关闭。在 `backend/.env` 设置 `CHAT_MEMORY_ENABLED=true` 后启用；默认累计 8 个完整轮次或历史预算达到 75% 时触发，保留最近 4 轮。摘要只辅助历史上下文，原始消息仍保留，不提供跨会话记忆。生成、重置和旧任务收尾使用版本与租约校验，重置后迟到任务不能重新发布旧摘要。
 
@@ -317,6 +324,7 @@ docker compose --profile summary --profile project up -d
 - `HYBRID_RETRIEVAL_ENABLED=true` 将向量结果与 PostgreSQL 全文关键词结果按排名融合。关键词保留英文型号/错误码、中文二三字片段，并统一中文/阿拉伯条款编号，不依赖新增搜索服务。两路都限定当前知识库、就绪且未取消的文档；关键词读取当前分块，向量与历史来源检查索引代次。某一路失败时尽量使用另一有效路；服务故障且没有可用候选时返回错误，而不是伪装成资料不足。
 - `RERANK_ENABLED=false` 默认不额外调用模型。配置 `RERANK_BASE_URL`、`RERANK_MODEL` 和相应密钥后可启用兼容 `/rerank` 的服务，最多处理 40 条有界文本，默认总截止时间 3 秒、不重试。失败或非法结果回退原顺序。关键词/融合/重排分数不会伪装成余弦相似度；仅关键词命中的来源不显示相似度百分比。
 - 新入库文档保留 PDF 实际页码、Markdown/中文章节条款、DOCX 原始段落与表格顺序、CSV/Excel 工作表及行位置；分块重复保留章节前缀；Markdown、CSV、Excel 和 DOCX 表格重复保留表头（CSV/Excel/DOCX 以首个非空行为表头），过长前缀有界截短。`RETRIEVAL_NEIGHBOR_CHUNKS=1` 只补同结构相邻片段；预算不足时先退回命中的中心片段，并收窄引用范围，避免把未实际供给模型的邻居计作依据。
+- 可提取文字的 PDF 使用 PyMuPDF 的真实表格识别：带格线的表格按行列还原，空单元格保留为空，表头（含位于表格上方、被识别为「外部表头」的情况）只加入一次并在分块前缀重复；表内逻辑行号 `row_start`/`row_end` 以物化后的表格行为准（表头恒为第 1 行、正文从第 2 行起），`page_start`/`page_end` 始终是 PDF 物理页号。正文与表格按页内纵/横坐标合并，同一行或同一文本片段只有部分落在表格内时保留表格外的文字；只有完整识别并复制成功的表才会从正文中排除，单表抽取失败保留该表原文、整体识别失败保留整页原文，因此不会因识别异常丢正文。旋转页（`/Rotate` 非 0）的表格区域与文字坐标不同源，这类页整体按正文保留，宁可重复也不误删。真正空白页跳过且不重编号；含可见图像却没有可提取文字的页（含旋转页与 inline 图像，只按实际展示位置判断，不按资源清单）会让整份文档失败并提示页号与「先 OCR 后重新上传」，混合文档不会只入库文字页就标记就绪。OCR 引擎与模型不在本仓库内提供，也不会自动下载。
 - 引用的「查看原文」重新检查知识库访问权、就绪状态与索引代次，显示完整分块及可用位置；PDF 通过带鉴权的接口读取，并定位到实际页码。文本按纯文本显示，不执行文档中的 HTML。文档删除/更新后旧来源会提示失效；旧索引不猜页码，重新索引后获得结构信息。扫描 PDF 仍需预先 OCR。
 
 ### 本次升级与验证
@@ -328,7 +336,7 @@ docker compose --profile summary --profile project up -d
 
 ### 真实浏览器与维护回归
 
-浏览器用例使用真实 API、PostgreSQL、三个独立 worker 与前端生产构建，只有模型由回环确定性替身提供。先安装锁定依赖、Playwright Chromium，并显式准备 `pgvector/pgvector:pg18` 测试镜像；harness 不会自动拉取镜像。在独立终端运行：
+浏览器用例使用真实 API、PostgreSQL、四个独立角色 worker（`ingest`/`summary`/`project`/`regression`）与前端生产构建，只有模型由回环确定性替身提供。先安装锁定依赖、Playwright Chromium，并显式准备 `pgvector/pgvector:pg18` 测试镜像；harness 不会自动拉取镜像。在独立终端运行：
 
 ```bash
 python -I backend/scripts/e2e_env.py up --out /tmp/ragkb-browser-run --owner local-browser --keep
@@ -498,21 +506,31 @@ worker 相互独立，可单独启动。
   本地模式下的 `qwen3.5:0.8b` 参数较小，复杂推理能力有限，生产建议换 7B 以上模型。
 - 云端模式需要后端能访问 `api.siliconflow.cn` 与 `www.sheapi.top`；内网部署请把两个
   `*_PROVIDER` 改回 `ollama`。
-- 扫描版 PDF 无法提取文字，需先 OCR。
+- 扫描版 PDF 无法提取文字，需先 OCR。整份只有图片、或文字页与扫描页混合时，入库会明确失败并列出需要 OCR 的物理页号（不列出文件路径或原文），修好后重新上传即可；系统不会自动安装或调用 OCR 引擎。
 - 文档入库由独立 worker 进程从数据库领取（`start-worker.bat`），支持断点续传与多开；
   worker 未运行时文档停在 `pending`，`/health` 会显示 `worker: stale`。
   `/health` 的 `worker` 有三种取值：`alive`（正在处理且有新鲜心跳）、
   `stale`（有排队文档但无人领取，通常是 worker 没启动）、`idle`（队列为空，无法观测）。
-- worker 支持 `--role` 参数三种角色：`ingest`（文档入库，默认，即 `start-worker.bat` 的行为）、
-  `summary`（普通对话摘要压缩）、`project`（项目源码/文档索引与手动/自动同步）。
-  **三种角色相互独立，需各自单独启动**，没有单一脚本能一次拉起全部：
+- worker 支持 `--role` 参数四个角色：`ingest`（文档入库，默认，即 `start-worker.bat` 的行为）、
+  `summary`（普通对话摘要压缩）、`project`（项目源码/文档索引与手动/自动同步）、
+  `regression`（反馈回归的后台重跑，消费管理员显式提交的在线作业）。
+  **四个角色相互独立，需各自单独启动**，没有单一脚本能一次拉起全部：
   ```bash
   python worker.py                              # 入库（默认）
   python worker.py --role summary               # 对话摘要
   python worker.py --role project               # 项目索引
+  python worker.py --role regression            # 反馈回归后台重跑
   ```
-  只跑 `ingest` 时，摘要与会话记忆保持在已触发/排队状态、项目同步停在待处理状态——文档/摘要/
-  项目的领取循环互不占用，长任务不会互相饿死。
+  本地也可用 `start-worker.bat [ingest|summary|project|regression]` 启动单个角色；
+  不带参数仍是入库。只跑 `ingest` 时，摘要与会话记忆保持在已触发/排队状态、项目同步与
+  在线回归作业停在待处理状态——文档/摘要/项目/回归的领取循环互不占用，长任务不会互相饿死。
+  在线回归没有默认自动入队；每次后台重跑都会真实调用模型并产生用量记录，机器断言与
+  人工核验是两件事。
+  除 `/health` 的队列推断外，管理员还可用 `/api/v1/operations/workers`（或「运维」页）看到四个角色
+  自己的实例心跳与任务队列；Prometheus 采集会输出固定 `role` 标签的 `ragkb_worker_enabled`、
+  `ragkb_worker_alive`、`ragkb_worker_{pending,processing,stale}_tasks` 等指标，并对“已启用但连续
+  5 分钟没有存活实例”的角色告警。采集失败时这些指标整体缺失（`ragkb_workers_available=0`），
+  不会显示为 0 个实例。
 - 本地模式下首次检索会加载 bge-m3 到内存，响应较慢，之后正常；云端模式无此问题。
 
 ## 生产部署
@@ -531,9 +549,10 @@ docker compose up -d --build
 ```
 
 编排默认启动 4 个服务：`db`（pgvector）、`api`（uvicorn）、`worker`（入库）、
-`web`（Nginx 静态托管 + 反代）；另有 2 个按 profile 启用的角色服务：
-`worker-summary`（`--profile summary`）与 `worker-project`（`--profile project`）。
-`api`、`worker` 和两个角色 worker 是**同一个镜像**（`rag-kb-backend`，只差启动命令），
+`web`（Nginx 静态托管 + 反代）；另有 3 个按 profile 启用的角色服务：
+`worker-summary`（`--profile summary`）、`worker-project`（`--profile project`）与
+`worker-regression`（`--profile regression`，反馈回归后台重跑）。
+`api`、`worker` 和三个 profile 角色 worker 是**同一个镜像**（`rag-kb-backend`，只差启动命令），
 构建一次、多个容器共用；`web` 单独构建，不会出现后端版本漂移。
 数据统一落在 `${DATA_DIR}`，附备份/恢复脚本，适配可能被回收的竞价实例。
 
@@ -560,4 +579,4 @@ python backend/scripts/verify_deployment.py \
 
 评测工具支持完整本地语料、公开检索配置和可选索引清单的身份校验，旧身份基线会明确判为不可比；业务问题集可用 `--require-reviewed` 检查人工核验状态，并输出分层样本数与固定断言结果。用法见 [评测说明](backend/evaluation/README.md) 与 [业务标注模板](backend/evaluation/templates/README.md)。
 
-审计写入失败通过脱敏日志、无标签指标和管理员摘要可见；可选的 Prometheus → Alertmanager → 通用 webhook 通知链路及启停步骤见 [监控与告警说明](deploy/monitoring/README.md)。上线仍需准备真实接收器和经人工核验的业务样本。
+审计写入失败通过脱敏日志、无标签指标和管理员摘要可见；可选的 Prometheus → Alertmanager → 通用 webhook 通知链路及启停步骤见 [监控与告警说明](deploy/monitoring/README.md)。worker 角色心跳同样导出为固定 `role` 标签的指标，规则见 `deploy/monitoring/prometheus/rules/ragkb-worker.yml.in`。上线仍需准备真实接收器和经人工核验的业务样本。

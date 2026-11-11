@@ -101,6 +101,9 @@
                     <el-dropdown-item v-if="!isProjectKb(kb)" command="diagnostics">
                       <el-icon><DataLine /></el-icon>{{ t('knowledge.diagnostics.menu') }}
                     </el-dropdown-item>
+                    <el-dropdown-item v-if="canManageMembers(kb)" command="members">
+                      <el-icon><User /></el-icon>{{ t('knowledge.members.menu') }}
+                    </el-dropdown-item>
                     <el-dropdown-item command="delete" divided>
                       <el-icon><Delete /></el-icon>
                       {{ isProjectKb(kb) ? t('knowledge.revokeProject') : t('common.delete') }}
@@ -218,6 +221,11 @@
     </el-dialog>
 
     <RetrievalDiagnosticsDialog v-model="diagnosticsOpen" :kb="diagnosticsKb" />
+    <KnowledgeBaseMembersDialog
+      v-model="membersOpen"
+      :kb="membersKb"
+      @revoked="onMembersRevoked"
+    />
   </div>
 </template>
 
@@ -229,6 +237,8 @@ import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'elem
 import { Search } from '@element-plus/icons-vue'
 import { isProjectKb, kbApi, type KnowledgeBase } from '@/api'
 import RetrievalDiagnosticsDialog from '@/components/RetrievalDiagnosticsDialog.vue'
+import KnowledgeBaseMembersDialog from '@/components/KnowledgeBaseMembersDialog.vue'
+import { canManageMembers } from '@/utils/kbCapabilities'
 import { useUserStore } from '@/stores/user'
 import { formatNumber } from '@/i18n/format'
 
@@ -244,6 +254,8 @@ const submitting = ref(false)
 const editing = ref<KnowledgeBase | null>(null)
 const diagnosticsOpen = ref(false)
 const diagnosticsKb = ref<KnowledgeBase | null>(null)
+const membersOpen = ref(false)
+const membersKb = ref<KnowledgeBase | null>(null)
 const formRef = ref<FormInstance>()
 
 const form = reactive({ name: '', description: '', is_public: true })
@@ -329,6 +341,13 @@ async function onCommand(cmd: string, kb: KnowledgeBase) {
     diagnosticsOpen.value = true
     return
   }
+  if (cmd === 'members') {
+    // 能力以服务端返回值为准：缺失或非 true 不作为管理员角色的兜底。
+    if (!canManageMembers(kb)) return
+    membersKb.value = kb
+    membersOpen.value = true
+    return
+  }
   if (cmd !== 'delete') return
 
   // 项目源的"删除"是撤销授权（软撤销，读取返回 410），文案与确认都必须说清楚。
@@ -392,6 +411,14 @@ function projectTagType(kb: KnowledgeBase) {
   if (kb.project_revoked) return 'info'
   if (kb.project_ready) return 'success'
   return 'warning'
+}
+
+/** 服务端拒绝成员管理后立即关闭并重取列表，避免继续使用旧能力。 */
+async function onMembersRevoked() {
+  membersOpen.value = false
+  membersKb.value = null
+  ElMessage.warning(t('knowledge.members.noPermission'))
+  await load()
 }
 
 function goChat(kb: KnowledgeBase) {

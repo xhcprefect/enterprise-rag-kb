@@ -195,7 +195,7 @@ async function capturePanel(
 
 test.beforeAll(async ({ request }) => {
   token = await apiLogin(request, manifest)
-  expect(Object.keys(manifest.workers || {}).sort()).toEqual(['ingest', 'project', 'summary'])
+  expect(Object.keys(manifest.workers || {}).sort()).toEqual(['ingest', 'project', 'regression', 'summary'])
 })
 
 test.beforeEach(async ({ page }) => {

@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
 from app.models import User
-from app.services.parser import detect_encoding
+from app.services.parser import TextDecodingError, detect_encoding
 
 logger = logging.getLogger(__name__)
 
@@ -185,15 +185,24 @@ def _cell_text(value: object) -> str:
 
 
 def _read_csv_rows(data: bytes) -> list[list[str]]:
-    encoding = detect_encoding(data[:64 * 1024])
+    # 用户 CSV 已经完整在内存里，这里对全部字节做编码校验，而不是只看前 64KiB：
+    # 表头是 ASCII、后面才出现中文的场景很常见。final=True 让真实 EOF 参与判定，
+    # 避免把结尾的 UTF-8 残尾（如 e4 b8）误当成 UTF-8 而错过可用的 GBK。
     try:
+        encoding = detect_encoding(data, final=True)
+    except TextDecodingError as exc:
+        raise ImportFormatError(
+            f"CSV 编码无法识别或文件被截断，请另存为 UTF-8 或 GBK 后重试（{exc}）"
+        ) from exc
+    try:
+        # 保持严格解码：损坏内容不能被当成导入成功。
         text = data.decode(encoding)
     except UnicodeDecodeError as exc:
         raise ImportFormatError(
             f"CSV 编码无法识别（尝试了 {encoding}），请另存为 UTF-8 或 GBK 后重试"
         ) from exc
-    # Excel 导出的「UTF-8 CSV」首字节常带 BOM。utf-8 解码器会把它解成 U+FEFF，
-    # 粘在第一个表头上导致识别不到「用户名」列，所以这里先剥掉。
+    # Excel 导出的「UTF-8 CSV」首字节常带 BOM。utf-8-sig 已剥离 BOM，
+    # 这里再兜底剥离一次，避免它粘在第一个表头上导致识别不到「用户名」列。
     text = text.lstrip("﻿")
 
     rows = list(csv.reader(io.StringIO(text)))

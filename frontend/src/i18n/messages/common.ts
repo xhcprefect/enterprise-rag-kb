@@ -8,7 +8,7 @@ export default {
       danger: '危险操作', created: '已创建', updated: '已更新', deleted: '已删除', notProvided: '未填写',
       loading: '加载中…', noDescription: '暂无描述', public: '公开', private: '私有', enabled: '启用', disabled: '禁用'
     },
-    nav: { login: '登录', chat: '知识问答', knowledge: '知识库管理', documents: '文档管理', projects: '项目索引', usage: '用量与费用', users: '用户管理', audit: '审计日志', feedback: '反馈处理', profile: '个人中心' },
+    nav: { login: '登录', chat: '知识问答', knowledge: '知识库管理', documents: '文档管理', projects: '项目索引', usage: '用量与费用', users: '用户管理', audit: '审计日志', feedback: '反馈处理', operations: '运行状态', profile: '个人中心' },
     preferences: {
       theme: '主题设置', light: '浅色模式', dark: '深色模式', system: '跟随系统',
       language: '界面语言', currentTheme: '当前主题：{theme}', currentLanguage: '当前语言：简体中文', selected: '已选择'
@@ -37,7 +37,7 @@ export default {
       danger: 'Destructive action', created: 'Created', updated: 'Updated', deleted: 'Deleted', notProvided: 'Not provided',
       loading: 'Loading…', noDescription: 'No description', public: 'Public', private: 'Private', enabled: 'Active', disabled: 'Disabled'
     },
-    nav: { login: 'Sign in', chat: 'Knowledge chat', knowledge: 'Knowledge bases', documents: 'Documents', projects: 'Project index', usage: 'Usage and cost', users: 'Users', audit: 'Audit log', feedback: 'Feedback', profile: 'My account' },
+    nav: { login: 'Sign in', chat: 'Knowledge chat', knowledge: 'Knowledge bases', documents: 'Documents', projects: 'Project index', usage: 'Usage and cost', users: 'Users', audit: 'Audit log', feedback: 'Feedback', operations: 'Worker status', profile: 'My account' },
     preferences: {
       theme: 'Appearance', light: 'Light mode', dark: 'Dark mode', system: 'Use system setting',
       language: 'Interface language', currentTheme: 'Appearance: {theme}', currentLanguage: 'Current language: English', selected: 'Selected'

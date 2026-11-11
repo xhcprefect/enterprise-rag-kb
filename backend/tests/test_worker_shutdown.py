@@ -227,6 +227,22 @@ class WorkerShutdownTests(_WorkerDbFixtureMixin, unittest.TestCase):
         self.assertEqual(len(stale), 3)    # 启动一次 + 33s/64s 两次周期
         self.assertEqual(len(cleanups), 0)  # 600s 内不触发上传清理
 
+    def test_ingest_main_starts_and_stops_process_heartbeat(self):
+        worker.stop_event.set()
+        with patch.object(worker, "init_db"), patch.object(worker, "setup_logging"),              patch.object(worker, "recover_stale"), patch.object(worker, "cleanup_expired"),              patch.object(worker, "_start_heartbeat", return_value="hb") as start,              patch.object(worker, "_stop_heartbeat") as stop:
+            self.assertEqual(worker.main([]), 0)
+        start.assert_called_once_with(worker.ROLE_INGEST)
+        stop.assert_called_once_with("hb")
+
+    def test_ingest_main_stops_heartbeat_when_loop_raises(self):
+        worker.stop_event.clear()
+        boom = RuntimeError("loop broken")
+        with patch.object(worker, "init_db"), patch.object(worker, "setup_logging"),              patch.object(worker, "recover_stale"), patch.object(worker, "cleanup_expired"),              patch.object(worker, "_start_heartbeat", return_value="hb"),              patch.object(worker, "_stop_heartbeat") as stop,              patch.object(worker, "claim_one", side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                worker.main([])
+        stop.assert_called_once_with("hb")
+        worker.stop_event.clear()
+
     def test_recover_stale_keeps_existing_semantics(self):
         expired = self.make_doc(DocumentStatus.PROCESSING.value, lease=None,
                                 heartbeat=datetime.now(timezone.utc))

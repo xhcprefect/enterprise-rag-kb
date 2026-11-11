@@ -15,7 +15,8 @@ class EvaluationError(ValueError):
 
 
 # 指标定义或口径变化时必须递增；比较双方不同则拒绝给出退步结论。
-METRICS_VERSION = 1
+# v2：新增候选/供给来源的 MRR 与前 K 相关率，以及各自的可计算 cohort 覆盖。
+METRICS_VERSION = 2
 # v2：检索开关/重排参数进入身份，本地语料快照覆盖整棵目录，新增分层与核验计数。
 # 旧报告保持可读，但 schema 不同直接判不可比，不做隐式升级。
 IDENTITY_SCHEMA = 2
@@ -48,6 +49,10 @@ METRIC_DIRECTIONS = {
     "supplied_source_recall": "higher",
     "citation_source_recall": "higher",
     "refusal_match_rate": "higher",
+    "candidate_source_mrr": "higher",
+    "supplied_source_mrr": "higher",
+    "candidate_source_precision_at_k": "higher",
+    "supplied_source_precision_at_k": "higher",
     "first_token_ms_mean": "lower",
     "total_ms_mean": "lower",
     "first_token_ms_p50": "lower",
@@ -56,6 +61,18 @@ METRIC_DIRECTIONS = {
     "total_ms_p95": "lower",
     "generation_cost_estimate": "lower",
 }
+
+# 排名指标只使用实际 trace 顺序与既有来源身份/片段范围匹配，不按分数重排，
+# 也不表示语义支持正确。它们必须各自报告 applicable/computable cohort。
+RANKING_METRICS = ("candidate_source_mrr", "supplied_source_mrr",
+                   "candidate_source_precision_at_k", "supplied_source_precision_at_k")
+_RANKING_MRR_METRICS = frozenset(("candidate_source_mrr", "supplied_source_mrr"))
+_RANKING_MARKER_KEYS = ("source_ranking_eligible", "source_label_count",
+                        "source_labels_complete", "top_k")
+_RANKING_RESULT_KEYS = frozenset((*RANKING_METRICS, *_RANKING_MARKER_KEYS))
+_RANKING_COVERAGE_KEYS = frozenset(("status", "eligible", "computable",
+                                    "eligible_cohort", "cohort", "unknown_cohort"))
+_RANKING_COVERAGE_STATUSES = ("no_eligible_cases", "unmeasured", "partial", "computed")
 
 # 默认只拦截确定性断言与来源命中率；延迟和费用需要显式阈值，避免把环境抖动当退步。
 DEFAULT_THRESHOLDS = {
@@ -159,6 +176,52 @@ def require_reviewed_cases(cases):
     return cases
 
 
+def _validate_uuid_text(value, message):
+    try:
+        uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise EvaluationError(message) from exc
+    return str(value)
+
+
+def _validate_project_source(source):
+    if source.get("source_kind") != "project":
+        raise EvaluationError("项目来源必须显式标记 source_kind=project")
+    document_id = source.get("document_id")
+    file_version_id = source.get("file_version_id")
+    if document_id is None or file_version_id is None:
+        raise EvaluationError("项目来源需要 document_id 与 file_version_id")
+    if str(document_id) != str(file_version_id):
+        raise EvaluationError("项目来源的 document_id 必须等于 file_version_id")
+    _validate_uuid_text(document_id, "项目来源文件版本必须为 UUID")
+    _validate_uuid_text(source.get("snapshot_id"), "项目来源 snapshot_id 必须为 UUID")
+    _validate_uuid_text(source.get("source_id"), "项目来源 source_id 必须为 UUID")
+    relative_path = source.get("relative_path")
+    if not isinstance(relative_path, str) or not relative_path or len(relative_path) > 2048:
+        raise EvaluationError("项目来源 relative_path 必须是非空字符串")
+    for key in ("manifest_fingerprint", "config_fingerprint"):
+        value = source.get(key)
+        if not isinstance(value, str) or not 1 <= len(value) <= 64:
+            raise EvaluationError("项目来源 manifest/config 指纹不合法")
+    if source.get("index_version") is not None:
+        raise EvaluationError("项目来源不能携带上传索引代次")
+    # 与上传来源同一严格标准：bool/float/负数都不是合法片段编号。
+    if source.get("chunk_index") is not None \
+            and (type(source["chunk_index"]) is not int or source["chunk_index"] < 0):
+        raise EvaluationError("项目来源片段编号不合法")
+
+
+def _validate_project_identity(value):
+    if not isinstance(value, dict):
+        raise EvaluationError("项目身份必须是对象")
+    _validate_uuid_text(value.get("snapshot_id"), "项目身份 snapshot_id 必须为 UUID")
+    _validate_uuid_text(value.get("source_id"), "项目身份 source_id 必须为 UUID")
+    for key in ("manifest_fingerprint", "config_fingerprint"):
+        item = value.get(key)
+        if not isinstance(item, str) or not 1 <= len(item) <= 64:
+            raise EvaluationError("项目身份 manifest/config 指纹不合法")
+
+
 def validate_cases(cases):
     seen = set()
     for case in cases:
@@ -175,6 +238,10 @@ def validate_cases(cases):
             raise EvaluationError("actor 必须为 admin 或 member")
         if type(case.get("expect_no_citations", False)) is not bool:
             raise EvaluationError("expect_no_citations 必须为布尔值")
+        # 缺省 false；只有标注者显式确认 fixed scope 下相关来源已完整列入
+        # expected_sources 时才允许计算前 K 相关率。这里不向旧 case 注入默认值。
+        if "source_labels_complete" in case and type(case["source_labels_complete"]) is not bool:
+            raise EvaluationError("source_labels_complete 必须为布尔值")
         expected_status = case.get("expected_http_status")
         if expected_status is not None and (type(expected_status) is not int or not 400 <= expected_status <= 499):
             raise EvaluationError("预期 HTTP 状态必须为 400–499")
@@ -195,13 +262,25 @@ def validate_cases(cases):
         sources = case.get("expected_sources", [])
         if not isinstance(sources, list) or any(not isinstance(source, dict) or not (source.get("filename") or source.get("document_id")) for source in sources):
             raise EvaluationError("预期来源需要 filename 或 document_id")
+        source_kinds = set()
         for source in sources:
-            if any(source.get(key) is not None and not isinstance(source[key], str) for key in ("filename", "document_id")):
-                raise EvaluationError("预期来源身份必须为字符串")
-            if source.get("chunk_index") is not None and (type(source["chunk_index"]) is not int or source["chunk_index"] < 0):
-                raise EvaluationError("预期片段编号不合法")
-            if source.get("index_version") is not None and (type(source["index_version"]) is not int or source["index_version"] < 0):
-                raise EvaluationError("预期索引代次必须是非负整数")
+            kind = source.get("source_kind")
+            if kind is not None and kind not in ("document", "project"):
+                raise EvaluationError("来源 source_kind 必须为 document 或 project")
+            if kind == "project":
+                _validate_project_source(source)
+            else:
+                if any(source.get(key) is not None for key in _PROJECT_SOURCE_KEYS):
+                    raise EvaluationError("上传来源不能携带项目身份字段")
+                if any(source.get(key) is not None and not isinstance(source[key], str) for key in ("filename", "document_id")):
+                    raise EvaluationError("预期来源身份必须为字符串")
+                if source.get("chunk_index") is not None and (type(source["chunk_index"]) is not int or source["chunk_index"] < 0):
+                    raise EvaluationError("预期片段编号不合法")
+                if source.get("index_version") is not None and (type(source["index_version"]) is not int or source["index_version"] < 0):
+                    raise EvaluationError("预期索引代次必须是非负整数")
+            source_kinds.add(kind or "document")
+        if len(source_kinds) > 1:
+            raise EvaluationError("同一 case 不能混用上传与项目来源")
         # 文档范围只属于知识库问答；URL 只允许来自显式登记的文档范围，不能借此变成“白名单”。
         document_ids = case.get("document_ids")
         if document_ids is not None:
@@ -216,6 +295,34 @@ def validate_cases(cases):
                     uuid.UUID(str(value))
                 except (ValueError, TypeError, AttributeError) as exc:
                     raise EvaluationError("document_ids 必须为 UUID") from exc
+        # 新范围能力：显式限定范围的固定身份。旧 case 没有该键时完全不变。
+        document_scope = case.get("document_scope")
+        if document_scope is not None:
+            if case.get("mode", "rag") != "rag":
+                raise EvaluationError("普通对话不支持 document_scope")
+            if case.get("conversation_id") is not None or document_ids is not None:
+                raise EvaluationError("document_scope 不能与预置会话或 document_ids 同时使用")
+            if not isinstance(document_scope, list) or not 1 <= len(document_scope) <= 5:
+                raise EvaluationError("document_scope 需要 1–5 个文档身份")
+            seen_documents = set()
+            for entry in document_scope:
+                if not isinstance(entry, dict):
+                    raise EvaluationError("document_scope 条目必须是对象")
+                identity = _validate_uuid_text(entry.get("document_id"), "document_scope 文档 ID 必须为 UUID")
+                if identity in seen_documents:
+                    raise EvaluationError("document_scope 文档 ID 不能重复")
+                seen_documents.add(identity)
+                version = entry.get("index_version")
+                if type(version) is not int or version < 0:
+                    raise EvaluationError("document_scope 索引代次必须是非负整数")
+        # 新项目能力：显式快照/源/manifest/config 身份；仅新 case 出现。
+        project_identity = case.get("project_identity")
+        if project_identity is not None:
+            if case.get("mode", "rag") != "rag":
+                raise EvaluationError("普通对话不支持项目身份")
+            _validate_project_identity(project_identity)
+            if document_ids is not None or document_scope is not None:
+                raise EvaluationError("项目身份不能与文档范围同时使用")
         _validate_review_metadata(case)
     return cases
 
@@ -259,25 +366,186 @@ def classify_outcome(answer, trace):
     return "answer"
 
 
+_PROJECT_SOURCE_KEYS = ("snapshot_id", "source_id", "file_version_id", "relative_path",
+                        "manifest_fingerprint", "config_fingerprint")
+
+
+def _chunk_range_matches(expected, actual):
+    wanted = expected.get("chunk_index")
+    if wanted is None:
+        return True
+    first = actual.get("chunk_start") if actual.get("chunk_start") is not None else actual.get("chunk_index")
+    last = actual.get("chunk_end") if actual.get("chunk_end") is not None else actual.get("chunk_index")
+    return (type(wanted) is int and type(first) is int and type(last) is int
+            and first <= wanted <= last)
+
+
+def _project_alias_values(actual, primary, *aliases):
+    """收集实际来源中所有出现的身份别名值（None 视为未提供）。"""
+    return [actual[key] for key in (primary, *aliases) if actual.get(key) is not None]
+
+
+def _project_alias_matches(actual, primary, aliases, expected):
+    """期望身份必须与**所有出现**的别名一致；别名互相矛盾或全部缺失都不命中。"""
+    values = _project_alias_values(actual, primary, *aliases)
+    return bool(values) and all(str(value) == str(expected) for value in values)
+
+
+def _matches_project(expected, actual):
+    """项目来源严格身份匹配：同文件名的不同快照/文件版本绝不命中。
+
+    兼容两类真实公开形态：``answer_sources`` 规范来源（``manifest_fingerprint`` /
+    ``config_fingerprint``）与 ``rag.to_citations`` 引用（``snapshot_manifest_fingerprint``
+    / ``snapshot_config_fingerprint``，并带兼容的 ``index_version=0``）。同一身份若有
+    多个别名同时出现，它们必须全部一致；任一矛盾或全部缺失都判不命中。
+    """
+    if not isinstance(actual, dict) or actual.get("source_kind") != "project":
+        return False
+    expected_file = expected.get("file_version_id") or expected.get("document_id")
+    if expected_file is not None and not _project_alias_matches(
+        actual, "file_version_id", ("document_id",), expected_file
+    ):
+        return False
+    for key in ("snapshot_id", "source_id"):
+        if expected.get(key) is not None:
+            if actual.get(key) is None or str(actual[key]) != str(expected[key]):
+                return False
+    if expected.get("relative_path") is not None and not _project_alias_matches(
+        actual, "relative_path", ("filename",), expected["relative_path"]
+    ):
+        return False
+    if expected.get("manifest_fingerprint") is not None and not _project_alias_matches(
+        actual, "manifest_fingerprint", ("snapshot_manifest_fingerprint",),
+        expected["manifest_fingerprint"],
+    ):
+        return False
+    if expected.get("config_fingerprint") is not None and not _project_alias_matches(
+        actual, "config_fingerprint", ("snapshot_config_fingerprint",),
+        expected["config_fingerprint"],
+    ):
+        return False
+    return _chunk_range_matches(expected, actual)
+
+
 def _matches(expected, actual):
+    if expected.get("source_kind") == "project" \
+            or any(expected.get(key) is not None for key in _PROJECT_SOURCE_KEYS):
+        return _matches_project(expected, actual)
+    # 上传期望来源绝不能跨类型命中项目实际来源；项目来源的 index_version=0 只是
+    # 公开引用兼容字段，不能反向把项目引用当成上传文档。
+    if actual.get("source_kind") == "project" \
+            or any(actual.get(key) is not None for key in _PROJECT_SOURCE_KEYS):
+        return False
     if any(expected.get(key) is not None and expected[key] != actual.get(key) for key in ("filename", "document_id")):
         return False
     if expected.get("index_version") is not None and expected["index_version"] != actual.get("index_version"):
         # 旧代次引用必须判失败，不能只看文件名和片段编号。
         return False
-    wanted = expected.get("chunk_index")
-    if wanted is not None:
-        first = actual.get("chunk_start") if actual.get("chunk_start") is not None else actual.get("chunk_index")
-        last = actual.get("chunk_end") if actual.get("chunk_end") is not None else actual.get("chunk_index")
-        if type(wanted) is not int or type(first) is not int or type(last) is not int or not first <= wanted <= last:
-            return False
-    return True
+    return _chunk_range_matches(expected, actual)
 
 
 def _recall(expected, actual):
     if not expected or actual is None:
         return None
     return sum(any(_matches(source, item) for item in actual if isinstance(item, dict)) for source in expected) / len(expected)
+
+
+def _source_labels_complete(case):
+    """严格布尔读取；缺省 false，不改变旧 case 的原始字段与数据集身份。"""
+    return case.get("source_labels_complete") is True
+
+
+def _source_ranking_eligible(case):
+    """普通对话与预期 HTTP 负例不进入排序质量分母。"""
+    return case.get("mode", "rag") == "rag" and case.get("expected_http_status") is None
+
+
+def _case_top_k(case):
+    top_k = case.get("top_k", 6)
+    return top_k if type(top_k) is int and 1 <= top_k <= 20 else 6
+
+
+def _first_positive_reciprocal_rank(expected, actual):
+    """实际 trace 原顺序中首个已知正来源的倒数排名。
+
+    - 没有正来源标注：None（不适用，不是 0）。
+    - 对应 trace 缺失：None（应测但未测）。
+    - trace 存在但为空，或没有任何命中：0.0（真实观测到的空/全未命中）。
+    不按分数排序，也不判断来源是否语义支持答案。
+    """
+    if not expected:
+        return None
+    if actual is None:
+        return None
+    for position, item in enumerate(actual, 1):
+        if isinstance(item, dict) and any(_matches(source, item) for source in expected):
+            return 1 / position
+    return 0.0
+
+
+def _precision_at_k(expected, actual, top_k, complete):
+    """前 K 实际位置中命中已知正来源的比例。
+
+    只有完整来源标注才可计算；固定分母 top_k，未返回的位置按未命中计。
+    未完整标注时返回 None，不能把未命中当作负相关。
+    """
+    if not complete:
+        return None
+    if actual is None:
+        return None
+    if type(top_k) is not int or top_k < 1:
+        return None
+    hits = sum(any(_matches(source, item) for source in expected)
+               for item in actual[:top_k] if isinstance(item, dict))
+    return hits / top_k
+
+
+def _row_ranking_eligible(metric, row):
+    """从逐条结果标记判断某排名指标是否应测；不信任报告顶层摘要计数。"""
+    if row.get("source_ranking_eligible") is not True:
+        return False
+    if metric in _RANKING_MRR_METRICS:
+        count = row.get("source_label_count")
+        return type(count) is int and count > 0
+    return row.get("source_labels_complete") is True
+
+
+def rank_cohorts(results):
+    """按指标从逐条结果推导 eligible/computable/unknown 的稳定 ID cohort。"""
+    coverage = {}
+    for metric in RANKING_METRICS:
+        eligible, computable = [], []
+        for row in results:
+            if not isinstance(row, dict) or not _row_ranking_eligible(metric, row):
+                continue
+            case_id = row.get("id")
+            if not isinstance(case_id, str):
+                continue
+            eligible.append(case_id)
+            if _is_unit_interval(row.get(metric)):
+                computable.append(case_id)
+        eligible = sorted(set(eligible))
+        computable = sorted(set(computable))
+        unknown = sorted(set(eligible) - set(computable))
+        if not eligible:
+            status = "no_eligible_cases"
+        elif not computable:
+            status = "unmeasured"
+        elif len(computable) < len(eligible):
+            status = "partial"
+        else:
+            status = "computed"
+        coverage[metric] = {"status": status, "eligible": len(eligible),
+                            "computable": len(computable), "eligible_cohort": eligible,
+                            "cohort": computable, "unknown_cohort": unknown}
+    return coverage
+
+
+def _ranking_mean(results, metric):
+    values = [row[metric] for row in results
+              if isinstance(row, dict) and _row_ranking_eligible(metric, row)
+              and _is_finite_number(row.get(metric)) and 0 <= row[metric] <= 1]
+    return sum(values) / len(values) if values else None
 
 
 def _number(value):
@@ -408,6 +676,17 @@ def grade_case(case, response, *, input_price=None, output_price=None, include_c
     candidate_recall = _recall(expected, trace.get("candidate_sources"))
     supplied_recall = _recall(expected, trace.get("supplied_sources"))
     citation_recall = _recall(expected, citations)
+    ranking_eligible = _source_ranking_eligible(case)
+    labels_complete = _source_labels_complete(case)
+    top_k = _case_top_k(case)
+    candidate_mrr = (_first_positive_reciprocal_rank(expected, trace.get("candidate_sources"))
+                     if ranking_eligible else None)
+    supplied_mrr = (_first_positive_reciprocal_rank(expected, trace.get("supplied_sources"))
+                    if ranking_eligible else None)
+    candidate_precision = (_precision_at_k(expected, trace.get("candidate_sources"),
+                                           top_k, labels_complete) if ranking_eligible else None)
+    supplied_precision = (_precision_at_k(expected, trace.get("supplied_sources"),
+                                          top_k, labels_complete) if ranking_eligible else None)
     if candidate_recall is not None and candidate_recall < 1:
         failures.append("missing_expected_candidates")
     if supplied_recall is not None and supplied_recall < 1:
@@ -425,11 +704,18 @@ def grade_case(case, response, *, input_price=None, output_price=None, include_c
     error_code = _result_error_code(response)
     result = {"id": case["id"], "passed": not failures, "failures": list(dict.fromkeys(failures)),
               "stratum": case_stratum(case), "review_state": review_state(case),
+              "mode": case.get("mode", "rag"),
               "expected_outcome": case.get("expected_outcome"), "outcome": outcome,
               "expected_http_status": expected_status, "http_status": actual_status,
               "citation_count": len(citations),
               "candidate_source_recall": candidate_recall, "supplied_source_recall": supplied_recall,
               "citation_source_recall": citation_recall,
+              "candidate_source_mrr": candidate_mrr, "supplied_source_mrr": supplied_mrr,
+              "candidate_source_precision_at_k": candidate_precision,
+              "supplied_source_precision_at_k": supplied_precision,
+              "source_ranking_eligible": ranking_eligible,
+              "source_label_count": len(expected) if isinstance(expected, list) else 0,
+              "source_labels_complete": labels_complete, "top_k": top_k,
               "rewrite_ms": _number(trace.get("rewrite_ms")), "retrieve_ms": _number(trace.get("retrieve_ms")),
               "generation_ms": _number(trace.get("generation_ms")),
               "refusal_match": (outcome == "refuse") == (case["expected_outcome"] == "refuse") if case.get("expected_outcome") in {"answer", "refuse"} else None,
@@ -508,6 +794,11 @@ def make_report(results, run_id=None, identity=None):
             "assertion_pass_rate": sum(row["passed"] for row in results) / len(results) if results else None,
             "candidate_source_recall": mean("candidate_source_recall"), "supplied_source_recall": mean("supplied_source_recall"),
             "citation_source_recall": mean("citation_source_recall"),
+            "candidate_source_mrr": _ranking_mean(results, "candidate_source_mrr"),
+            "supplied_source_mrr": _ranking_mean(results, "supplied_source_mrr"),
+            "candidate_source_precision_at_k": _ranking_mean(results, "candidate_source_precision_at_k"),
+            "supplied_source_precision_at_k": _ranking_mean(results, "supplied_source_precision_at_k"),
+            "ranking_coverage": rank_cohorts(results),
             "refusal_match_rate": mean("refusal_match"), "first_token_ms_mean": mean("first_token_ms"),
             "total_ms_mean": mean("total_ms"), "generation_cost_estimate": sum(costs) if len(costs) == len(results) and results else None,
             "first_token_ms_p50": _percentile(first_tokens, 0.50), "first_token_ms_p95": _percentile(first_tokens, 0.95),
@@ -522,7 +813,12 @@ def make_report(results, run_id=None, identity=None):
             "notes": ["固定断言和来源匹配不是语义事实正确率。", "费用只包含已返回实际用量的回答生成，不包含追问补全、向量化和重排。", "首字延迟针对最后一轮；总耗时包含 case 的所有准备轮次。",
                       "p50/p95 只使用实际返回的样本；样本数为 0 时保持 null，不补 0。",
                       "result_sha256 覆盖完整答案、引用身份/索引代次/实际片段内容和实际 HTTP 状态，不含时间或耗时；默认报告只导出摘要，不导出正文。",
-                      "reviewed_cases 只表示核验元数据齐全，不代表语义准确率。"], "results": results}
+                      "reviewed_cases 只表示核验元数据齐全，不代表语义准确率。",
+                      "candidate/supplied_source_mrr 使用实际 trace 原顺序的首个已知正来源倒数排名；空 trace 记 0，缺 trace 或无正来源标注记 null。",
+                      "candidate/supplied_source_precision_at_k 只在 source_labels_complete=true 时计算，固定分母为 case.top_k，未返回的位置按未命中计。",
+                      "排名指标只回答既有来源身份/片段范围匹配出现多早，不证明引用语义支持，也不代表语义准确率。",
+                      "ranking_coverage 从逐条结果推导 eligible/computable/unknown case ID cohort；缺 trace 的应测 case 是 unknown，不补 0，零 eligible 与未测量分开。",
+                      "排名指标只是观测，不改变既有机器断言与答案引用指纹，也不代表语义准确率。"], "results": results}
     if identity is not None:
         report["identity"] = identity
     return report
@@ -910,6 +1206,66 @@ def _compare_metric(name, baseline, current, rules):
     return metric
 
 
+def _compare_ranking_metric(name, baseline, current, rules, baseline_coverage, current_coverage):
+    """排序指标比较：先按本指标核对覆盖/cohort，再看数值与门槛。
+
+    应测但缺 trace/response 的 case 是 unknown；相同数量但 case ID 不同的 cohort
+    不可比；零 eligible 与 eligible>0 但全部未测量必须区分。摘要计数不能替代
+    从逐条结果推导的 cohort；单个指标的摘要错误只影响该指标。
+    """
+    metric = {"baseline": baseline.get(name), "current": current.get(name),
+              "delta": None, "relative_delta": None, "direction": METRIC_DIRECTIONS[name],
+              "threshold": rules or None}
+    if baseline_coverage is None or current_coverage is None:
+        metric["status"] = "unknown"
+        metric["detail"] = "coverage_unverifiable"
+        return metric
+    metric["baseline_coverage"] = baseline_coverage["metrics"][name]
+    metric["current_coverage"] = current_coverage["metrics"][name]
+    if baseline_coverage["marker_inconsistent"] or current_coverage["marker_inconsistent"]:
+        metric["status"] = "unknown"
+        metric["detail"] = "ranking_marker_inconsistent"
+        return metric
+    baseline_detail = baseline_coverage["details"].get(name)
+    current_detail = current_coverage["details"].get(name)
+    if baseline_detail or current_detail:
+        metric["status"] = "unknown"
+        metric["detail"] = baseline_detail or current_detail
+        return metric
+    left, right = baseline_coverage["metrics"][name], current_coverage["metrics"][name]
+    if left["status"] == "no_eligible_cases" and right["status"] == "no_eligible_cases":
+        metric["status"] = "unknown" if rules else "not_applicable"
+        metric["detail"] = "no_eligible_cases"
+        return metric
+    if left["status"] == "no_eligible_cases" or right["status"] == "no_eligible_cases":
+        metric["status"] = "unknown"
+        metric["detail"] = "no_eligible_cases_one_side"
+        return metric
+    if left["eligible_cohort"] != right["eligible_cohort"]:
+        metric["status"] = "unknown"
+        metric["detail"] = "eligible_cohort_mismatch"
+        return metric
+    if left["cohort"] != right["cohort"]:
+        metric["status"] = "unknown"
+        metric["detail"] = "computable_cohort_mismatch"
+        return metric
+    if not left["cohort"]:
+        # 应测 case 存在但全部缺 trace/response；不能当作 0 或通过。
+        metric["status"] = "unknown"
+        metric["detail"] = "unmeasured"
+        return metric
+    if left["computable"] < left["eligible"] or right["computable"] < right["eligible"]:
+        # 即使两侧漏测的是同一批 case，应测未测仍不能给出“无退步”。
+        metric["status"] = "unknown"
+        metric["detail"] = "unmeasured_cases"
+        return metric
+    # cohort 一致且至少有一个可计算样本；复用普通指标比较后补回覆盖结构。
+    compared = _compare_metric(name, baseline, current, rules)
+    compared["baseline_coverage"] = metric["baseline_coverage"]
+    compared["current_coverage"] = metric["current_coverage"]
+    return compared
+
+
 def _is_digest(value):
     return isinstance(value, str) and bool(re.fullmatch(r"[a-f0-9]{64}", value))
 
@@ -924,6 +1280,133 @@ _SAMPLE_METRICS = {
 
 def _is_finite_non_negative(value):
     return _is_finite_number(value) and value >= 0
+
+
+def _is_unit_interval(value):
+    return _is_finite_number(value) and 0 <= value <= 1
+
+
+def _validate_ranking_value(value, label, name):
+    if value is not None and not _is_unit_interval(value):
+        raise EvaluationError(f"{label} 报告的 {name} 必须是 0–1 之间的有限数字或 null")
+
+
+def _validate_ranking_cohort(value, label, name):
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise EvaluationError(f"{label} 报告的 {name} 必须是 case ID 列表")
+    if len(set(value)) != len(value):
+        raise EvaluationError(f"{label} 报告的 {name} 含重复 case ID")
+    if value != sorted(value):
+        raise EvaluationError(f"{label} 报告的 {name} 必须按 case ID 稳定排序")
+
+
+def _ranking_fields_present(report):
+    results = report.get("results")
+    if not isinstance(results, list):
+        return False
+    if any(isinstance(row, dict) and any(key in row for key in _RANKING_RESULT_KEYS)
+           for row in results):
+        return True
+    return report.get("ranking_coverage") is not None
+
+
+def _validate_ranking_structure(report, label):
+    """校验逐条排名字段和覆盖摘要的类型/范围；与结果的 cohort 一致性在比较阶段核对。"""
+    if not _ranking_fields_present(report):
+        return
+    results = report["results"]
+    if not results:
+        # 空报告由 cases/results 计数和后续核验流程处理，避免覆盖既有原因码。
+        return
+    present = [isinstance(row, dict) and any(key in row for key in _RANKING_RESULT_KEYS)
+               for row in results]
+    if not all(present):
+        raise EvaluationError(f"{label} 报告的排名指标字段不完整")
+    for row in results:
+        if not _RANKING_RESULT_KEYS.issubset(row):
+            raise EvaluationError(f"{label} 报告的排名指标字段不完整")
+        if not isinstance(row.get("id"), str) or not 1 <= len(row["id"]) <= 128:
+            raise EvaluationError(f"{label} 报告的排名结果 case ID 不合法")
+        if row.get("mode") not in ("rag", "chat"):
+            raise EvaluationError(f"{label} 报告的排名结果 mode 不合法")
+        if type(row.get("source_ranking_eligible")) is not bool:
+            raise EvaluationError(f"{label} 报告的 source_ranking_eligible 必须是布尔值")
+        count = row.get("source_label_count")
+        if type(count) is not int or count < 0:
+            raise EvaluationError(f"{label} 报告的 source_label_count 必须是非负整数")
+        if type(row.get("source_labels_complete")) is not bool:
+            raise EvaluationError(f"{label} 报告的 source_labels_complete 必须是布尔值")
+        top_k = row.get("top_k")
+        if type(top_k) is not int or not 1 <= top_k <= 20:
+            raise EvaluationError(f"{label} 报告的 top_k 必须为 1–20")
+        for name in RANKING_METRICS:
+            _validate_ranking_value(row.get(name), label, name)
+    coverage = report.get("ranking_coverage")
+    if not isinstance(coverage, dict):
+        raise EvaluationError(f"{label} 报告缺少 ranking_coverage")
+    if set(coverage) != set(RANKING_METRICS):
+        raise EvaluationError(f"{label} 报告的 ranking_coverage 指标集合不完整")
+    cases = report["cases"]
+    for name in RANKING_METRICS:
+        entry = coverage.get(name)
+        if not isinstance(entry, dict) or set(entry) != _RANKING_COVERAGE_KEYS:
+            raise EvaluationError(f"{label} 报告的 {name} 覆盖结构不合法")
+        if entry.get("status") not in _RANKING_COVERAGE_STATUSES:
+            raise EvaluationError(f"{label} 报告的 {name} 覆盖状态不合法")
+        eligible, computable = entry.get("eligible"), entry.get("computable")
+        if type(eligible) is not int or type(computable) is not int:
+            raise EvaluationError(f"{label} 报告的 {name} eligible/computable 必须是整数")
+        if not 0 <= computable <= eligible <= cases:
+            raise EvaluationError(f"{label} 报告的 {name} eligible/computable 越界")
+        eligible_cohort = entry.get("eligible_cohort")
+        cohort = entry.get("cohort")
+        unknown = entry.get("unknown_cohort")
+        _validate_ranking_cohort(eligible_cohort, label, f"{name}.eligible_cohort")
+        _validate_ranking_cohort(cohort, label, f"{name}.cohort")
+        _validate_ranking_cohort(unknown, label, f"{name}.unknown_cohort")
+        if len(eligible_cohort) != eligible or len(cohort) != computable:
+            raise EvaluationError(f"{label} 报告的 {name} 覆盖计数与 cohort 不一致")
+        if not set(cohort).issubset(set(eligible_cohort)):
+            raise EvaluationError(f"{label} 报告的 {name} computable cohort 不在 eligible cohort 内")
+        if set(unknown) != set(eligible_cohort) - set(cohort):
+            raise EvaluationError(f"{label} 报告的 {name} unknown cohort 与 eligible/computable 不一致")
+
+
+def _ranking_coverage_from_results(report):
+    """按指标分别从逐条结果推导覆盖，并核对对应摘要。
+
+    返回 {"metrics": {name: 推导覆盖}, "details": {name: 摘要错误码或 None},
+    "marker_inconsistent": bool}。任一指标摘要不一致只影响该指标；全局 marker
+    矛盾（source_ranking_eligible 与 mode/预期 HTTP 状态不符）会阻止所有排名
+    指标给出结论，但不影响非排名指标。
+    """
+    derived = rank_cohorts(report["results"])
+    if not _ranking_fields_present(report):
+        # 旧报告完全没有排名字段：无法证明覆盖，不能当作 0 或全量通过。
+        return {"metrics": derived,
+                "details": {name: "coverage_unverifiable" for name in RANKING_METRICS},
+                "marker_inconsistent": False}
+    details = {}
+    marker_inconsistent = False
+    for row in report["results"]:
+        if not isinstance(row, dict):
+            continue
+        expected_eligible = row.get("mode") == "rag" and row.get("expected_http_status") is None
+        if row.get("source_ranking_eligible") is not expected_eligible:
+            marker_inconsistent = True
+    declared = report.get("ranking_coverage")
+    if not isinstance(declared, dict):
+        return {"metrics": derived, "details": {name: "coverage_missing" for name in RANKING_METRICS},
+                "marker_inconsistent": marker_inconsistent}
+    for name in RANKING_METRICS:
+        entry = declared.get(name)
+        if not isinstance(entry, dict):
+            details[name] = "coverage_missing"
+        elif entry != derived[name]:
+            details[name] = "coverage_summary_mismatch"
+        else:
+            details[name] = None
+    return {"metrics": derived, "details": details, "marker_inconsistent": marker_inconsistent}
 
 
 def _validate_identity_structure(identity, label, cases):
@@ -1003,6 +1486,8 @@ def validate_comparison_report(report, label="report"):
         value = report.get(name)
         if value is not None and not _is_finite_non_negative(value):
             raise EvaluationError(f"{label} 报告的指标 {name} 必须是有限的非负数字")
+        if name in RANKING_METRICS and value is not None and not _is_unit_interval(value):
+            raise EvaluationError(f"{label} 报告的排名指标 {name} 必须在 0–1 之间")
     for samples_key, metrics in _SAMPLE_METRICS.items():
         samples = report.get(samples_key)
         if samples is None:
@@ -1012,6 +1497,7 @@ def validate_comparison_report(report, label="report"):
         if samples == 0 and any(report.get(name) is not None for name in metrics):
             # 样本为 0 却有指标值，说明缺测被补成了数字；不能参与比较。
             raise EvaluationError(f"{label} 报告的 {samples_key}=0 但仍有指标值")
+    _validate_ranking_structure(report, label)
     _validate_identity_structure(report.get("identity"), label, cases)
     return report
 
@@ -1108,7 +1594,15 @@ def compare_reports(baseline, current, thresholds=None):
     validate_comparison_report(current, "current")
     rules = merge_thresholds(default_thresholds(), validate_thresholds(thresholds or {}))
     reasons, unknown_config = _identity_reasons(baseline, current)
-    metrics = {name: _compare_metric(name, baseline, current, rules.get(name)) for name in METRIC_DIRECTIONS}
+    baseline_ranking = _ranking_coverage_from_results(baseline)
+    current_ranking = _ranking_coverage_from_results(current)
+    metrics = {}
+    for name in METRIC_DIRECTIONS:
+        if name in RANKING_METRICS:
+            metrics[name] = _compare_ranking_metric(name, baseline, current, rules.get(name),
+                                                    baseline_ranking, current_ranking)
+        else:
+            metrics[name] = _compare_metric(name, baseline, current, rules.get(name))
     regressions = [name for name, metric in metrics.items() if metric["status"] == "regressed"]
     improvements = [name for name, metric in metrics.items() if metric["status"] == "improved"]
     unknown_metrics = [name for name, metric in metrics.items() if metric["status"] == "unknown"]
@@ -1132,6 +1626,7 @@ def compare_reports(baseline, current, thresholds=None):
               "thresholds": rules, "metrics": metrics,
               "notes": ["delta = current - baseline；relative_delta 在 baseline 为 0 时不计算，改用绝对变化。",
                         "零基线时任何变差都超出相对阈值；缺失或覆盖不全的指标记为 unknown，不当作 0 或通过。",
+                        "排名指标按逐条结果推导的 eligible/computable case ID cohort 比较；缺 trace/response 为 unknown，零 eligible 与未测量分开。",
                         "断言失败优先于比较结论；不可比时不声称无退步。"]}
     return report
 

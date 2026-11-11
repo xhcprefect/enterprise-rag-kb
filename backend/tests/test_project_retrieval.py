@@ -46,7 +46,7 @@ class ScopeConditionSqlTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.kb = SimpleNamespace(collection_name="kb-project", is_public=True, owner_id=None)
-        self.user = SimpleNamespace(id=uuid.uuid4(), is_admin=False)
+        self.user = SimpleNamespace(id=uuid.uuid4(), is_admin=False, is_active=True, role="user")
         self.snap_id = uuid.uuid4()
 
     def test_no_scope_has_no_file_version_predicate(self) -> None:
@@ -158,7 +158,7 @@ class StillAuthorizedSqlShapeTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.kb = SimpleNamespace(collection_name="kb", is_public=True, owner_id=None)
-        self.user = SimpleNamespace(id=uuid.uuid4(), is_admin=False)
+        self.user = SimpleNamespace(id=uuid.uuid4(), is_admin=False, is_active=True, role="user")
 
     def _sql(self, scope=None) -> str:
         stmt = pr._still_authorized_statement(
@@ -258,7 +258,7 @@ class VectorPairsExecutionTest(unittest.TestCase):
         pairs = pr._project_vector_pairs(
             db, self._store(), SimpleNamespace(collection_name="kb", is_public=True, owner_id=None),
             uuid.uuid4(), [0.0] * 1024, 10,
-            min_similarity=0.0, user=SimpleNamespace(id=uuid.uuid4(), is_admin=False),
+            min_similarity=0.0, user=SimpleNamespace(id=uuid.uuid4(), is_admin=False, is_active=True, role="user"),
             prefix_parts=None,
         )
         self.assertEqual(pairs, [])
@@ -274,7 +274,7 @@ class VectorPairsExecutionTest(unittest.TestCase):
         pr._project_vector_pairs(
             db, self._store(), SimpleNamespace(collection_name="kb", is_public=True, owner_id=None),
             uuid.uuid4(), [0.0] * 1024, 5,
-            min_similarity=0.0, user=SimpleNamespace(id=uuid.uuid4(), is_admin=False),
+            min_similarity=0.0, user=SimpleNamespace(id=uuid.uuid4(), is_admin=False, is_active=True, role="user"),
             prefix_parts=None,
         )
         compiled = _sql(captured["sql"])

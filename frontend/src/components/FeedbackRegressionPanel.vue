@@ -125,9 +125,22 @@
           </div>
         </dl>
 
+        <FeedbackRegressionJobsPanel
+          ref="jobsPanel"
+          :feedback-id="feedbackId"
+          :regression-revision="regression.revision"
+          :available="regression.available"
+          :unavailable-reason="regression.unavailable_reason"
+          @active-change="onOnlineActiveChange"
+          @changed="onOnlineChanged"
+        />
+
         <section class="prepare">
           <h5>{{ t('feedback.regression.prepareTitle') }}</h5>
           <p class="hint">{{ t('feedback.regression.prepareHint') }}</p>
+          <p v-if="onlineActive" class="hint online-block" data-testid="regression-prepare-blocked">
+            {{ fj('prepareBlockedOnline') }}
+          </p>
           <div class="prepare-row">
             <span class="field-label">{{ t('feedback.regression.prepareModeLabel') }}</span>
             <el-radio-group v-model="prepareMode" :disabled="!canPrepare" data-testid="regression-mode">
@@ -135,17 +148,17 @@
                 {{ t(regressionModeKey(mode)) }}
               </el-radio>
             </el-radio-group>
-            <el-button
-              type="primary"
-              plain
-              :loading="preparing"
-              :disabled="!canPrepare"
-              data-testid="regression-prepare"
-              @click="prepare"
-            >
-              <el-icon><Download /></el-icon>
-              {{ preparing ? t('feedback.regression.preparing') : t('feedback.regression.prepare') }}
-            </el-button>
+        <el-button
+          type="primary"
+          plain
+          :loading="preparing"
+          :disabled="!canPrepare"
+          data-testid="regression-prepare"
+          @click="prepare"
+        >
+          <el-icon><Download /></el-icon>
+          {{ preparing ? t('feedback.regression.preparing') : t('feedback.regression.prepare') }}
+        </el-button>
           </div>
           <el-alert
             v-if="prepareError"
@@ -207,7 +220,9 @@
           />
         </section>
         <p v-else-if="currentRun" class="hint" data-testid="regression-import-unavailable">
-          {{ t('feedback.regression.importNotReady') }}
+          {{ currentRun.execution_kind === 'online'
+            ? fj('runImportUnavailableOnline')
+            : t('feedback.regression.importNotReady') }}
         </p>
 
         <section class="history">
@@ -252,7 +267,7 @@
                 </el-tag>
                 <span class="run-time">{{ formatDateTime(run.created_at) }}</span>
                 <el-button
-                  v-if="run.is_current"
+                  v-if="run.is_current && run.execution_kind !== 'online'"
                   link
                   type="primary"
                   size="small"
@@ -276,6 +291,10 @@
                 <span>
                   <em>{{ t('feedback.regression.history.state') }}</em>
                   <el-tag size="small" effect="light" :type="stateTagType(run)">{{ t(runStateKey(run.state)) }}</el-tag>
+                </span>
+                <span data-testid="regression-run-execution-kind">
+                  <em>{{ fj('executionKindLabel') }}</em>
+                  {{ t(executionKindKey(run.execution_kind || 'manual')) }}
                 </span>
                 <span>
                   <em>{{ t('feedback.regression.history.createdAt') }}</em>
@@ -323,6 +342,7 @@ import {
   type FeedbackStatus
 } from '@/api'
 import { formatDateTime, formatNumber } from '@/i18n/format'
+import { useFeedbackRegressionJobsI18n } from '@/i18n/messages/feedbackRegressionJobs'
 import { createLatestGuard } from '@/utils/usage'
 import { downloadJsonl } from '@/utils/feedback'
 import {
@@ -334,6 +354,7 @@ import {
   buildPreparePayload,
   canImport,
   describeRunOutcome,
+  executionKindKey,
   failureLabel,
   newPrepareRequestId,
   regressionCauseKey,
@@ -343,6 +364,7 @@ import {
   validateReportFile,
   validationLevelKey
 } from '@/utils/feedbackRegression'
+import FeedbackRegressionJobsPanel from '@/components/FeedbackRegressionJobsPanel.vue'
 
 const props = defineProps<{
   feedbackId: string
@@ -355,6 +377,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { fj } = useFeedbackRegressionJobsI18n()
 
 const HISTORY_PAGE_SIZE = 10
 
@@ -400,6 +423,9 @@ let importController: AbortController | null = null
 
 const isVerified = computed(() => props.status === 'verified')
 const busy = computed(() => enrolling.value || preparing.value || importing.value)
+/** 在线作业活动期间后端会拒绝人工准备；面板已知时必须直接禁用。 */
+const onlineActive = ref(false)
+const jobsPanel = ref<InstanceType<typeof FeedbackRegressionJobsPanel> | null>(null)
 
 /** 未纳入时后端不会返回 available，只能按反馈状态给出本地阻断原因。 */
 const unavailableReason = computed<string | null>(() => {
@@ -424,7 +450,9 @@ const canEnroll = computed(() =>
   && !busy.value
 )
 
-const canPrepare = computed(() => !!regression.value?.available && !busy.value)
+const canPrepare = computed(() =>
+  !!regression.value?.available && !busy.value && !onlineActive.value
+)
 const currentRun = computed(() => regression.value?.current_run ?? null)
 const importReady = computed(() => canImport(currentRun.value))
 
@@ -457,12 +485,28 @@ function tryDownload(filename: string, jsonl: string): boolean {
 }
 
 function runResult(run: FeedbackRegressionRun): string {
+  if (run.execution_kind === 'online') {
+    if (run.job_status === 'succeeded') {
+      if (run.passed === true) return t('feedback.regression.history.passed')
+      if (run.passed === false) return t('feedback.regression.history.failed')
+      return '—'
+    }
+    if (run.job_status === 'failed') return fj('status.failed')
+    if (run.job_status === 'cancelled') return fj('status.cancelled')
+    return '—'
+  }
   if (run.passed === true) return t('feedback.regression.history.passed')
   if (run.passed === false) return t('feedback.regression.history.failed')
   return '—'
 }
 
-function stateTagType(run: FeedbackRegressionRun): 'success' | 'warning' | 'info' {
+function stateTagType(run: FeedbackRegressionRun): 'success' | 'warning' | 'info' | 'danger' {
+  if (run.execution_kind === 'online') {
+    if (run.job_status === 'succeeded') return 'success'
+    if (run.job_status === 'failed') return 'danger'
+    if (run.job_status === 'running') return 'warning'
+    return 'info'
+  }
   if (run.state === 'imported') return 'success'
   if (run.state === 'stale') return 'info'
   return 'warning'
@@ -470,6 +514,7 @@ function stateTagType(run: FeedbackRegressionRun): 'success' | 'warning' | 'info
 
 function resetPanelState() {
   regression.value = null
+  onlineActive.value = false
   loaded.value = false
   loading.value = false
   loadError.value = ''
@@ -593,7 +638,18 @@ async function loadAll(page: number = historyPage.value) {
 
 function refresh() {
   if (loading.value || busy.value) return
+  jobsPanel.value?.refreshNow()
   void loadAll(historyPage.value)
+}
+
+/** 在线作业创建/结束/取消/核验都会改变当前轮次与回归 revision，需要重读。 */
+function onOnlineChanged() {
+  emit('changed')
+  void loadAll(1)
+}
+
+function onOnlineActiveChange(active: boolean) {
+  onlineActive.value = active
 }
 
 function onHistoryPageChange(page: number) {
@@ -686,6 +742,7 @@ async function prepare() {
     if (error?.response?.status === 409) {
       pendingPrepareRequestId = null
       prepareError.value = t('feedback.regression.errors.prepareConflict')
+      jobsPanel.value?.refreshNow()
       await loadAll(historyPage.value)
     } else if (isNetworkError(error)) {
       // 网络中断时保留 prepare_request_id：重试同一请求，服务端幂等返回同一轮。
@@ -1109,6 +1166,14 @@ onBeforeUnmount(() => {
 .is-empty {
   color: var(--text-3);
   font-size: 12px;
+}
+
+.online-block {
+  padding: 6px 9px;
+  border: 1px solid var(--warning-border, var(--line));
+  border-radius: 8px;
+  background: var(--warning-soft, var(--surface-soft));
+  color: var(--warning);
 }
 
 @media (max-width: 700px) {

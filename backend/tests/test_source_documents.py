@@ -175,6 +175,33 @@ class SourceDocumentTests(unittest.TestCase):
         self.assertEqual(self.legacy_preview("<!-- page 2 -->\n" + pages[1])["location"],
                          {"page_start": 2, "page_end": 2})
 
+    def test_table_pdf_legacy_marker_still_matches_the_physical_page(self):
+        """新解析器把表格文本写入分块，旧标记路径必须仍能核对到同一物理页。"""
+        import pymupdf
+
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        patcher = patch.object(settings, "UPLOAD_DIR", root.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        path = Path(root.name) / "table.pdf"
+        with pymupdf.open() as pdf:
+            page = pdf.new_page()
+            page.insert_text((50, 50), "Unique table page evidence.")
+            page.draw_rect(pymupdf.Rect(50, 70, 200, 120))
+            page.draw_line((125, 70), (125, 120))
+            page.draw_line((50, 95), (200, 95))
+            page.insert_text((55, 88), "Plan")
+            page.insert_text((130, 88), "Budget")
+            page.insert_text((55, 112), "Alpha")
+            page.insert_text((130, 112), "120")
+            pdf.save(path)
+            text = page.get_text("text").strip()
+        self.doc.stored_path, self.doc.index_version = str(path), 0
+        self.assertIn("Plan", text)
+        self.assertEqual(self.legacy_preview("<!-- page 1 -->\n" + text)["location"],
+                         {"page_start": 1, "page_end": 1})
+
     def test_modern_page_metadata_skips_legacy_pdf_scanning(self):
         with patch.object(sources, "_recover_pdf_locations") as lookup:
             result = sources.read_source(self.db, self.kb_id, self.doc_id, 2, 2, 2, 3)

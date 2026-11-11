@@ -1,0 +1,6 @@
+{
+  "candidate_source_mrr": {"max_absolute_change": 0.0},
+  "supplied_source_mrr": {"max_absolute_change": 0.0},
+  "candidate_source_precision_at_k": {"max_absolute_change": 0.0},
+  "supplied_source_precision_at_k": {"max_absolute_change": 0.0}
+}

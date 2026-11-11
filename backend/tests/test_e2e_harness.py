@@ -116,15 +116,25 @@ class EnvAllowlistTests(unittest.TestCase):
 
 
 class WorkerRoleTests(unittest.TestCase):
+    def test_worker_roles_cover_four_independent_processes(self):
+        # manifest.workers、子进程启动、崩溃清理的 PID 归属都从这份映射派生。
+        self.assertEqual(tuple(e2e_env.WORKER_ROLES.items()), (
+            ("worker", "ingest"),
+            ("worker-summary", "summary"),
+            ("worker-project", "project"),
+            ("worker-regression", "regression"),
+        ))
+
     def test_boot_passes_only_the_selected_role_to_worker_argparse(self):
         import subprocess
         import tempfile
+        choices = "[" + ", ".join(json.dumps(role) for role in e2e_env.WORKER_ROLES.values()) + "]"
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
             (path / "worker.py").write_text(
                 'import argparse, json, sys\n'
                 'parser = argparse.ArgumentParser()\n'
-                'parser.add_argument("--role", choices=["ingest", "summary", "project"])\n'
+                f'parser.add_argument("--role", choices={choices})\n'
                 'args = parser.parse_args()\n'
                 'print(json.dumps({"role": args.role, "argv": sys.argv[1:]}))\n', encoding="utf-8",
             )
@@ -136,6 +146,65 @@ class WorkerRoleTests(unittest.TestCase):
                     ], capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(json.loads(result.stdout), {"role": role, "argv": ["--role", role]})
+
+    def test_start_worker_spawns_every_role_with_its_own_nonce_argv(self):
+        orchestrator = e2e_env.Orchestrator(out_dir=Path("unused"), token="abc123",
+                                            nonce="n" * 32)
+        # 用真实 child_env()：只补齐它在真实 start() 里会由 postgres/stub 启动阶段
+        # 写入的少量状态，不 mock 待测的启动逻辑本身。
+        orchestrator.db_name = "rag_e2e_abc123_test"
+        orchestrator.db_password = "local-db-password"
+        orchestrator.state.update(pg_port=5432, stub_base_url="http://127.0.0.1:1234/v1")
+        spawned = {}
+
+        class FakeChild:
+            def __init__(self, name):
+                self.log_path = Path(f"{name}.log")
+
+            def alive(self):
+                return True
+
+        def fake_spawn(name, argv, *, env, cwd):
+            spawned[name] = argv
+            orchestrator.children[name] = FakeChild(name)
+            return orchestrator.children[name]
+
+        with patch.object(orchestrator, "_spawn", side_effect=fake_spawn), \
+                patch.object(e2e_env.time, "sleep"):
+            orchestrator._start_worker()
+
+        self.assertEqual(list(spawned), list(e2e_env.WORKER_ROLES))
+        for name, role in e2e_env.WORKER_ROLES.items():
+            with self.subTest(name=name):
+                argv = spawned[name]
+                # WORKER_BOOT 的入参契约：<backend> <role> --ragkb-e2e-nonce <nonce>；
+                # boot 自己把它转成 worker.py 的 ``--role <role>``（由上一个用例验证）。
+                boot = argv.index(e2e_env.WORKER_BOOT)
+                self.assertEqual(argv[boot + 1], str(e2e_env.REPO_ROOT / "backend"))
+                self.assertEqual(argv[boot + 2], role)
+                self.assertEqual(argv[boot + 3], "--ragkb-e2e-nonce")
+                self.assertEqual(argv[boot + 4], "n" * 32)
+
+    def test_crash_cleanup_verifies_every_worker_role(self):
+        nonce = "n" * 32
+        pids = {name: 2000 + index for index, name in enumerate(e2e_env.WORKER_ROLES)}
+        seen = {}
+
+        def fake_matches(pid, *, required, optional_any=(), nonce=""):
+            seen[pid] = (required, nonce)
+            return True
+
+        with patch.object(e2e_env, "_pid_alive", return_value=True), \
+                patch.object(e2e_env, "_process_matches", side_effect=fake_matches), \
+                patch.object(e2e_env, "_kill_pid") as kill:
+            killed, refused = e2e_env._kill_verified_processes({"pids": pids}, nonce=nonce)
+
+        self.assertEqual(refused, [])
+        self.assertEqual(sorted(killed), sorted(pids.values()))
+        self.assertEqual(kill.call_count, len(pids))
+        for name, role in e2e_env.WORKER_ROLES.items():
+            with self.subTest(name=name):
+                self.assertEqual(seen[pids[name]], (("worker.py", role), nonce))
 
     def test_fixture_and_blob_roots_are_owned_by_this_run(self):
         import tempfile

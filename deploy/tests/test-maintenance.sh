@@ -59,33 +59,46 @@ tar -tzf "${ups[0]}" | grep -q '^uploads/content.txt$' || fail 'uploads 归档�
 assert_contains "${mfs[0]}" 'projects-'
 echo "   ok: 三件产物、三行清单"
 
-echo "== 2. 停写覆盖全部写角色，只重启原本运行的 =="
-# 先把替身状态重置为“新部署”：api + worker + profile 角色 + 旧版遗留 ingest-worker。
+echo "== 2. 停写覆盖全部写角色（含第四角色 regression），只重启原本运行的 =="
+# 先把替身状态重置为“新部署”：api + worker + 三个 profile 角色 + 旧版遗留 ingest-worker。
 rm -rf "$FAKE_DOCKER_STATE"
-export FAKE_DOCKER_RUNNING='c-api api c-ing worker c-sum worker-summary c-prj worker-project c-old ingest-worker c-web web'
+export FAKE_DOCKER_RUNNING='c-api api c-ing worker c-sum worker-summary c-prj worker-project c-reg worker-regression c-old ingest-worker c-web web'
 : > "$OPERATIONS_LOG"
 rm -f "$work"/backups/*.sql.gz "$work"/backups/*.tar.gz "$work"/backups/manifest-*.sha256
 bash "$root/deploy/backup.sh" >/dev/null
-# 上一步删除了旧产物并重新备份，刷新产物列表供后续恢复用例使用。
-mapfile -t dbs < <(ls "$work"/backups/ragdb-*.sql.gz)
-mapfile -t ups < <(ls "$work"/backups/uploads-*.tar.gz)
-mapfile -t prj < <(ls "$work"/backups/projects-*.tar.gz)
-mapfile -t mfs < <(ls "$work"/backups/manifest-*.sha256)
-[[ ${#dbs[@]} -eq 1 && ${#ups[@]} -eq 1 && ${#prj[@]} -eq 1 && ${#mfs[@]} -eq 1 ]] \
-  || fail "第二次备份产物数量不正确"
-for id in c-api c-ing c-sum c-prj c-old; do
+for id in c-api c-ing c-sum c-prj c-reg c-old; do
   grep -q "^stop --timeout [0-9]* $id$" "$OPERATIONS_LOG" \
     || fail "未停止写容器 $id"
 done
 if grep -q "stop --timeout .* c-web" "$OPERATIONS_LOG"; then fail '误停 web'; fi
 # 比例：API 用短预算，worker 角色用 worker 预算。
 assert_contains "$OPERATIONS_LOG" 'stop --timeout 180 c-ing'
+assert_contains "$OPERATIONS_LOG" 'stop --timeout 180 c-reg'
 assert_contains "$OPERATIONS_LOG" 'stop --timeout 30 c-api'
-# 重启的必须恰好是之前那五个写容器，且不包含已停止/未运行的 web。
+# 重启的必须恰好是之前那六个写容器，且不包含已停止/未运行的 web。
 started=$(sed -n 's/^start //p' "$OPERATIONS_LOG" | sort | tr '\n' ' ')
-[[ "$started" == "c-api c-ing c-old c-prj c-sum " ]] || fail "恢复列表不符: $started"
+[[ "$started" == "c-api c-ing c-old c-prj c-reg c-sum " ]] || fail "恢复列表不符: $started"
 if grep -q '^start c-web$' "$OPERATIONS_LOG"; then fail '重启了原本未运行的 web'; fi
-echo "   ok: 停/启列表与角色超时正确"
+echo "   ok: 停/启列表与角色超时正确（含 regression）"
+
+echo "== 2b. 未运行的 regression 角色不会被停写或顺手拉起 =="
+# regression 是显式 profile：没启动过就不该出现在停写/恢复名单里。
+rm -rf "$FAKE_DOCKER_STATE"
+export FAKE_DOCKER_RUNNING='c-api api c-ing worker c-sum worker-summary'
+: > "$OPERATIONS_LOG"
+rm -f "$work"/backups/*.sql.gz "$work"/backups/*.tar.gz "$work"/backups/manifest-*.sha256
+bash "$root/deploy/backup.sh" >/dev/null
+if grep -q 'c-reg' "$OPERATIONS_LOG"; then fail '未运行的 regression 容器被停写/重启'; fi
+started=$(sed -n 's/^start //p' "$OPERATIONS_LOG" | sort | tr '\n' ' ')
+[[ "$started" == "c-api c-ing c-sum " ]] || fail "未运行 regression 时恢复列表不符: $started"
+# 这一轮的产物留给后续恢复用例使用（仍是 db + uploads + projects 三件套）。
+mapfile -t dbs < <(ls "$work"/backups/ragdb-*.sql.gz)
+mapfile -t ups < <(ls "$work"/backups/uploads-*.tar.gz)
+mapfile -t prj < <(ls "$work"/backups/projects-*.tar.gz)
+mapfile -t mfs < <(ls "$work"/backups/manifest-*.sha256)
+[[ ${#dbs[@]} -eq 1 && ${#ups[@]} -eq 1 && ${#prj[@]} -eq 1 && ${#mfs[@]} -eq 1 ]] \
+  || fail "第二次备份产物数量不正确"
+echo "   ok: 只处理实际运行的写角色"
 
 echo "== 3. 恢复新格式：uploads 与 projects 文件都还原 =="
 printf 'mutated' > "$work/uploads/content.txt"

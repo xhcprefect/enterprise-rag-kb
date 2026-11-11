@@ -1,4 +1,15 @@
-"""分片完成发布的离线锁序回归；不连接任何数据库。"""
+"""分片完成发布的离线锁序回归；不连接任何数据库。
+
+A3 契约：完成上传仍是三段式短事务，但根锁复核从"User 存在性 KEY SHARE"
+升级为"新鲜 User FOR UPDATE（active + 认证期原 token）+ KB + 当前维护权"。
+
+- 阶段一：User -> KB 根门禁（维护权 + 原 token），提交即释放；
+- 阶段二：只持上传会话行锁合并慢写；
+- 阶段三：重新按 User -> KB -> 会话取锁发布；已完成会话重放也不得沿用旧权限。
+
+离线替身必须同时提供 ``is_active``/``role``/``token_version``，并在请求上放
+认证期 ``auth_token_version`` 快照；缺失快照按生产契约 fail closed（401）。
+"""
 import hashlib
 import tempfile
 import unittest
@@ -6,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
@@ -30,6 +41,12 @@ class _UploaderIdentity:
             raise AssertionError("取得 KB/会话锁后不得刷新认证 User")
         self.id_reads += 1
         return self.user_id
+
+    @property
+    def username(self):
+        if self.locks:
+            raise AssertionError("取得 KB/会话锁后不得刷新认证 User")
+        return "uploader"
 
 
 class UploadCompletionLockTests(unittest.TestCase):
@@ -59,10 +76,17 @@ class UploadCompletionLockTests(unittest.TestCase):
         self.queries = []
         self.locks = []
         self.uploader = _UploaderIdentity(self.uploader_id, self.locks)
-        self.uploader_exists = True
+        # 新根门禁锁的是新鲜 User 行：需要真实的 active/role/token 字段。
+        self.fresh_user = SimpleNamespace(
+            id=self.uploader_id, username="uploader", is_active=True,
+            role="admin", token_version=0,
+        )
+        # 从该阶段起用户被删除/被撤权，用于验证发布前复核而不是只信任阶段一。
+        self.uploader_missing_from_phase = None
+        self.fresh_user_token_version = 0
         self.publication_session_exists = True
         self.reference_id = None
-        self.db = Mock()
+        self.db = MagicMock()
         self.db.scalar.side_effect = self._scalar
         self.db.commit.side_effect = self._end_transaction
         self.db.rollback.side_effect = self._end_transaction
@@ -85,11 +109,18 @@ class UploadCompletionLockTests(unittest.TestCase):
         if table == "knowledge_bases":
             return self.kb
         if table == "upload_sessions":
-            if self.phase == 2 and not self.publication_session_exists:
+            if self.phase >= 2 and not self.publication_session_exists:
                 return None
             return self.session
         if table == "users":
-            return self.uploader_id if self.uploader_exists else None
+            if (self.uploader_missing_from_phase is not None
+                    and self.phase >= self.uploader_missing_from_phase):
+                return None  # 删除/禁用：FOR UPDATE 行不存在 -> 401
+            return SimpleNamespace(
+                id=self.fresh_user.id, username=self.fresh_user.username,
+                is_active=self.fresh_user.is_active, role=self.fresh_user.role,
+                token_version=self.fresh_user_token_version,
+            )
         if table == "documents":
             # canonical 查询返回空；清理的单列 id 查询可模拟并发收编的文件。
             return self.reference_id if len(statement.selected_columns) == 1 else None
@@ -103,7 +134,7 @@ class UploadCompletionLockTests(unittest.TestCase):
         self.assertIs(db, self.db)
         self.assertIs(session, self.session)
         self.assertEqual(self.phase, 1)
-        # 阶段一已释放 KB，User 锁必须等合并提交后才取。
+        # 阶段一根锁已释放，合并期间只能持有会话行锁。
         self.assertEqual([table for table, _ in self.locks], ["upload_sessions"])
         self.assembled.path.parent.mkdir(parents=True)
         self.assembled.path.write_bytes(b"payload")
@@ -120,20 +151,22 @@ class UploadCompletionLockTests(unittest.TestCase):
             setattr(document, name, value)
 
     def complete(self):
+        request = SimpleNamespace(state=SimpleNamespace(auth_token_version=0))
         return knowledge.complete_upload(
-            self.kb_id, self.session_id, SimpleNamespace(), self.db, self.uploader,
+            self.kb_id, self.session_id, request, self.db, self.uploader,
         )
 
-    def test_publication_uses_real_key_share_before_kb_and_owned_session_locks(self):
+    def test_publication_relocks_user_for_update_then_kb_and_owned_session(self):
         result = self.complete()
         publication_locks = [(table, sql) for phase, table, sql in self.queries
                              if phase == 2 and " FOR " in sql]
         self.assertEqual([table for table, _ in publication_locks],
                          ["users", "knowledge_bases", "upload_sessions"])
         user_sql, kb_sql, session_sql = [sql for _, sql in publication_locks]
-        self.assertTrue(user_sql.startswith("SELECT users.id \nFROM users"), user_sql)
-        self.assertTrue(user_sql.endswith("FOR KEY SHARE"), user_sql)
-        self.assertNotIn("FOR NO KEY UPDATE", user_sql)
+        # 认证期原 token / active / 维护权必须在锁后复核：不再是仅 EXISTS 的 KEY SHARE。
+        self.assertIn("FROM users", user_sql)
+        self.assertTrue(user_sql.endswith("FOR UPDATE"), user_sql)
+        self.assertNotIn("FOR KEY SHARE", user_sql)
         self.assertTrue(kb_sql.endswith("FOR UPDATE"), kb_sql)
         self.assertTrue(session_sql.endswith("FOR UPDATE"), session_sql)
         for _, table, sql in self.queries:
@@ -150,15 +183,15 @@ class UploadCompletionLockTests(unittest.TestCase):
         self.assertEqual(list(Path(self.temp.name).rglob("*.txt")), [self.assembled.path])
         self.assertFalse(upload.tmp_dir(self.session_id).exists())
 
-    def test_deleted_uploader_rolls_back_and_cleans_before_lower_publication_locks(self):
-        self.uploader_exists = False
+    def test_deleted_uploader_at_root_gate_cleans_only_its_own_orphaned_tmp(self):
+        # 阶段一等锁期间用户被删除：FK 已把会话 created_by 置 NULL，任何用户都
+        # 不再能合法完成/续传该会话，本请求清理其 tmp 分片。
+        self.uploader_missing_from_phase = 0
+        self.session.created_by = None
         with self.assertRaises(HTTPException) as error:
             self.complete()
         self.assertEqual(error.exception.status_code, 401)
-        self.assertEqual(error.exception.detail, "用户不存在")
-        self.assertEqual([table for phase, table, _ in self.queries if phase == 2], ["users"])
-        self.assertEqual(self.db.commit.call_count, 2)
-        self.db.rollback.assert_called_once()
+        self.assertEqual(error.exception.detail, "登录状态已失效，请重新登录")
         self.db.add.assert_not_called()
         self.audit.assert_not_called()
         self.assertEqual(self.uploader.id_reads, 1)
@@ -167,15 +200,33 @@ class UploadCompletionLockTests(unittest.TestCase):
         self.assertFalse([path for path in Path(self.temp.name).rglob("*") if path.is_file()])
 
     def test_deleted_uploader_does_not_remove_a_concurrently_referenced_assembly(self):
-        self.uploader_exists = False
+        # 该路径已由并发完成收编为 canonical 文档（合并文件已存在并被引用）。
+        self.assembled.path.parent.mkdir(parents=True, exist_ok=True)
+        self.assembled.path.write_bytes(b"payload")
+        self.uploader_missing_from_phase = 0
+        self.session.created_by = None
         self.reference_id = uuid.uuid4()
         with self.assertRaises(HTTPException) as error:
             self.complete()
         self.assertEqual(error.exception.status_code, 401)
-        self.db.rollback.assert_called_once()
         self.db.add.assert_not_called()
+        # 清理不得删除被引用的 canonical 文件，只清本次会话的 tmp 分片。
         self.assertEqual(self.assembled.path.read_bytes(), b"payload")
         self.assertFalse(upload.tmp_dir(self.session_id).exists())
+
+    def test_revoked_token_at_root_gate_keeps_recoverable_upload(self):
+        # 仅令牌轮换/撤权而账号仍活跃：会话仍可由所有者用新 token 完成，
+        # 不得为了清理而破坏可恢复的分片与合并文件。
+        self.fresh_user_token_version = 1
+        with self.assertRaises(HTTPException) as error:
+            self.complete()
+        self.assertEqual(error.exception.status_code, 401)
+        self.assertEqual([table for phase, table, _ in self.queries if phase == 0], ["users"])
+        self.db.add.assert_not_called()
+        final_files = [path for path in Path(self.temp.name).rglob("*")
+                       if path.is_file() and "tmp" not in path.parts]
+        self.assertEqual(final_files, [])
+        self.assertTrue((upload.tmp_dir(self.session_id) / "0.part").exists())
 
     def test_deleted_upload_session_still_uses_existing_rollback_and_cleanup(self):
         self.publication_session_exists = False

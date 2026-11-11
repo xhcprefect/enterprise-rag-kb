@@ -96,7 +96,7 @@ def get_session(
 
 def create_or_resume(
     db: Session, kb_id: uuid.UUID, filename: str, file_size: int, ext: str,
-    user_id: uuid.UUID, content_sha256: str | None = None,
+    user_id: uuid.UUID, content_sha256: str | None = None, *, authorize_after_conflict=None,
 ) -> UploadSession:
     _guard_project_kb(db, kb_id)
     if not 0 < file_size <= settings.MAX_UPLOAD_MB * 1024 * 1024:
@@ -122,8 +122,12 @@ def create_or_resume(
     try:
         db.commit()
     except IntegrityError:
+        # API-facing callers pass a root-gate callback: rollback released the first
+        # User/KB locks, so authorization must be re-established before canonical reuse.
         db.rollback()
-        session = db.scalar(statement)
+        if authorize_after_conflict is not None:
+            authorize_after_conflict()
+        session = db.scalar(statement.with_for_update().execution_options(populate_existing=True))
         if session is None:
             raise
     tmp_dir(session.id).mkdir(parents=True, exist_ok=True)

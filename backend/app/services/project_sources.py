@@ -31,6 +31,7 @@ from app.schemas.project import (
     AUTO_SYNC_MIN_INTERVAL_SECONDS,
     ProjectSourceRead,
 )
+from app.services.kb_access import can_read_kb, visible_kb_predicate
 from app.services.project_paths import (
     ProjectPathError,
     RootAnchor,
@@ -223,17 +224,16 @@ def source_to_read(source: ProjectSource) -> ProjectSourceRead:
     )
 
 
-def _kb_visible(kb: KnowledgeBase, user: User) -> bool:
-    if user.is_admin:
-        return True
-    return bool(kb.is_public) or kb.owner_id == user.id
+def _kb_visible(db: DBSession, kb: KnowledgeBase, user: User) -> bool:
+    """管理员/公开/拥有者原语义 + 显式成员读取权（当前 Session，无跨请求缓存）。"""
+    return can_read_kb(db, kb, user)
 
 
-def _source_or_gone(source: ProjectSource | None, user: User) -> ProjectSource:
+def _source_or_gone(db: DBSession, source: ProjectSource | None, user: User) -> ProjectSource:
     if source is None:
         raise ProjectSourceNotFound()
     kb = source.knowledge_base
-    if kb is None or not _kb_visible(kb, user):
+    if kb is None or not _kb_visible(db, kb, user):
         raise ProjectSourceNotFound()
     if source.revoked_at is not None:
         raise ProjectSourceRevoked()
@@ -244,24 +244,25 @@ def get_project_source(
     db: DBSession, source_id: uuid.UUID, user: User
 ) -> ProjectSource:
     source = db.get(ProjectSource, source_id)
-    return _source_or_gone(source, user)
+    return _source_or_gone(db, source, user)
 
 
 def get_project_source_by_kb(
     db: DBSession, kb_id: uuid.UUID, user: User
 ) -> ProjectSource:
     source = db.scalar(select(ProjectSource).where(ProjectSource.kb_id == kb_id))
-    return _source_or_gone(source, user)
+    return _source_or_gone(db, source, user)
 
 
 def list_visible_sources(db: DBSession, user: User) -> list[ProjectSource]:
-    """按 KB ACL 返回可见且未 revoke 的源（管理员全部可见）。"""
-    stmt = select(ProjectSource)
-    if not user.is_admin:
-        stmt = stmt.join(KnowledgeBase).where(
-            KnowledgeBase.is_public.is_(True)
-            | (KnowledgeBase.owner_id == user.id)
-        )
+    """按 KB ACL 返回可见且未 revoke 的源（管理员全部可见；成员仅授权库）。
+
+    可见性在 SQL 内 JOIN 知识库判定，分页/LIMIT 之前就收敛到当前用户；成员
+    EXISTS 与检索路径使用同一份 ``visible_kb_predicate``。
+    """
+    stmt = select(ProjectSource).join(KnowledgeBase).where(
+        visible_kb_predicate(user, KnowledgeBase)
+    )
     stmt = stmt.where(ProjectSource.revoked_at.is_(None)).order_by(
         ProjectSource.created_at.desc()
     )

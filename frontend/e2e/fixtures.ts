@@ -16,7 +16,7 @@ export interface Manifest {
   stub?: { base_url?: string; state_url?: string; config_url?: string; reset_url?: string }
   database?: { host?: string; port?: number; name?: string }
   worker?: { pid?: number }
-  workers?: Record<'ingest' | 'summary' | 'project', { pid: number }>
+  workers?: Record<'ingest' | 'summary' | 'project' | 'regression', { pid: number }>
   project_fixture?: { root_key: string; relative_dir: string; root: string; file: string }
 }
 
@@ -106,6 +106,7 @@ export interface StubState {
   nonce?: string
   counts: Record<string, number>
   config: Record<string, unknown>
+  recent?: Array<Record<string, unknown>>
 }
 
 export function stubControl(manifest: Manifest): StubControl {
@@ -168,4 +169,74 @@ export async function uiLogin(page: Page): Promise<void> {
   await page.getByPlaceholder('请输入密码').fill(CREDENTIALS.password)
   await page.getByRole('button', { name: /登录工作空间/ }).click()
   await page.waitForURL((url) => !url.pathname.startsWith('/login'), { timeout: 30_000 })
+}
+
+export interface ApiCallResult<T> {
+  status: number
+  ok: boolean
+  data: T | null
+  body: unknown
+}
+
+/**
+ * 真实 API 调用的通用薄封装：只附带管理员 token 与 JSON 正文，不做自动重试。
+ * 需要把失败状态（409/404）当作业务断言时用 status 判断，而不是让 Playwright 抛错。
+ */
+export async function apiCall<T = any>(
+  request: APIRequestContext,
+  manifest: Manifest,
+  token: string,
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  path: string,
+  data?: unknown
+): Promise<ApiCallResult<T>> {
+  const response = await request.fetch(`${apiUrl(manifest)}/api/v1${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${token}` },
+    data,
+    failOnStatusCode: false
+  })
+  let body: unknown = null
+  try {
+    body = await response.json()
+  } catch {
+    body = null
+  }
+  const envelope = body as { data?: T } | null
+  return {
+    status: response.status(),
+    ok: response.ok(),
+    data: envelope && typeof envelope === 'object' && 'data' in envelope
+      ? (envelope.data as T)
+      : null,
+    body
+  }
+}
+
+/** 期望 2xx 的 API 读取；失败时把状态与正文交给断言输出。 */
+export async function apiGetData<T = any>(
+  request: APIRequestContext,
+  manifest: Manifest,
+  token: string,
+  path: string
+): Promise<T> {
+  const result = await apiCall<T>(request, manifest, token, 'GET', path)
+  if (!result.ok || result.data === null) {
+    throw new Error(`GET ${path} 失败: HTTP ${result.status} ${JSON.stringify(result.body)}`)
+  }
+  return result.data
+}
+
+export async function apiPostData<T = any>(
+  request: APIRequestContext,
+  manifest: Manifest,
+  token: string,
+  path: string,
+  data: unknown
+): Promise<T> {
+  const result = await apiCall<T>(request, manifest, token, 'POST', path, data)
+  if (!result.ok || result.data === null) {
+    throw new Error(`POST ${path} 失败: HTTP ${result.status} ${JSON.stringify(result.body)}`)
+  }
+  return result.data
 }

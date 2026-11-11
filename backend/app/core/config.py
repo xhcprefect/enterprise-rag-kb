@@ -110,6 +110,18 @@ class Settings(BaseSettings):
     RETRIEVAL_REWRITE_MAX_TOKENS: int = Field(default=256, ge=32, le=2048)
     RETRIEVAL_REWRITE_HISTORY_TURNS: int = Field(default=3, ge=1, le=10)
     RETRIEVAL_REWRITE_HISTORY_CHARS: int = Field(default=3000, ge=128, le=12000)
+
+    # ===== 反馈回归在线作业（R1b 持久作业租约与重试）=====
+    # 单次 claim 的租约；heartbeat 只续租约，不延长整个作业的 deadline。
+    FEEDBACK_REGRESSION_JOB_LEASE_SECONDS: int = Field(default=300, ge=30, le=3600)
+    # worker 轮询间隔（由 R2 使用）。
+    FEEDBACK_REGRESSION_JOB_POLL_SECONDS: float = Field(default=2.0, ge=0.1, le=30)
+    # 同一 job 的 worker 尝试上限；与 run.attempt_no（管理员新提交）独立。
+    FEEDBACK_REGRESSION_JOB_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    # 仅显式可恢复错误在重试前的有界退避。
+    FEEDBACK_REGRESSION_JOB_RETRY_DELAY_SECONDS: float = Field(default=5.0, ge=0, le=300)
+    # 整个作业从第一次 claim 开始的总时限；排队等待不计。
+    FEEDBACK_REGRESSION_JOB_TOTAL_TIMEOUT_SECONDS: int = Field(default=600, ge=30, le=3600)
     # 多轮记忆：只保留完整的 user + assistant 轮次。
     HISTORY_MAX_TURNS: int = Field(default=10, ge=0, le=100)
     HISTORY_MAX_CHARS: int = Field(default=8000, ge=0)

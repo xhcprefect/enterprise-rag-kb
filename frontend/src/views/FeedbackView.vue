@@ -7,7 +7,7 @@
         <p>{{ t('feedback.admin.subtitle') }}</p>
       </div>
       <div class="page-actions">
-        <el-button :loading="loading" @click="load">
+        <el-button :loading="loading" @click="refreshList">
           <el-icon><Refresh /></el-icon>{{ t('feedback.admin.refresh') }}
         </el-button>
         <el-button type="primary" plain :loading="exportingAll" :disabled="exportingAll" @click="exportAll">
@@ -48,7 +48,24 @@
         </el-select>
       </div>
 
+      <div class="batch-tools">
+        <span class="batch-hint" data-testid="feedback-batch-hint">
+          {{ selectedIds.length ? fj('batch.selected', { count: selectedIds.length }) : fj('batch.selectHint') }}
+        </span>
+      </div>
+
       <el-table v-loading="loading" :data="items">
+        <el-table-column width="48" align="center">
+          <template #default="{ row }">
+            <el-checkbox
+              :model-value="isBatchSelected(row.id)"
+              :disabled="batchBusy || (!isBatchSelected(row.id) && selectedIds.length >= MAX_BATCH_ITEMS)"
+              :aria-label="fj('batch.selectAria', { id: shortId(row.id) })"
+              :data-testid="`feedback-batch-select-${row.id}`"
+              @change="toggleBatchSelection(row.id, $event)"
+            />
+          </template>
+        </el-table-column>
         <el-table-column :label="t('feedback.admin.colId')" width="120">
           <template #default="{ row }">
             <span class="mono" :title="row.id">{{ shortId(row.id) }}</span>
@@ -102,6 +119,14 @@
         </template>
       </el-table>
 
+      <FeedbackRegressionJobBatchPanel
+        :selected="selectedItems"
+        :reset-token="batchResetToken"
+        @clear-selection="clearBatchSelection"
+        @busy-change="batchBusy = $event"
+        @batch-created="onBatchCreated"
+      />
+
       <div class="panel-foot">
         <el-pagination
           v-model:current-page="page"
@@ -109,8 +134,8 @@
           :total="total"
           :page-sizes="[10, 20, 50]"
           layout="total, sizes, prev, pager, next"
-          @current-change="load"
-          @size-change="load"
+          @current-change="onPageChange"
+          @size-change="onPageSizeChange"
         />
       </div>
     </div>
@@ -364,11 +389,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { Download, Refresh } from '@element-plus/icons-vue'
 import FeedbackRegressionPanel from '@/components/FeedbackRegressionPanel.vue'
+import FeedbackRegressionJobBatchPanel from '@/components/FeedbackRegressionJobBatchPanel.vue'
 import {
   feedbackApi,
   type AnswerFeedbackAdminDetail,
@@ -379,6 +405,8 @@ import {
 } from '@/api'
 import { formatDateTime, formatNumber } from '@/i18n/format'
 import { createLatestGuard } from '@/utils/usage'
+import { MAX_BATCH_ITEMS } from '@/utils/feedbackRegressionJobs'
+import { useFeedbackRegressionJobsI18n } from '@/i18n/messages/feedbackRegressionJobs'
 import {
   buildReviewPayload,
   canVerify,
@@ -391,6 +419,7 @@ import {
 } from '@/utils/feedback'
 
 const { t } = useI18n()
+const { fj } = useFeedbackRegressionJobsI18n()
 
 const STATUSES: FeedbackStatus[] = ['pending', 'verified', 'rejected']
 const CATEGORIES: FeedbackCategory[] = ['inaccurate_answer', 'citation_error', 'missing_material']
@@ -406,6 +435,49 @@ const loading = ref(false)
 const listError = ref('')
 const listGuard = createLatestGuard()
 let listController: AbortController | null = null
+
+/**
+ * 批量在线回归的选择只属于当前列表页。筛选、翻页、手动刷新和关闭列表上下文
+ * 都清空选择；已选对象的回归版本由批量子面板在提交前逐条重新读取。
+ */
+const selectedIds = ref<string[]>([])
+const batchBusy = ref(false)
+const batchResetToken = ref(0)
+const selectedItems = computed(() =>
+  items.value.filter(item => selectedIds.value.includes(item.id))
+)
+
+function isBatchSelected(id: string): boolean {
+  return selectedIds.value.includes(id)
+}
+
+function toggleBatchSelection(id: string, value: unknown) {
+  const checked = value === true
+  if (!checked) {
+    selectedIds.value = selectedIds.value.filter(current => current !== id)
+    return
+  }
+  if (isBatchSelected(id)) return
+  if (selectedIds.value.length >= MAX_BATCH_ITEMS) {
+    ElMessage.warning(fj('batch.limit', { max: formatNumber(MAX_BATCH_ITEMS) }))
+    return
+  }
+  selectedIds.value = [...selectedIds.value, id]
+}
+
+function clearBatchSelection() {
+  selectedIds.value = []
+}
+
+/** 清空选择并推进 resetToken，让批量子面板丢弃已缓存的版本/比较内容。 */
+function resetBatchContext() {
+  clearBatchSelection()
+  batchResetToken.value += 1
+}
+
+function onBatchCreated() {
+  void load()
+}
 
 const drawerVisible = ref(false)
 const detail = ref<AnswerFeedbackAdminDetail | null>(null)
@@ -492,6 +564,11 @@ async function load() {
     if (current.signal.aborted || !listGuard.isCurrent(token)) return
     items.value = Array.isArray(data?.items) ? data.items : []
     total.value = typeof data?.total === 'number' && data.total >= 0 ? data.total : items.value.length
+    // 当前页重新加载后，不在列表中的旧选择不再展示也不再提交。
+    if (selectedIds.value.length) {
+      const present = new Set(items.value.map(item => item.id))
+      selectedIds.value = selectedIds.value.filter(id => present.has(id))
+    }
   } catch (err: any) {
     if (current.signal.aborted || !listGuard.isCurrent(token)) return
     listError.value = err?.message || t('feedback.admin.loadFailed')
@@ -502,8 +579,25 @@ async function load() {
   }
 }
 
+function refreshList() {
+  resetBatchContext()
+  void load()
+}
+
 function onFilterChange() {
   page.value = 1
+  resetBatchContext()
+  void load()
+}
+
+function onPageChange() {
+  resetBatchContext()
+  void load()
+}
+
+function onPageSizeChange() {
+  page.value = 1
+  resetBatchContext()
   void load()
 }
 
@@ -529,6 +623,8 @@ async function loadDetail(id: string) {
 }
 
 function openDetail(row: AnswerFeedbackAdminItem) {
+  // 切换到单条反馈上下文时，收起批量比较/缓存内容；选择本身保留在列表中。
+  batchResetToken.value += 1
   drawerVisible.value = true
   detail.value = null
   detailError.value = ''
@@ -603,6 +699,11 @@ function onRegressionChanged() {
   void load()
 }
 
+watch(drawerVisible, visible => {
+  // 关闭详情后不再保留批次比较里的旧回答/引用展示。
+  if (!visible) batchResetToken.value += 1
+})
+
 onMounted(() => {
   void load()
 })
@@ -632,6 +733,21 @@ onBeforeUnmount(() => {
 
 .filter-select {
   width: 160px;
+}
+
+.batch-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 24px 12px;
+}
+
+.batch-hint {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 
 .mono {
@@ -875,6 +991,10 @@ onBeforeUnmount(() => {
 
   .filter-select {
     width: 100%;
+  }
+
+  .batch-tools {
+    padding: 0 16px 10px;
   }
 }
 </style>

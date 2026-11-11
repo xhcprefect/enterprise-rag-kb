@@ -1,11 +1,12 @@
 """有界结构化解析与分块，保留原文位置，表格和章节前缀在分块中重复。"""
+import codecs
 import csv
 import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.services.parser import detect_encoding
+from app.services.parser import detect_file_encoding
 from app.services.source_documents import merge_locations
 
 
@@ -58,12 +59,11 @@ class _Sections:
 
 
 def _text_lines(path):
-    with path.open("rb") as stream:
-        encoding = detect_encoding(stream.read(65536))
-    if encoding == "utf-8":
-        encoding = "utf-8-sig"
+    # 全文件流式校验编码：前 64KiB 的 ASCII 前缀不能代表后面的正文编码。
+    encoding = detect_file_encoding(path)
     line, size = 1, max(1, path.stat().st_size)
-    with path.open("r", encoding=encoding, errors="replace", newline="") as stream:
+    # 校验通过后严格解码；损坏内容必须报错，不能用 replace 静默污染正文。
+    with path.open("r", encoding=encoding, errors="strict", newline="") as stream:
         while text := stream.readline(65536):
             text = text.replace("\r\n", "\n").replace("\r", "\n")
             end = line + text.count("\n") - (1 if text.endswith("\n") else 0)
@@ -120,15 +120,27 @@ def _text_blocks(path):
 
 
 def _pdf_blocks(path):
-    import pymupdf
+    """PDF 正文与真实表格按页内阅读顺序合并，物理页码来自 PDF 页序。
+
+    表格只在完整物化成功后才从正文中排除对应区域；失败保留原文细节见
+    :mod:`app.services.pdf_documents`。扫描页/全空 PDF 抛专用错误，消息可直接
+    作为用户提示，不含路径或原文。
+    """
+    from app.services.pdf_documents import PdfTableSegment, iter_pdf_segments
+
     sections = _Sections()
-    with pymupdf.open(path) as document:
-        total = max(1, document.page_count)
-        for page_no, page in enumerate(document, 1):
-            for line in page.get_text("text").splitlines(keepends=True):
-                sections.update(line)
-                yield _Block(line, {**sections.metadata(), "page_start": page_no, "page_end": page_no},
-                             page_no / total, sections.prefix())
+    for segment in iter_pdf_segments(Path(path)):
+        progress = segment.progress
+        base = {**sections.metadata(), "page_start": segment.page, "page_end": segment.page}
+        if isinstance(segment, PdfTableSegment):
+            # 行号以表内逻辑行计：表头始终是第 1 行（外部表头同样计 1），正文从 2 起。
+            yield from _table_blocks(segment.rows, {**base, "table_index": segment.table_index},
+                                     lambda value=progress: value, sections.prefix())
+            continue
+        for line in segment.text.splitlines(keepends=True):
+            sections.update(line)
+            yield _Block(line, {**sections.metadata(), "page_start": segment.page,
+                                "page_end": segment.page}, progress, sections.prefix())
 
 
 def _cell(value):
@@ -167,17 +179,17 @@ def _table_blocks(rows, base, progress, prefix=""):
 
 
 def _csv_blocks(path):
+    encoding = detect_file_encoding(path)
     with path.open("rb") as stream:
         sample = stream.read(65536)
-    encoding = detect_encoding(sample)
-    if encoding == "utf-8":
-        encoding = "utf-8-sig"
+    # 采样只用于嗅探分隔符，末尾可能截断多字节字符；增量解码可以安全丢弃残尾。
+    sample_text = codecs.getincrementaldecoder(encoding)().decode(sample, final=False)
     try:
-        dialect = csv.Sniffer().sniff(sample.decode(encoding, errors="replace"), delimiters=",;\t|")
+        dialect = csv.Sniffer().sniff(sample_text, delimiters=",;\t|")
     except csv.Error:
         dialect = csv.excel
     size = max(1, path.stat().st_size)
-    with path.open("r", encoding=encoding, errors="replace", newline="") as stream:
+    with path.open("r", encoding=encoding, errors="strict", newline="") as stream:
         yield from _table_blocks(csv.reader(stream, dialect), {"table_index": 1},
                                  lambda: min(1.0, stream.buffer.tell() / size))
 

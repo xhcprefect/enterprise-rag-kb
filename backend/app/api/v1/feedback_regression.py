@@ -85,7 +85,13 @@ def enroll_feedback_regression(
     db: DBSession = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    data = feedback_regression.enroll(db, admin, feedback_id, payload)
+    data = feedback_regression.enroll(
+        db,
+        admin,
+        feedback_id,
+        payload,
+        auth_token_version=request.state.auth_token_version,
+    )
     write_audit(
         db,
         request,
@@ -133,7 +139,13 @@ def prepare_feedback_regression_run(
     admin: User = Depends(require_admin),
 ):
     response.headers["Cache-Control"] = "no-store"
-    data = feedback_regression.prepare_run(db, admin, feedback_id, payload)
+    data = feedback_regression.prepare_run(
+        db,
+        admin,
+        feedback_id,
+        payload,
+        auth_token_version=request.state.auth_token_version,
+    )
     write_audit(
         db,
         request,
@@ -162,7 +174,13 @@ def export_feedback_regression_run(
     admin: User = Depends(require_admin),
 ):
     response.headers["Cache-Control"] = "no-store"
-    data = feedback_regression.export_run(db, admin, feedback_id, run_id)
+    data = feedback_regression.export_run(
+        db,
+        admin,
+        feedback_id,
+        run_id,
+        auth_token_version=request.state.auth_token_version,
+    )
     write_audit(
         db,
         request,
@@ -195,6 +213,7 @@ def import_feedback_regression_report(
         run_id,
         expected_revision=expected_revision,
         raw=raw,
+        auth_token_version=request.state.auth_token_version,
     )
     write_audit(
         db,

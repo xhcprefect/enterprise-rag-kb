@@ -32,7 +32,17 @@ from app.core.config import settings
 from app.core.observability import metrics, start_chat
 from app.core.security import create_access_token, hash_password
 from app.db import session as db_session
-from app.models import Document, DocumentStatus, KnowledgeBase, User
+from app.models import (
+    Conversation,
+    Document,
+    DocumentStatus,
+    KnowledgeBase,
+    SummaryJob,
+    SummaryJobStatus,
+    User,
+    WorkerHeartbeat,
+)
+from app.services import worker_status as ws
 
 
 def _bind_engine() -> None:
@@ -57,6 +67,13 @@ import app.models  # noqa: E402,F401  确保所有表已注册
 
 if _TEST_URL:
     Base.metadata.create_all(bind=db_session.engine)
+
+
+def _async_return(value):
+    async def _inner():
+        return value
+
+    return _inner
 
 
 def build_app() -> FastAPI:
@@ -118,11 +135,11 @@ class OperationsTestCase(unittest.TestCase):
         token = create_access_token(str(self.member.id), self.member.role, token_version=self.member.token_version)
         return {"Authorization": f"Bearer {token}"}
 
-    def _add_document(self, status=DocumentStatus.PENDING.value, heartbeat=None):
+    def _add_document(self, status=DocumentStatus.PENDING.value, heartbeat=None, lease_id=None):
         with db_session.SessionLocal() as db:
             doc = Document(kb_id=self.kb.id, filename=f"ops_test_{uuid.uuid4().hex[:8]}.txt",
                            file_ext="txt", file_size=1, stored_path="ops_test.txt",
-                           status=status, heartbeat_at=heartbeat)
+                           status=status, heartbeat_at=heartbeat, lease_id=lease_id)
             db.add(doc)
             db.commit()
             db.refresh(doc)
@@ -335,6 +352,268 @@ class OperationsTestCase(unittest.TestCase):
         self.assertIsNone(data["queue"])  # 不把超时误报成"队列为空"
         self.assertEqual(data["database"]["error"], "timeout")
         self.assertLess(elapsed, 4.0)
+
+
+    # ---- worker 状态 --------------------------------------------------
+    def _add_heartbeat(self, role, *, age=0, stopped=False):
+        with db_session.SessionLocal() as db:
+            row = WorkerHeartbeat(
+                role=role,
+                started_at=datetime.now(timezone.utc) - timedelta(seconds=age + 5),
+                heartbeat_at=datetime.now(timezone.utc) - timedelta(seconds=age),
+                stopped_at=datetime.now(timezone.utc) if stopped else None,
+            )
+            db.add(row)
+            db.commit()
+            return row.instance_id
+
+    def _add_summary_job(self, status, *, heartbeat=None, error_code=None):
+        with db_session.SessionLocal() as db:
+            conv = Conversation(
+                user_id=self.admin.id, mode="chat",
+                title=f"ops_test_conv_{uuid.uuid4().hex[:8]}",
+            )
+            db.add(conv)
+            db.flush()
+            job = SummaryJob(
+                conversation_id=conv.id, idempotency_key=f"ops-{uuid.uuid4().hex}",
+                status=status, heartbeat_at=heartbeat, error_code=error_code,
+            )
+            db.add(job)
+            db.commit()
+            return job.id
+
+    def _purge_worker_observations(self):
+        with db_session.SessionLocal() as db:
+            db.execute(delete(SummaryJob).where(SummaryJob.idempotency_key.like("ops-%")))
+            db.execute(delete(Conversation).where(Conversation.title.like("ops_test_conv_%")))
+            db.execute(delete(WorkerHeartbeat))
+            db.commit()
+
+    def test_workers_requires_admin_and_no_store(self):
+        self.assertEqual(self.client.get("/api/v1/operations/workers").status_code, 401)
+        self.assertEqual(
+            self.client.get("/api/v1/operations/workers", headers=self._member_headers()).status_code,
+            403,
+        )
+        response = self.client.get("/api/v1/operations/workers", headers=self._admin_headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("cache-control"), "no-store")
+        body = response.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["code"], 0)
+
+    def test_workers_auth_is_checked_before_querying(self):
+        with patch.object(operations.worker_status_service, "collect_worker_status",
+                          side_effect=AssertionError("未授权请求不应查询数据库")):
+            self.assertEqual(self.client.get("/api/v1/operations/workers").status_code, 401)
+            self.assertEqual(
+                self.client.get(
+                    "/api/v1/operations/workers", headers=self._member_headers()
+                ).status_code,
+                403,
+            )
+
+    def test_workers_payload_contract_and_no_leaks(self):
+        old_source = self._add_heartbeat("summary", age=ws.STALE_AFTER_SECONDS + 10)
+        self._add_heartbeat("ingest", age=1)
+        self._add_heartbeat("ingest", age=2)
+        pending_id = self._add_document(DocumentStatus.PENDING.value)
+        stale_id = self._add_document(
+            DocumentStatus.PROCESSING.value,
+            heartbeat=datetime.now(timezone.utc) - timedelta(
+                seconds=settings.INGEST_STALE_SECONDS + 30
+            ),
+            lease_id=uuid.uuid4(),
+        )
+        failure_id = self._add_document(DocumentStatus.FAILED.value)
+        job_id = self._add_summary_job(
+            SummaryJobStatus.FAILED.value, error_code="C:\\secret\\private\\name.txt"
+        )
+        try:
+            with patch.object(settings, "CHAT_MEMORY_ENABLED", True), \
+                 patch.object(settings, "PROJECT_ALLOWED_ROOTS", {"demo": "/tmp/demo"}):
+                response = self.client.get(
+                    "/api/v1/operations/workers", headers=self._admin_headers()
+                )
+            self.assertEqual(response.status_code, 200)
+            data = response.json()["data"]
+            self.assertEqual(data["stale_after_seconds"], 45)
+            self.assertFalse(data["degraded"])
+            self.assertIn("generated_at", data)
+            roles = {item["role"]: item for item in data["roles"]}
+            self.assertEqual(list(roles), ["ingest", "summary", "project", "regression"])
+            for role in ("ingest", "summary", "project", "regression"):
+                self.assertEqual(
+                    set(roles[role]),
+                    {
+                        "role", "enabled", "state", "alive_count", "last_heartbeat_at",
+                        "pending", "processing", "stale_tasks",
+                        "oldest_pending_age_seconds", "last_failure",
+                    },
+                )
+            self.assertTrue(roles["ingest"]["enabled"])
+            self.assertEqual(roles["ingest"]["state"], "running")
+            self.assertEqual(roles["ingest"]["alive_count"], 2)
+            self.assertGreaterEqual(roles["ingest"]["pending"], 1)
+            self.assertGreaterEqual(roles["ingest"]["processing"], 1)
+            self.assertGreaterEqual(roles["ingest"]["stale_tasks"], 1)
+            self.assertIsNotNone(roles["ingest"]["oldest_pending_age_seconds"])
+            self.assertEqual(roles["ingest"]["last_failure"]["code"], "document-failed")
+            self.assertEqual(roles["summary"]["state"], "stale")
+            self.assertEqual(roles["summary"]["alive_count"], 0)
+            self.assertEqual(roles["summary"]["last_failure"]["code"], "failed")
+            self.assertIsNotNone(roles["summary"]["last_failure"]["updated_at"])
+            self.assertIn(roles["project"]["state"], {"not_started", "disabled"})
+            self.assertTrue(roles["regression"]["enabled"])
+            self.assertIn(roles["regression"]["state"], {"not_started", "unknown"})
+            blob = response.text
+            for leaked in (
+                str(pending_id), str(stale_id), str(failure_id), str(job_id),
+                str(old_source), "secret", "private", "name.txt", "ops_test_",
+                self.admin.username, "127.0.0.1:9",
+            ):
+                self.assertNotIn(leaked, blob)
+        finally:
+            self._purge()
+            self._purge_worker_observations()
+
+    def test_workers_degrade_to_null_when_database_unavailable(self):
+        from sqlalchemy import create_engine
+
+        broken = create_engine(
+            "postgresql+psycopg://ragtest:bad@127.0.0.1:9/unreachable",
+            connect_args={"connect_timeout": 1},
+        )
+        with patch.object(db_session, "engine", broken), \
+             patch.object(settings, "OPERATIONS_DB_TIMEOUT_SECONDS", 1.0), \
+             patch.object(settings, "CHAT_MEMORY_ENABLED", True), \
+             patch.object(settings, "PROJECT_ALLOWED_ROOTS", {"demo": "/tmp/demo"}):
+            response = self.client.get(
+                "/api/v1/operations/workers", headers=self._admin_headers()
+            )
+        broken.dispose()
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertTrue(data["degraded"])
+        for item in data["roles"]:
+            self.assertTrue(item["enabled"])
+            self.assertEqual(item["state"], "unknown")
+            self.assertIsNone(item["alive_count"])
+            self.assertIsNone(item["pending"])
+            self.assertIsNone(item["processing"])
+            self.assertIsNone(item["stale_tasks"])
+            self.assertIsNone(item["oldest_pending_age_seconds"])
+            self.assertIsNone(item["last_failure"])
+        self.assertNotIn("bad", response.text)
+
+    def test_workers_timeout_is_bounded_and_not_zeroed(self):
+        # 超时由 collect_worker_status 内部的 anyio 超时收敛（见 test_worker_status），
+        # 这里验证接口在超时/异常结果下仍返回 degraded + null，而不是 500 或补零。
+        async def timeout_result():
+            return {"status": "unavailable", "error": "timeout"}
+
+        with patch.object(operations.worker_status_service, "collect_worker_status",
+                          new=timeout_result), \
+             patch.object(settings, "CHAT_MEMORY_ENABLED", True), \
+             patch.object(settings, "PROJECT_ALLOWED_ROOTS", {"demo": "/tmp/demo"}):
+            response = self.client.get(
+                "/api/v1/operations/workers", headers=self._admin_headers()
+            )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertTrue(data["degraded"])
+        for item in data["roles"]:
+            self.assertTrue(item["enabled"])
+            self.assertEqual(item["state"], "unknown")
+            self.assertIsNone(item["pending"])
+
+    def test_worker_observation_failure_never_breaks_existing_summary(self):
+        # worker 观测失败不能让已有 /summary 变成 500 或改变其语义。
+        with patch.object(operations.worker_status_service, "collect_worker_status",
+                          side_effect=RuntimeError("broken")):
+            response = self.client.get("/api/v1/operations/summary", headers=self._admin_headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["data"]["degraded"])
+
+    # ---- worker metrics ------------------------------------------------
+    def test_metrics_export_worker_roles(self):
+        self._add_heartbeat("ingest", age=1)
+        try:
+            with patch.object(settings, "METRICS_TOKEN", "t0ken"), \
+                 patch.object(settings, "CHAT_MEMORY_ENABLED", True), \
+                 patch.object(settings, "PROJECT_ALLOWED_ROOTS", {}):
+                response = self.client.get(
+                    "/api/v1/operations/metrics",
+                    headers={"Authorization": "Bearer t0ken"},
+                )
+            self.assertEqual(response.status_code, 200)
+            text = response.text
+            self.assertIn("ragkb_workers_available 1", text)
+            for role in ("ingest", "summary", "project", "regression"):
+                self.assertIn('ragkb_worker_enabled{role="%s"}' % role, text)
+                self.assertIn('ragkb_worker_alive{role="%s"}' % role, text)
+                self.assertIn('ragkb_worker_pending_tasks{role="%s"}' % role, text)
+                self.assertIn('ragkb_worker_processing_tasks{role="%s"}' % role, text)
+                self.assertIn('ragkb_worker_stale_tasks{role="%s"}' % role, text)
+            self.assertIn('ragkb_worker_enabled{role="ingest"} 1', text)
+            self.assertIn('ragkb_worker_enabled{role="project"} 0', text)
+            self.assertIn('ragkb_worker_enabled{role="regression"} 1', text)
+            self.assertIn('ragkb_worker_alive{role="ingest"} 1', text)
+        finally:
+            self._purge_worker_observations()
+
+    def test_metrics_omit_worker_values_when_observation_fails(self):
+        broken = {"status": "unavailable", "error": "query_failed"}
+        with patch.object(settings, "METRICS_TOKEN", "t0ken"), \
+             patch.object(operations.worker_status_service, "collect_worker_status",
+                          new=_async_return(broken)):
+            response = self.client.get(
+                "/api/v1/operations/metrics", headers={"Authorization": "Bearer t0ken"}
+            )
+        self.assertEqual(response.status_code, 200)
+        text = response.text
+        self.assertIn("ragkb_workers_available 0", text)
+        # 未知不导出，避免被告警读成 0；enabled 只来自配置，仍可输出。
+        self.assertNotIn("ragkb_worker_alive", text)
+        self.assertNotIn("ragkb_worker_pending_tasks", text)
+        self.assertNotIn("ragkb_worker_processing_tasks", text)
+        self.assertNotIn("ragkb_worker_stale_tasks", text)
+        self.assertNotIn("ragkb_worker_last_failure", text)
+        # 现有数据库指标仍按自身结果独立输出。
+        self.assertIn("ragkb_db_available 1", text)
+
+    def test_metrics_worker_failure_does_not_break_existing_metrics(self):
+        with patch.object(settings, "METRICS_TOKEN", "t0ken"), \
+             patch.object(operations.worker_status_service, "collect_worker_status",
+                          side_effect=RuntimeError("boom")):
+            response = self.client.get(
+                "/api/v1/operations/metrics", headers={"Authorization": "Bearer t0ken"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("ragkb_workers_available 0", response.text)
+        self.assertIn("ragkb_db_available 1", response.text)
+        self.assertIn("ragkb_metrics_process_local 1", response.text)
+
+    def test_metrics_worker_failure_code_is_sanitized(self):
+        self._add_summary_job(
+            SummaryJobStatus.FAILED.value, error_code='evil code "{x="y"}'
+        )
+        try:
+            with patch.object(settings, "METRICS_TOKEN", "t0ken"), \
+                 patch.object(settings, "CHAT_MEMORY_ENABLED", True):
+                response = self.client.get(
+                    "/api/v1/operations/metrics",
+                    headers={"Authorization": "Bearer t0ken"},
+                )
+            text = response.text
+            self.assertIn(
+                'ragkb_worker_last_failure_info{role="summary",code="failed"} 1', text
+            )
+            self.assertNotIn("evil", text)
+            self.assertIn("ragkb_worker_last_failure_timestamp_seconds", text)
+        finally:
+            self._purge_worker_observations()
 
     def test_summary_chat_counters_are_process_local(self):
         metrics.audit_write_failed()

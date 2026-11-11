@@ -100,7 +100,8 @@ class DocumentIdentityTests(unittest.TestCase):
         chunk_size = 4
         for index in range((len(data) + chunk_size - 1) // chunk_size):
             knowledge._write_chunk(kb_id or self.kb_id, session_id, self.admin_id, index,
-                                   data[index * chunk_size:(index + 1) * chunk_size])
+                                   data[index * chunk_size:(index + 1) * chunk_size],
+                                   self.request.state.auth_token_version)
         with SessionLocal() as db:
             return knowledge.complete_upload(kb_id or self.kb_id, session_id, self.request, db, self.admin)
 
@@ -223,7 +224,7 @@ class DocumentIdentityTests(unittest.TestCase):
             self.assertEqual(reused.status, status)
             # 显式重新入库是唯一的重试方式
             with SessionLocal() as db:
-                result = knowledge.reindex_document(self.kb_id, first.id, db, self.admin)
+                result = knowledge.reindex_document(self.kb_id, first.id, self.request, db, self.admin)
             self.assertEqual(result.data.status, DocumentStatus.PENDING.value)
 
     # ---- 治理：inactive canonical 不得被复用/复活，重索引不得重置治理 ----
@@ -264,9 +265,20 @@ class DocumentIdentityTests(unittest.TestCase):
             self.chunked_upload(data, filename="again.txt")
         self.assertEqual(error.exception.status_code, 409)
         self.assertEqual(self.document_count(), 1)
-        # 被拒的分片会话不留正式文件（tmp 分片由会话 TTL 处理）
-        remaining = [p for p in Path(self.temp.name).rglob("*") if p.is_file()]
-        self.assertEqual(len(remaining), 1)
+        # 本次内容明确不可采用（inactive canonical）：不产生新 Document，本次合并
+        # 文件与分片由请求自己清理，只保留 canonical 及其文件。
+        canonical_path = Path(self.fresh_document(first.data.document.id).stored_path)
+        remaining = {p for p in Path(self.temp.name).rglob("*") if p.is_file()}
+        self.assertEqual(remaining, {canonical_path})
+        # TTL/主动放弃路径也不会误删 canonical。
+        with SessionLocal() as db:
+            for session in db.scalars(select(UploadSession)).all():
+                session.updated_at = datetime.now(timezone.utc) - timedelta(hours=48)
+            db.commit()
+            upload.cleanup_expired(db)
+        self.assertTrue(canonical_path.is_file())
+        left = {p for p in Path(self.temp.name).rglob("*") if p.is_file()}
+        self.assertEqual(left, {canonical_path})
 
     def test_completed_session_replay_of_inactive_canonical_is_409(self):
         data = b"replay governed"
@@ -297,7 +309,7 @@ class DocumentIdentityTests(unittest.TestCase):
                              valid_until=valid_until, index_version=4,
                              status=DocumentStatus.READY.value)
         with SessionLocal() as db:
-            result = knowledge.reindex_document(self.kb_id, first.id, db, self.admin)
+            result = knowledge.reindex_document(self.kb_id, first.id, self.request, db, self.admin)
         self.assertEqual(result.data.status, DocumentStatus.PENDING.value)
         doc = self.fresh_document(first.id)
         self.assertEqual(doc.maintainer, "ops")
@@ -313,7 +325,7 @@ class DocumentIdentityTests(unittest.TestCase):
         self._set_governance(first.id, maintainer="ops", valid_from=valid_from,
                              status=DocumentStatus.PENDING.value)
         with SessionLocal() as db:
-            knowledge.cancel_document(self.kb_id, first.id, db, self.admin)
+            knowledge.cancel_document(self.kb_id, first.id, self.request, db, self.admin)
         doc = self.fresh_document(first.id)
         self.assertEqual(doc.maintainer, "ops")
         self.assertEqual(doc.valid_from, valid_from)
@@ -351,7 +363,7 @@ class DocumentIdentityTests(unittest.TestCase):
             session_id = session.id
         for index in range((len(data) + 3) // 4):
             knowledge._write_chunk(self.kb_id, session_id, self.admin_id, index,
-                                   data[index * 4:(index + 1) * 4])
+                                   data[index * 4:(index + 1) * 4], self.request.state.auth_token_version)
         real_assemble = upload.assemble
 
         def assemble_then_delete(db, session):
@@ -378,7 +390,7 @@ class DocumentIdentityTests(unittest.TestCase):
             session_id = session.id
         for index in range((len(data) + 3) // 4):
             knowledge._write_chunk(self.kb_id, session_id, self.admin_id, index,
-                                   data[index * 4:(index + 1) * 4])
+                                   data[index * 4:(index + 1) * 4], self.request.state.auth_token_version)
         real_assemble = upload.assemble
 
         def assemble_then_abort(db, session):
@@ -404,7 +416,7 @@ class DocumentIdentityTests(unittest.TestCase):
             session_id = session.id
         for index in range((len(data) + 3) // 4):
             knowledge._write_chunk(self.kb_id, session_id, self.admin_id, index,
-                                   data[index * 4:(index + 1) * 4])
+                                   data[index * 4:(index + 1) * 4], self.request.state.auth_token_version)
         real_assemble = upload.assemble
 
         def assemble_then_abort(db, session):
@@ -435,7 +447,7 @@ class DocumentIdentityTests(unittest.TestCase):
             session_id = session.id
         for index in range((len(data) + 3) // 4):
             knowledge._write_chunk(self.kb_id, session_id, self.admin_id, index,
-                                   data[index * 4:(index + 1) * 4])
+                                   data[index * 4:(index + 1) * 4], self.request.state.auth_token_version)
         with SessionLocal() as db:
             session = upload.get_session(db, self.kb_id, session_id, lock=True)
             assembled = upload.assemble(db, session)
@@ -460,7 +472,7 @@ class DocumentIdentityTests(unittest.TestCase):
                 sessions[name] = session.id
             for index in range((len(data) + 3) // 4):
                 knowledge._write_chunk(self.kb_id, sessions[name], self.admin_id, index,
-                                       data[index * 4:(index + 1) * 4])
+                                       data[index * 4:(index + 1) * 4], self.request.state.auth_token_version)
 
         assembled = {}
         with SessionLocal() as db:

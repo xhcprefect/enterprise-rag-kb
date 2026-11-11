@@ -252,7 +252,7 @@ class DatabaseTests(unittest.TestCase):
         did = self.add_doc()
         def cancel():
             with SessionLocal() as db:
-                knowledge.cancel_document(self.kb.id, did, db, self.admin)
+                knowledge.cancel_document(self.kb.id, did, self.request, db, self.admin)
         self.embeddings.on_embed = cancel
         ingest.ingest_document_task(str(did))
         with SessionLocal() as db:
@@ -279,7 +279,9 @@ class DatabaseTests(unittest.TestCase):
 
     def write_parts(self, session, data=b"abcdefgh"):
         for index in range(session.total_chunks):
-            knowledge._write_chunk(self.kb.id, session.id, self.admin.id, index, data[index * 4:(index + 1) * 4])
+            knowledge._write_chunk(self.kb.id, session.id, self.admin.id, index,
+                                   data[index * 4:(index + 1) * 4],
+                                   self.request.state.auth_token_version)
 
     def test_content_identity_and_owner_isolation(self):
         first = self.make_upload()
@@ -294,10 +296,12 @@ class DatabaseTests(unittest.TestCase):
     def test_chunk_replay_conflict_and_hash_mismatch(self):
         session = self.make_upload(digest=hashlib.sha256(b"XXXXXXXX").hexdigest())
         self.write_parts(session)
-        receipt = knowledge._write_chunk(self.kb.id, session.id, self.admin.id, 0, b"abcd")
+        receipt = knowledge._write_chunk(self.kb.id, session.id, self.admin.id, 0, b"abcd",
+                                   self.request.state.auth_token_version)
         self.assertFalse(receipt.created)
         with self.assertRaises(HTTPException) as error:
-            knowledge._write_chunk(self.kb.id, session.id, self.admin.id, 0, b"ZZZZ")
+            knowledge._write_chunk(self.kb.id, session.id, self.admin.id, 0, b"ZZZZ",
+                                   self.request.state.auth_token_version)
         self.assertEqual(error.exception.status_code, 409)
         with SessionLocal() as db, self.assertRaises(HTTPException) as error:
             knowledge.complete_upload(self.kb.id, session.id, self.request, db, self.admin)

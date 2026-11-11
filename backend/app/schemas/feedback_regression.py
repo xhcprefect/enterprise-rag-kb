@@ -20,7 +20,9 @@ RegressionCause = Literal[
 ]
 RequestedMode = Literal["offline", "live"]
 ValidationLevel = Literal["consistency_only", "content_regraded"]
-RunState = Literal["awaiting_report", "imported", "stale"]
+RunState = Literal["awaiting_report", "imported", "stale", "online"]
+RunExecutionKind = Literal["manual", "online"]
+JobStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
 
 _MAX_CAUSE_NOTE = 1000
 
@@ -36,6 +38,11 @@ class FeedbackRegressionRunRead(_FrozenResponse):
     attempt_no: int
     is_current: bool
     state: RunState
+    execution_kind: RunExecutionKind
+    can_import: bool
+    job_id: uuid.UUID | None
+    job_status: JobStatus | None
+    job_revision: int | None
     requested_mode: RequestedMode
     protocol_version: int
     case_sha256: str

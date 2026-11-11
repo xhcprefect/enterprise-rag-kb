@@ -1,4 +1,4 @@
-# 生产部署编排：db + api + worker(ingest) + worker-summary + worker-project + web。
+# 生产部署编排：db + api + worker(ingest) + worker-summary + worker-project + worker-regression + web。
 #
 # 数据全部落在宿主机 ${DATA_DIR}（默认 ./data）下，便于：
 #   1. 挂到独立数据盘 —— 机器若被回收，换台机器把目录拷过去即可恢复；
@@ -132,14 +132,17 @@ services:
 
   # ===== 独立角色 worker（按 profile 启动，默认不随 `up -d` 起）=====
   #
-  # 摘要与项目同步各自独占一个进程，避免长文档入库、模型摘要和项目扫描互相饿死。
+  # 摘要、项目同步与反馈回归重跑各自独占一个进程，避免长文档入库、模型摘要、
+  # 项目扫描和后台回归互相饿死。
   # 没有开启对应功能时不要启动它们：worker-summary 消费不了任务时只是空转轮询，
-  # worker-project 在 PROJECT_ALLOWED_ROOTS 为空时没有可同步的源。
+  # worker-project 在 PROJECT_ALLOWED_ROOTS 为空时没有可同步的源，
+  # worker-regression 只在管理员显式提交在线回归作业时才有任务（没有自动入队开关）。
   #
   # 启动方式：
-  #   docker compose --profile summary up -d worker-summary   # CHAT_MEMORY_ENABLED=true 时
-  #   docker compose --profile project up -d worker-project   # 配置了 PROJECT_ALLOWED_ROOTS 时
-  #   docker compose --profile summary --profile project up -d # 两者都要
+  #   docker compose --profile summary up -d worker-summary       # CHAT_MEMORY_ENABLED=true 时
+  #   docker compose --profile project up -d worker-project       # 配置了 PROJECT_ALLOWED_ROOTS 时
+  #   docker compose --profile regression up -d worker-regression # 需要后台重跑反馈回归时
+  #   docker compose --profile summary --profile project --profile regression up -d
   #
   # 维护脚本按容器标签识别“正在运行的写服务”，因此只重启原本已启动的角色。
   worker-summary:
@@ -194,6 +197,37 @@ services:
       # 真要索引宿主机目录时，管理员显式设置 PROJECT_ALLOWED_ROOTS，并**同时**在
       # api 与 worker-project 下取消同一行的注释（只读；容器内路径必须一致）：
       # - ${PROJECT_ROOT_HOST:-/srv/projects}:/srv/projects:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks: [internal]
+
+  worker-regression:
+    build:
+      context: ./backend
+    # 与 api 及 ingest/summary/project worker 同一个镜像 tag，只差启动命令。
+    image: rag-kb-backend:latest
+    restart: unless-stopped
+    # 显式 profile：默认 `docker compose up -d` 不会启动它。
+    profiles: ["regression"]
+    command: ["python", "worker.py", "--role", "regression"]
+    # 停写预算与 ingest/summary/project 相同，见 deploy/common.sh 的说明。
+    stop_grace_period: ${WORKER_STOP_TIMEOUT_SECONDS:-180}s
+    env_file:
+      - ./backend/.env
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
+      UPLOAD_DIR: /data/uploads
+      LOG_DIR: /data/logs
+      PROJECT_STORAGE_DIR: /data/projects
+    # 与 API 及其他 worker 共用同一份持久存储：后台重跑要读取上传原文与项目 blob。
+    volumes:
+      - ${DATA_DIR:-./data}/uploads:/data/uploads
+      - ${DATA_DIR:-./data}/logs:/data/logs
+      - ${DATA_DIR:-./data}/projects:/data/projects
     depends_on:
       db:
         condition: service_healthy

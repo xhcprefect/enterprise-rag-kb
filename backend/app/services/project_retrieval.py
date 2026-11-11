@@ -48,7 +48,7 @@ from app.schemas.project import (
     ProjectSearchHit,
     ProjectSearchRead,
 )
-from app.services import project_sources
+from app.services import kb_access, project_sources
 from app.services.hybrid_search import fuse_results, keyword_terms, rerank_results
 from app.services.project_paths import split_relative_path
 from app.services.project_terms import code_terms
@@ -117,8 +117,8 @@ def validate_project_binding(
     if kb is None:
         raise project_sources.ProjectSourceNotFound()
     # ACL 先于 revoke：私有已 revoke 源对无权限 stranger 呈 404，而非 410。
-    # 只有授权（管理员/拥有者）才见到 revoke 语义（410）。
-    if not user.is_admin and not kb.is_public and kb.owner_id != user.id:
+    # 只有授权（管理员/拥有者/显式成员）才见到 revoke 语义（410）。
+    if not kb_access.can_read_kb(db, kb, user):
         raise project_sources.ProjectSourceNotFound()
     if source.revoked_at is not None:
         raise project_sources.ProjectSourceRevoked()
@@ -334,14 +334,9 @@ def _scope_conditions(
     ]
     if require_chunks:
         conds.append(ProjectChunk.embedded.is_(True))
-    # KB ACL 在 SQL 内再过滤一次（初始授权之外的双保险；按当前用户）。
-    if not user.is_admin:
-        conds.append(
-            or_(
-                KnowledgeBase.is_public.is_(True),
-                KnowledgeBase.owner_id == user.id,
-            )
-        )
+    # KB ACL 在 SQL 内再过滤一次（初始授权之外的双保险；按当前用户，分页/排名前生效）。
+    # 成员读取权与统一入口共用同一相关 EXISTS，绝不先排名再在 Python 里过滤。
+    conds.append(kb_access.visible_kb_predicate(user, KnowledgeBase))
     prefix_str = _prefix_str(prefix_parts)
     if prefix_str:
         conds.append(_like_path_prefix(ProjectFileVersion.relative_path, prefix_str))

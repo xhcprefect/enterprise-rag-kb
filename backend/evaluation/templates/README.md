@@ -8,7 +8,7 @@
 
 1. 按业务分层抽样，记录抽样来源、时间范围与每层样本量。优先覆盖真实问题的原始说法、编号、单位、文档版本和时点。
 2. 根据原文标注 `expected_outcome`：有充分依据为 `answer`，资料明确不支持为 `refuse`，需要补充条件为 `clarify`。不要用模型自己生成的答案作标准答案。
-3. 为可回答问题标注来源身份及必要的原文要点；逐项检查引用是否支持结论，核对时效、单位与版本。敏感问题或资料不得提交到公开仓库。
+3. 为可回答问题标注来源身份及必要的原文要点；逐项检查引用是否支持结论，核对时效、单位与版本。标记排序指标前先固定检索范围：登记知识库、文档范围、索引代次与抽样时间，并确认相关来源已完整列出后才设 `source_labels_complete: true`。语料或范围变化后必须重新标注；未完整标注的样本不能计算 precision@K。敏感问题或资料不得提交到公开仓库。
 4. 至少一人核验；关键样本建议双人独立标注并裁定分歧。使用核验人代号和日期，未解决的问题保留在 `unknowns`，全部解决后设为空列表。
 5. 将 `reviewed` 设为 `true`，填写有效的核验人代号与日期，然后运行严格模式。`reviewed: false` 即使带有旧核验信息仍表示未核验。
 
@@ -20,6 +20,7 @@
 | `question` / `turns` | 脱敏后的真实问题或最多 10 轮提问 |
 | `expected_outcome` | `answer` / `refuse` / `clarify` |
 | `expected_sources` | 核验过的来源，可含 `chunk_index` 与 `index_version` |
+| `source_labels_complete` | 严格布尔值，缺省 `false`；只有确认固定检索范围/固定语料快照下相关来源已完整列入 `expected_sources` 时才设为 `true`。显式 `[]` + `true` 表示确认没有相关来源 |
 | `required_phrases` / `forbidden_phrases` | 必须出现的要点与禁止出现的错误口径；仍是固定断言 |
 | `stratum` | 登记的分层代号；缺省为 `unclassified` |
 | `verified_by` | 1–64 位 ASCII 代号，字母数字起始，可含 `.`、`_`、`-`；不填姓名或邮箱 |
@@ -111,7 +112,9 @@
 
 ## 基线与指标解释
 
-- 修改问题、断言、范围或样本数量会改变数据集身份，需要重建相同问题集的基线。`stratum`、`verified_by`、`verified_at`、`unknowns`、`reviewed` 是纯核验元数据，不改变问题集摘要。
+- 修改问题、断言、范围、`source_labels_complete` 或样本数量会改变数据集身份，需要重建相同问题集的基线。`stratum`、`verified_by`、`verified_at`、`unknowns`、`reviewed` 是纯核验元数据，不改变问题集摘要。
+- 当前指标口径为 `metrics_version=2`；新增的 MRR / precision@K 是排序观测，不是语义正确率，也不改变旧结果/机器指纹。`metrics_version=1` 的旧报告比较固定为 `incomparable`，必须用真实离线 CLI 重新生成基线，不能手填结论。
+- 排序指标按稳定 case ID cohort 比较：应测但缺 trace/response 的样本为 `unknown`，不补 0；零 eligible 表示该维度不适用。显式设置排序门槛时，无适用样本不能宣称通过。人工核验仍需逐条阅读答案与引用原文，排序变好不代表引用语义支持正确。
 - 每层均报告样本量和未核验数量。资料可回答率可按人工标为 `answer` 的样本占比统计；模型答案正确率与拒答正确率需依据逐条人工核验结果计算，不能从固定断言通过率推导。
 - 延迟、费用只有样本覆盖完整时才参与比较；缺测保持 `unknown`，不补零。费用仅覆盖返回实际 token 用量的回答生成。
 - 默认不使用 `--include-content`；确需人工核验时在受控目录导出，并依照自己的资料保留与访问制度管理。

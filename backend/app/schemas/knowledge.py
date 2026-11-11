@@ -35,6 +35,14 @@ class KnowledgeBaseRead(BaseModel):
     project_active_snapshot_id: uuid.UUID | None = None
     project_ready: bool = False
     project_revoked: bool = False
+    # ---- A3 成员能力（冻结契约）----
+    # membership_revision 来自 knowledge_bases 行；成员写/删除用户会递增。
+    membership_revision: int = Field(default=0, ge=0)
+    # 服务端按"当前用户 + 当前库"实时判定，不接受客户端按角色兜底：
+    # - can_manage_documents：仅 kind='upload' 且 admin 或显式 maintainer；
+    # - can_manage_members：仅 active admin（项目库管理员也可管理成员）。
+    can_manage_documents: bool = False
+    can_manage_members: bool = False
 
     model_config = {"from_attributes": True}
 

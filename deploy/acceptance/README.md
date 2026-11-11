@@ -113,7 +113,7 @@ python backend/scripts/verify_deployment.py \
 | `worker` | 入库 worker 的心跳状态：`alive`、`stale` 或 `idle`。 | 不证明摘要/项目 worker 也在运行；`idle` 不代表 worker 存活。 |
 | `metrics_auth` | 使用**本次提供的** metrics 令牌请求一次 `/api/v1/operations/metrics`，HTTP 200 即 `pass`。 | 不额外测试无令牌、错误令牌或管理员 JWT 的负例；这些鉴权边界由既有后端回归（如 `backend/tests/test_operations.py`）和人工验收覆盖。也不证明 Prometheus 已采集或指标内容完整。 |
 | `metrics_database` | 指标响应中 `ragkb_db_available=1` 且存在队列指标 `ragkb_ingest_queued_documents` 时 `pass`。 | 数据库不可用（`0`）会 `fail`；缺失、不可解析或缺少队列指标为 `unknown`，**不能把缺失读成队列为 0**；也不证明队列长期健康。 |
-| `admin_summary` | 管理员 JWT 可读取摘要，且 `degraded=false`、`database.status=ok`、`queue` 不为 `null`。 | 不证明业务数据正确、三个 worker 角色持续运行或告警已送达。 |
+| `admin_summary` | 管理员 JWT 可读取摘要，且 `degraded=false`、`database.status=ok`、`queue` 不为 `null`。 | 不证明业务数据正确、四个 worker 角色（`ingest`/`summary`/`project`/`regression`）持续运行或告警已送达。 |
 | `tls` | 目标 HTTPS 的证书链与主机名校验（按客户端默认信任库）。回环 HTTP 目标没有 TLS 可验证，记为 `unknown`。 | 不证明 HSTS、密码套件策略、反向代理/CDN 或内网链路配置。 |
 | `prometheus_readiness` | 配置的 Prometheus `/-/ready` 返回 HTTP 200。 | 只证明进程就绪；不证明抓取目标 UP、规则求值成功或告警已发送。 |
 | `alertmanager_readiness` | 配置的 Alertmanager `/-/ready` 返回 HTTP 200。 | 只证明进程就绪；**ready ≠ 通知送达**，不证明路由、接收器、重试或回执。 |
@@ -144,7 +144,7 @@ python backend/scripts/verify_deployment.py \
 | `backup_restore_rto_rpo` | `restore_drill` + `checksum`：同一版本/环境下的备份点与恢复点、实测 RTO/RPO、数据库行数与文件 SHA-256 等校验结果、复核结论。 |
 | `alert_delivery_firing_resolved` | `firing` + `resolved` + `receipt`：真实接收器收到的触发与恢复通知、唯一关联标识、接收回执与时间戳。 |
 | `member_acl_allow_deny` | `allow` + `deny`：同一批真实成员/角色在指定资源上的允许与拒绝结果，含预期 HTTP 状态。 |
-| `soak_24h` | `soak`：连续 24 小时观测记录，含起止时间、缺口策略、三个 worker 角色状态与异常记录。 |
+| `soak_24h` | `soak`：连续 24 小时观测记录，含起止时间、缺口策略、四个 worker 角色状态与异常记录。 |
 | `soak_72h` | `soak`：连续 72 小时观测记录，要求同上。 |
 
 ### 等级与通过条件
@@ -207,7 +207,7 @@ python backend/scripts/verify_deployment.py \
 - 生产服务器、网络、域名、TLS 证书链与安全组/代理配置。
 - 真实生产备份的恢复演练、实测 RTO/RPO、数据与文件校验。
 - 真实通知接收器收到的 firing/resolved 及回执。
-- 24 小时与 72 小时连续运行（soak）记录，以及三个 worker 角色的持续状态。
+- 24 小时与 72 小时连续运行（soak）记录，以及四个 worker 角色（`ingest`/`summary`/`project`/`regression`）的持续状态。仓库当前**没有**这两段真实证据，仍保持 `unknown`；不能把接线测试或短时回归描述为已完成 soak。
 - 真实成员/角色的 ACL 允许与拒绝结果。
 - 生产部署版本/环境身份（镜像 digest、提交号与部署记录）。
 

@@ -141,7 +141,13 @@ def verify_stub_owner(state: Any, *, owner: str, nonce: str) -> None:
     if state.get("nonce") != nonce:
         raise ValueError("替身 nonce 不匹配：指向了别的运行的替身")
 
-WORKER_ROLES = {"worker": "ingest", "worker-summary": "summary", "worker-project": "project"}
+WORKER_ROLES = {
+    "worker": "ingest",
+    "worker-summary": "summary",
+    "worker-project": "project",
+    # 第四角色：独立进程消费 feedback regression 在线作业。
+    "worker-regression": "regression",
+}
 
 WORKER_BOOT = """
 import os, runpy, sys
@@ -735,7 +741,8 @@ class Orchestrator:
                  str(self.repo / "backend"), role, "--ragkb-e2e-nonce", self.nonce],
                 env=self.child_env(), cwd=self.out_dir,
             )
-        # 三个角色各自消费队列；启动即退出不能发布 READY。
+        # 每个角色各自消费自己的队列；任何角色启动即退出都不能发布 READY，
+        # 包括 regression——少起一个角色会让在线回归作业无人消费。
         time.sleep(1.0)
         for name in WORKER_ROLES:
             child = self.children[name]

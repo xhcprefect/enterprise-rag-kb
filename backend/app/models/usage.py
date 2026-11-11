@@ -31,6 +31,7 @@ class ModelUsage(Base):
         Index("ix_model_usage_time", "occurred_at"),
         Index("ix_model_usage_user_time", "user_id", "occurred_at"),
         Index("ix_model_usage_turn_operation", "turn_id", "operation"),
+        Index("ix_model_usage_regression_job", "regression_job_id"),
         UniqueConstraint("origin_key", name="uq_model_usage_origin"),
     )
 
@@ -45,6 +46,8 @@ class ModelUsage(Base):
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     turn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # 在线反馈回归作业关联；裸 UUID、无外键/级联：反馈或作业删除后用量仍保留。
+    regression_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     provider: Mapped[str] = mapped_column(String(128), nullable=False)
     model: Mapped[str] = mapped_column(String(256), nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)

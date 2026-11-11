@@ -111,6 +111,45 @@ def ensure_foundation_schema(conn) -> None:
             "ON messages (conversation_id, turn_seq, role) WHERE turn_seq IS NOT NULL"
         ))
 
+    # A1 成员权限基础：与既有 init_db -> ensure_foundation_schema 调用链一起执行，
+    # 不新增对 init_db.py 的侵入（该文件不在本轮 A1 所有权内）。
+    ensure_kb_membership_schema(conn)
+
+
+# 成员权限基础的新增列（A1）：老库只补列，不重写任何老业务数据。
+# ``membership_revision`` 必须有真实 server default，老行在 ALTER 时回填 0，
+# 且绕过 ORM 的 INSERT 也得到确定值。
+_KB_MEMBER_COLUMNS: dict[str, dict[str, str]] = {
+    "knowledge_bases": {
+        "membership_revision": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
+
+def ensure_kb_membership_schema(conn) -> None:
+    """幂等补齐知识库成员基础 schema（A1）。
+
+    - ``knowledge_bases.membership_revision``：已存在的表只补缺失列，保留所有
+      原有行；列已存在时不做任何重写。两遍初始化结果一致。
+    - 新表 ``knowledge_base_members`` 由 ``Base.metadata.create_all`` 创建（含
+      复合主键、FK CASCADE、CHECK、user_id 索引），本函数不重复建表，也绝不
+      删除/重建老表。
+    """
+    table_names = {
+        row[0]
+        for row in conn.execute(
+            text("SELECT table_name FROM information_schema.tables "
+                 "WHERE table_schema = current_schema()")
+        )
+    }
+    for table, columns in _KB_MEMBER_COLUMNS.items():
+        if table not in table_names:
+            continue
+        existing = _existing_columns(conn, table)
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
 
 def plan_legacy_turn_seq(rows) -> dict[str, int]:
     """为旧 chat 完整轮确定性补序，返回 {message_id: turn_seq}（只含本次应写 NULL 行）。

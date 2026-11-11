@@ -6,6 +6,12 @@ export default {
       title: '文档管理',
       subtitle: '上传文档后系统会自动解析、切分并向量化入库',
       upload: '上传文档',
+      capability: {
+        readOnly: '只读：不能上传或维护文档。',
+        unknown: '维护权限未确认，请刷新。',
+        revoked: '维护权限已失效，操作已停止；请刷新。',
+        unavailable: '无法确认维护权限，操作已停用。'
+      },
       formatsLabel: '支持格式',
       formatsTip: '大文件分片上传，可暂停、可断点续传',
       resumeAction: '继续上传',
@@ -315,6 +321,12 @@ export default {
       title: 'Documents',
       subtitle: 'Uploaded documents are parsed, split, and indexed automatically',
       upload: 'Upload document',
+      capability: {
+        readOnly: 'Read-only; upload and maintenance disabled.',
+        unknown: 'Maintenance permission unconfirmed. Refresh.',
+        revoked: 'Maintenance permission lost; actions stopped. Refresh.',
+        unavailable: 'Maintenance permission unconfirmed; actions disabled.'
+      },
       formatsLabel: 'Supported formats',
       formatsTip: 'Large files upload in chunks. You can pause and resume anytime.',
       resumeAction: 'Resume upload',

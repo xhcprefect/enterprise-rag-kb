@@ -7,7 +7,12 @@ from sqlalchemy import and_, false, or_, select
 from app.models import Document, DocumentStatus
 from app.services.document_lifecycle import is_retrievable, retrievable_conditions, utc_now
 
+# 用户会话显式选择的文档上限；scope_ids/resolve_scope/validate_scope 与
+# scope_pairs 的默认值都保持这条严格边界。
 MAX_SCOPE_DOCUMENTS = 5
+# 内部检索清单（在线回归冻结的执行范围等）有界上限。只允许检索路径显式使用，
+# 不能反过来放宽用户会话选择；超限明确拒绝，绝不截断。
+MAX_INTERNAL_SCOPE_DOCUMENTS = 256
 
 
 def scope_ids(values) -> list[uuid.UUID]:
@@ -57,8 +62,23 @@ def resolve_scope(db, kb_id, identifiers, *, expected_versions: dict[str, int] |
     return result
 
 
-def scope_pairs(scope: list[dict]) -> list[tuple[uuid.UUID, int]]:
-    if not isinstance(scope, list) or len(scope) > MAX_SCOPE_DOCUMENTS:
+def _scope_limit(max_documents: int) -> int:
+    """上限本身也必须是严格非负整数；坏参数失败关闭，不能静默当成 0 或无限。"""
+    if not isinstance(max_documents, int) or isinstance(max_documents, bool) or max_documents < 0:
+        raise ValueError("Invalid document scope limit")
+    return max_documents
+
+
+def scope_pairs(scope, *, max_documents: int = MAX_SCOPE_DOCUMENTS) -> list[tuple[uuid.UUID, int]]:
+    """规范文档身份。
+
+    默认仍是用户会话上限 5；只有检索路径可显式传入
+    ``max_documents=MAX_INTERNAL_SCOPE_DOCUMENTS`` 接纳内部冻结清单。
+    超过所给上限一律拒绝，绝不截断。内部清单可以由执行上下文以 tuple 提供，
+    用户请求仍以 HTTP 列表校验（``scope_ids``）为唯一入口。
+    """
+    limit = _scope_limit(max_documents)
+    if not isinstance(scope, (list, tuple)) or len(scope) > limit:
         raise ValueError("Invalid document scope")
     result, seen = [], set()
     for item in scope:
@@ -77,16 +97,20 @@ def scope_pairs(scope: list[dict]) -> list[tuple[uuid.UUID, int]]:
 
 def validate_scope(db, kb_id, scope: list[dict], *, lock: bool = False) -> list[dict]:
     try:
-        pairs = scope_pairs(scope)
+        pairs = scope_pairs(scope, max_documents=MAX_SCOPE_DOCUMENTS)
     except (ValueError, TypeError, AttributeError) as exc:
         raise HTTPException(409, "文档范围已失效，请重新选择或取消范围") from exc
     return resolve_scope(db, kb_id, [identifier for identifier, _ in pairs], lock=lock,
                          expected_versions={str(identifier): version for identifier, version in pairs})
 
 
-def scope_filter(scope: list[dict]):
-    """None 由调用者表示不限制；显式空范围在 SQL 层返回空结果。"""
-    pairs = scope_pairs(scope)
+def scope_filter(scope, *, max_documents: int = MAX_INTERNAL_SCOPE_DOCUMENTS):
+    """检索 SQL 的文档范围谓词；None 仍由调用者表示不限制。
+
+    此函数只服务于检索 SQL，默认接纳有界内部清单 256；显式空范围在 SQL 层返回
+    空结果。用户会话选择仍必须先经 ``scope_ids`` / ``validate_scope`` 的 5 份限制。
+    """
+    pairs = scope_pairs(scope, max_documents=max_documents)
     return or_(*(and_(Document.id == identifier, Document.index_version == version)
                  for identifier, version in pairs)) if pairs else false()
 
@@ -108,11 +132,18 @@ def from_verified_pairs(pairs) -> list[dict]:
     return result
 
 
-def contains(scope: list[dict], metadata: dict) -> bool:
+def contains(scope, metadata: dict, *, max_documents: int = MAX_INTERNAL_SCOPE_DOCUMENTS) -> bool:
+    """候选是否属于范围；检索身份判定默认接纳有界内部清单 256。
+
+    ``contains`` 只做成员判定，不扩大选择入口：用户会话范围仍必须先经
+    ``scope_ids`` / ``validate_scope`` 的 5 份限制，普通 chat 传入的已是合法范围。
+    需要按更小边界复核时可显式传 ``max_documents=MAX_SCOPE_DOCUMENTS``。
+    """
     try:
         version = metadata.get("index_version", 0)
         if not isinstance(version, int) or isinstance(version, bool) or version < 0:
             return False
-        return (uuid.UUID(str(metadata.get("document_id"))), version) in scope_pairs(scope)
+        return (uuid.UUID(str(metadata.get("document_id"))), version) in scope_pairs(
+            scope, max_documents=max_documents)
     except (ValueError, TypeError, AttributeError):
         return False

@@ -52,6 +52,27 @@ def _stop_requested(stop_event) -> bool:
     return stop_event is not None and stop_event.is_set()
 
 
+# 专用解析错误的用户提示长度上限：即便未来新增文案也不能无限膨胀。
+MAX_PUBLIC_ERROR_CHARS = 300
+
+
+def _safe_parse_message(exc: BaseException) -> str | None:
+    """只接受专用 PDF 解析错误的固定/有界提示；其它异常返回 None 走通用文案。
+
+    文案由 ``pdf_documents`` 用固定字符串与本地页号整数拼出，不含路径、原文或
+    上游异常正文；这里再做一次类型与长度兜底。
+    """
+    from app.services.pdf_documents import PdfParseError
+
+    if not isinstance(exc, PdfParseError):
+        return None
+    message = exc.public_message if isinstance(exc.public_message, str) else ""
+    message = message.strip()
+    if not message or len(message) > MAX_PUBLIC_ERROR_CHARS:
+        return None
+    return message
+
+
 @dataclass(frozen=True)
 class IngestJob:
     document_id: uuid.UUID
@@ -395,7 +416,11 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None, *,
                 try:
                     doc = _locked_doc(db, job, allow_cancel=True)
                     doc.status = DocumentStatus.FAILED.value
-                    doc.error_message = "文档处理失败，请联系管理员检查日志"
+                    # 只有专用解析错误可以给出固定/有边的安全提示；其它异常（含
+                    # PyMuPDF、数据库或网络的第三方消息）保持原通用文案，绝不回显
+                    # str(exc)、路径或原文。
+                    doc.error_message = (_safe_parse_message(exc)
+                                         or "文档处理失败，请联系管理员检查日志")
                     doc.lease_id = None
                     db.commit()
                 except IngestLeaseLost:

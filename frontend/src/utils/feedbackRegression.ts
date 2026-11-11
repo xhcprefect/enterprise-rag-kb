@@ -7,6 +7,10 @@ import type {
   FeedbackRegressionRunState,
   FeedbackRegressionValidationLevel
 } from '../api/index.ts'
+import type {
+  FeedbackRegressionExecutionKind,
+  FeedbackRegressionJobStatus
+} from '../api/feedbackRegressionJobs.ts'
 
 /** 后端冻结的原因枚举；顺序与下拉展示一致。 */
 export const REGRESSION_CAUSES: readonly FeedbackRegressionCause[] = [
@@ -24,7 +28,8 @@ export const REGRESSION_MODES: readonly FeedbackRegressionMode[] = ['offline', '
 export const REGRESSION_RUN_STATES: readonly FeedbackRegressionRunState[] = [
   'awaiting_report',
   'imported',
-  'stale'
+  'stale',
+  'online'
 ]
 
 export const REGRESSION_VALIDATION_LEVELS: readonly FeedbackRegressionValidationLevel[] = [
@@ -48,6 +53,17 @@ export const REGRESSION_UNAVAILABLE_REASONS: readonly string[] = [
   'chunk_missing',
   'version_mismatch',
   'sample_changed'
+]
+
+/**
+ * R1a 新增的固定范围/项目快照阻断码只在懒加载反馈页面使用；对应文案在
+ * feedbackRegressionJobs 懒加载 catalog 中，不进入全局入口。
+ */
+export const REGRESSION_ONLINE_UNAVAILABLE_REASONS: readonly string[] = [
+  'manifest_overflow',
+  'scope_invalid',
+  'project_snapshot_invalid',
+  'project_snapshot_changed'
 ]
 
 /** 原因说明上限：与后端 FeedbackRegressionCreateRequest 保持一致。 */
@@ -81,6 +97,9 @@ export function isKnownUnavailableReason(value: string): boolean {
 
 /** 已知阻断码映射到专属文案；未知码返回通用回退 key（调用方附带原始 reason）。 */
 export function unavailableReasonKey(reason: string | null | undefined): string {
+  if (reason && REGRESSION_ONLINE_UNAVAILABLE_REASONS.includes(reason)) {
+    return `feedbackJobs.unavailable.${reason}`
+  }
   return reason && isKnownUnavailableReason(reason)
     ? `feedback.regression.unavailable.${reason}`
     : 'feedback.regression.unavailable.unknown'
@@ -94,8 +113,14 @@ export function regressionModeKey(mode: FeedbackRegressionMode): string {
   return `feedback.regression.modes.${mode}`
 }
 
+/** online 轮次没有人工导入语义；其余状态沿用原手工轮次命名空间。 */
 export function runStateKey(state: FeedbackRegressionRunState): string {
-  return `feedback.regression.state.${state}`
+  return state === 'online' ? 'feedbackJobs.runState.online' : `feedback.regression.state.${state}`
+}
+
+/** 轮次执行种类；manual 标签放在懒加载 catalog，避免入口增长。 */
+export function executionKindKey(kind: FeedbackRegressionExecutionKind): string {
+  return `feedbackJobs.executionKind.${kind}`
 }
 
 /** 未导入或历史数据缺失校验级别时返回空串，由界面显示占位符。 */
@@ -111,10 +136,16 @@ export function failureLabel(code: string): string {
   return code
 }
 
+/**
+ * 后端显式给出 can_import 后以它为准：在线轮次即使数据形状类似也永远不能导入。
+ * 旧响应缺该字段时保持原判断，兼容既有手工闭环。
+ */
 export function canImport(
-  run: Pick<FeedbackRegressionRun, 'is_current' | 'state'> | null | undefined
+  run: (Pick<FeedbackRegressionRun, 'is_current' | 'state'> & { can_import?: boolean }) | null | undefined
 ): boolean {
-  return !!run && run.is_current && run.state === 'awaiting_report'
+  if (!run) return false
+  if (run.can_import === false) return false
+  return !!run.is_current && run.state === 'awaiting_report'
 }
 
 /** imported/stale 都已有最终摘要，不能再导入或改变该轮状态。 */
@@ -126,13 +157,29 @@ export function isTerminalRun(
 
 /**
  * 轮次结论的展示 key：
+ * - 在线执行按真实 job_status 区分排队/运行/成功+断言/执行失败/取消；
  * - consistency_only 通过：只能称“报告声明通过（未重算断言）”；
  * - content_regraded 通过：称“断言复算通过（待人工复核）”；
  * - 其余 imported 记录（缺少校验级别等）按离线/一般导入说明，绝不推断为通过。
  */
 export function describeRunOutcome(
-  run: Pick<FeedbackRegressionRun, 'state' | 'validation_level' | 'passed' | 'requested_mode'>
+  run: Pick<FeedbackRegressionRun, 'state' | 'validation_level' | 'passed' | 'requested_mode'> & {
+    execution_kind?: FeedbackRegressionExecutionKind
+    state?: FeedbackRegressionRunState
+    job_status?: FeedbackRegressionJobStatus | null
+  }
 ): string {
+  if (run.execution_kind === 'online' || run.state === 'online') {
+    if (run.job_status === 'queued') return 'feedbackJobs.runOutcome.onlineQueued'
+    if (run.job_status === 'running') return 'feedbackJobs.runOutcome.onlineRunning'
+    if (run.job_status === 'failed') return 'feedbackJobs.runOutcome.onlineFailed'
+    if (run.job_status === 'cancelled') return 'feedbackJobs.runOutcome.onlineCancelled'
+    if (run.job_status === 'succeeded') {
+      if (run.passed === true) return 'feedbackJobs.runOutcome.onlineSucceededPassed'
+      if (run.passed === false) return 'feedbackJobs.runOutcome.onlineSucceededFailed'
+    }
+    return 'feedbackJobs.runOutcome.onlineUnknown'
+  }
   if (run.state === 'stale') return 'feedback.regression.outcome.stale'
   if (run.state === 'awaiting_report') return 'feedback.regression.outcome.awaitingReport'
   if (run.passed === true) {

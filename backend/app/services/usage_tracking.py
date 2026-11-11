@@ -27,6 +27,8 @@ class UsageContext:
     turn_id: uuid.UUID | None = None
     document_id: uuid.UUID | None = None
     operation: str = "generation"
+    # 在线反馈回归作业关联；追加在原有六字段之后，旧位置参数与 for_operation 保持兼容。
+    regression_job_id: uuid.UUID | None = None
 
     def for_operation(self, operation: str):
         return replace(self, operation=operation)
@@ -167,6 +169,7 @@ class ModelCall:
                       user_id=select(User.id).where(User.id == ctx.user_id).scalar_subquery() if ctx.user_id else None,
                       kb_id=select(KnowledgeBase.id).where(KnowledgeBase.id == ctx.kb_id).scalar_subquery() if ctx.kb_id else None,
                       conversation_id=ctx.conversation_id, turn_id=ctx.turn_id, document_id=ctx.document_id,
+                      regression_job_id=ctx.regression_job_id,
                       provider=self.provider, model=self.model, kind=self.kind, operation=operation,
                       status=status, source="provider", currency="CNY", **self.usage, **self.price,
                       input_cost=input_cost, output_cost=output_cost, estimated_cost=cost)

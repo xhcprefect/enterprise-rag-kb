@@ -13,10 +13,26 @@
 #   ragkb_ingest_stale_processing_documents            processing 且心跳缺失/超过 INGEST_STALE_SECONDS
 #   ragkb_ingest_oldest_pending_age_seconds            最老 pending 文档的年龄（无 pending 时不输出）
 #   ragkb_db_pool_{size,checked_in,checked_out,overflow,total,capacity}  SQLAlchemy 连接池
+#   ragkb_workers_available                            1/0，本次 worker 角色观测查询是否成功
+#   ragkb_worker_enabled{role}                         该角色是否在当前 API 配置中启用（只看配置）
+#   ragkb_worker_alive{role}                           45 秒内有新鲜心跳的 worker 实例数
+#   ragkb_worker_pending_tasks{role}                   角色队列 pending 数
+#   ragkb_worker_processing_tasks{role}                角色队列 processing 数
+#   ragkb_worker_stale_tasks{role}                     processing 且心跳/租约过期（沿用各角色既有语义）
+#   ragkb_worker_oldest_pending_age_seconds{role}      最老 pending 任务年龄（无 pending 时不输出）
+#   ragkb_worker_last_failure_timestamp_seconds{role}  最近失败记录的更新时间（无失败时不输出）
+#   ragkb_worker_last_failure_info{role,code}          最近失败的安全码（固定白名单）
 #
-# 注意：项目里**没有**“worker 最近一次成功处理时间”指标，因此这里用
-# “队列堆积 + 陈旧 processing + 最老 pending 年龄”组合判断 worker 是否停摆，
-# 不虚构一个不存在的 last_success 指标。
+# 注意：
+#   - role 由后端固定输出四个：ingest / summary / project / regression（反馈回归
+#     后台重跑）。四者共用下列既有规则与同一 role 标签，本文件不为某个角色另建规则。
+#   - 四者的存活判断都与“角色是否启用”无关——未启用的角色只要真的有心跳也会显示
+#     alive；
+#   - 采集失败时（ragkb_workers_available==0）worker 存活/队列指标整体缺失，绝不能
+#     把“采不到”当成 0，因此告警用 `== 0` 明确区分“0 个存活实例”与“指标缺失”；
+#   - 项目里**没有**“worker 最近一次成功处理时间”指标，因此这里用
+#     “队列堆积 + 陈旧 processing + 最老 pending 年龄 + 存活实例为 0”组合判断 worker
+#     是否停摆，不虚构一个不存在的 last_success 指标。
 groups:
   - name: ragkb-ingest
     interval: 30s
@@ -32,6 +48,66 @@ groups:
           description: >-
             采集接口本身可达，但队列摘要查询失败或超时（OPERATIONS_DB_TIMEOUT_SECONDS）。
             此时队列指标整体缺失，不能据此判断队列为空；先检查 db 容器与连接池。
+
+      - alert: RagkbWorkerObservationUnavailable
+        expr: ragkb_workers_available == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "运维指标无法读取 worker 状态"
+          description: >-
+            worker 角色心跳/队列查询失败或超时。此时 ragkb_worker_alive 等指标整体缺失，
+            不能据此判断 worker 已停；先检查 db 容器、连接池与采集日志。
+
+      # ---------- 启用角色停摆（心跳） ----------
+      # 只看“已启用”的角色：未启用角色本就不该有实例，不应告警。
+      # 用 == 0 而非 < 1：仅当指标确实存在（采集成功）时才触发，缺失时由上一个告警负责。
+      - alert: RagkbWorkerRoleDown
+        expr: |
+          (ragkb_worker_alive == 0)
+          and (ragkb_worker_enabled == 1)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "已启用的 {{ $labels.role }} worker 没有新鲜心跳"
+          description: >-
+            该角色已启用，但 45 秒内没有任何存活实例的心跳（ragkb_worker_alive==0）。
+            常见原因：对应角色的 worker 进程未启动或已崩溃。请确认 `python worker.py
+            --role {{ $labels.role }}`（ingest 为默认角色）是否在运行。
+
+      # ---------- 启用角色积压但无人消费 ----------
+      # 真实数量放在 LHS：`and` 只保留左侧样本与标签，value 来自左侧。
+      # 不写 on(role)：只用完整标签（含 job/instance）匹配同一采集目标的同一次快照，
+      # 避免跨 job/instance 的“同 role”样本被错误配对。
+      - alert: RagkbWorkerRoleQueueStalled
+        expr: |
+          (ragkb_worker_pending_tasks > 0)
+          and (ragkb_worker_alive == 0)
+          and (ragkb_worker_enabled == 1)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "已启用的 {{ $labels.role }} 角色有 {{ $value }} 个待处理任务且无存活实例"
+          description: >-
+            该角色有待处理任务，但没有任何新鲜心跳的实例，说明消费已停滞。
+            检查进程是否在运行、是否卡在模型调用或数据库慢查询。
+
+      # ---------- 启用角色存在陈旧 processing ----------
+      - alert: RagkbWorkerRoleProcessingStuck
+        expr: |
+          (ragkb_worker_stale_tasks > 0)
+          and (ragkb_worker_enabled == 1)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.role }} 角色有 {{ $value }} 个 processing 任务心跳/租约超时"
+          description: >-
+            正常应由各角色 worker 的恢复扫描退回 pending 续传。持续存在说明对应角色
+            worker 没在跑、或无法写回心跳（数据库/租约问题）。
 
       # ---------- 积压 ----------
       - alert: RagkbIngestQueueBacklog

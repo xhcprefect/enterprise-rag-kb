@@ -62,6 +62,14 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "source_metadata": "JSONB NOT NULL DEFAULT '{}'::jsonb",
         "search_text": "TEXT NOT NULL DEFAULT ''",
     },
+    "feedback_regression_runs": {
+        # R1b：旧准备/导入轮次补列后保持 manual；在线作业轮次显式写 online。
+        "execution_kind": "VARCHAR(16) NOT NULL DEFAULT 'manual'",
+    },
+    "model_usage": {
+        # 在线反馈回归作业关联；裸 UUID、无级联外键。
+        "regression_job_id": "UUID",
+    },
 }
 
 
@@ -143,6 +151,44 @@ def _ensure_document_governance_constraints(conn) -> None:
         )
 
 
+
+def _ensure_feedback_regression_request_scope(conn, table_names: set[str]) -> None:
+    """R1b 幂等迁移：请求幂等键从“全局 UUID”改为“管理员 + UUID”。
+
+    旧版本给 ``feedback_regression_jobs.request_id`` / ``feedback_regression_batches.request_id``
+    建的是全局唯一约束，会让两个管理员无法各自使用同一个客户端 UUID。这里显式删除旧约束
+    （及其索引），再按 ``(admin_id, request_id)`` 建唯一索引；可重复执行。
+    """
+    targets = (
+        ("feedback_regression_jobs", "uq_feedback_regression_jobs_request",
+         "uq_feedback_regression_jobs_admin_request"),
+        ("feedback_regression_batches", "uq_feedback_regression_batches_request",
+         "uq_feedback_regression_batches_admin_request"),
+    )
+    for table, old_name, new_name in targets:
+        if table not in table_names:
+            continue
+        conn.execute(text(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {old_name}"))
+        conn.execute(text(f"DROP INDEX IF EXISTS {old_name}"))
+        # 老库的 admin_id 列由 R1b 更早版本建表时已存在；若表是更早的实验版本且缺列，
+        # 这里补一个可空列，保证唯一索引能建立（缺失归属的旧行彼此不冲突）。
+        columns = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = :t"
+                ),
+                {"t": table},
+            )
+        }
+        if "admin_id" not in columns:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN admin_id UUID"))
+        conn.execute(text(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {new_name} "
+            f"ON {table} (admin_id, request_id)"
+        ))
+
 def init_db(create_admin: bool = True) -> None:
     """建表 + 幂等迁移。``create_admin`` 只在 API 进程里为 True。
 
@@ -179,6 +225,9 @@ def init_db(create_admin: bool = True) -> None:
 
         if "documents" in table_names:
             _ensure_document_governance_constraints(conn)
+
+        # R1b：请求幂等键按管理员隔离的真实迁移（旧全局唯一约束 -> admin+UUID 唯一索引）。
+        _ensure_feedback_regression_request_scope(conn, table_names)
 
         if "messages" in table_names:
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_turn_role ON messages (turn_id, role)"))
@@ -235,6 +284,17 @@ def init_db(create_admin: bool = True) -> None:
 
         # 已存在的计量表也补上索引，避免启动补录检查逐条扫描整个账本。
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_model_usage_turn_operation ON model_usage (turn_id, operation)"))
+        # R1b：在线回归用量关联索引；老库由这里幂等补齐（create_all 不补缺失索引）。
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_model_usage_regression_job ON model_usage (regression_job_id)"))
+        if "feedback_regression_runs" in table_names:
+            # 兼容曾经手工补过可空列/缺省值的老库：已知 NULL 语义只可能是旧 manual。
+            conn.execute(text(
+                "UPDATE feedback_regression_runs SET execution_kind = 'manual' "
+                "WHERE execution_kind IS NULL"
+            ))
+            conn.execute(text(
+                "ALTER TABLE feedback_regression_runs ALTER COLUMN execution_kind SET DEFAULT 'manual'"
+            ))
         # 独立计量表随 create_all 创建；补录仅接受历史中明确返回的实际用量。
         from app.services.usage_statistics import initialize_usage
         initialize_usage(conn)

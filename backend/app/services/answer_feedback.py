@@ -32,7 +32,7 @@ from app.models.feedback import (
     AnswerFeedback,
 )
 from app.schemas.feedback import FeedbackCreate, FeedbackReviewRequest
-from app.services import document_lifecycle, project_chat_scope
+from app.services import document_lifecycle, kb_access, project_chat_scope
 from app.services.evaluation import (
     EvaluationError,
     dataset_identity,
@@ -135,7 +135,7 @@ def _validate_feedback_target(db: DBSession, user: User, message_id: uuid.UUID) 
         kb = db.get(KnowledgeBase, conversation.kb_id)
         if kb is None:
             raise HTTPException(status_code=404, detail="知识库不存在")
-        if not user.is_admin and not kb.is_public and kb.owner_id != user.id:
+        if not kb_access.can_read_kb(db, kb, user):
             raise HTTPException(status_code=403, detail="无权访问该知识库")
     if conversation.mode == "rag" and kb is None:
         raise HTTPException(status_code=404, detail="知识库不存在")
@@ -707,7 +707,7 @@ def _case_for_feedback(db: DBSession, admin: User, feedback: AnswerFeedback) -> 
         kb = db.get(KnowledgeBase, conversation.kb_id)
         if kb is None:
             raise HTTPException(status_code=404, detail="知识库不存在")
-        if not admin.is_admin and not kb.is_public and kb.owner_id != admin.id:
+        if not kb_access.can_read_kb(db, kb, admin):
             raise HTTPException(status_code=403, detail="无权访问该知识库")
     if conversation.mode == "rag" and kb is None:
         raise HTTPException(status_code=404, detail="知识库不存在")

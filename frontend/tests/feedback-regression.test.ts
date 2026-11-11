@@ -10,6 +10,7 @@ import {
   buildPreparePayload,
   canImport,
   describeRunOutcome,
+  executionKindKey,
   failureLabel,
   isRegressionCause,
   isRegressionMode,
@@ -31,6 +32,7 @@ function run(overrides: Partial<FeedbackRegressionRun> = {}): FeedbackRegression
     attempt_no: 1,
     is_current: true,
     state: 'awaiting_report',
+    execution_kind: 'manual',
     requested_mode: 'offline',
     protocol_version: 1,
     case_sha256: 'a'.repeat(64),
@@ -274,6 +276,46 @@ test('isTerminalRun treats imported and stale attempts as final', () => {
   assert.equal(isTerminalRun(run({ state: 'imported' })), true)
   assert.equal(isTerminalRun(run({ state: 'stale' })), true)
   assert.equal(isTerminalRun(null), false)
+})
+
+test('online runs use lazy job labels and never expose manual import', () => {
+  assert.equal(runStateKey('online'), 'feedbackJobs.runState.online')
+  assert.equal(executionKindKey('manual'), 'feedbackJobs.executionKind.manual')
+  assert.equal(executionKindKey('online'), 'feedbackJobs.executionKind.online')
+
+  for (const reason of [
+    'manifest_overflow',
+    'scope_invalid',
+    'project_snapshot_invalid',
+    'project_snapshot_changed'
+  ]) {
+    assert.equal(unavailableReasonKey(reason), `feedbackJobs.unavailable.${reason}`)
+  }
+
+  const online = (overrides: Partial<FeedbackRegressionRun> = {}) => run({
+    state: 'online',
+    execution_kind: 'online',
+    requested_mode: 'live',
+    can_import: false,
+    ...overrides
+  })
+
+  assert.equal(canImport(online()), false)
+  assert.equal(canImport(online({ state: 'awaiting_report' })), false)
+  assert.equal(describeRunOutcome(online({ job_status: 'queued' })), 'feedbackJobs.runOutcome.onlineQueued')
+  assert.equal(describeRunOutcome(online({ job_status: 'running' })), 'feedbackJobs.runOutcome.onlineRunning')
+  assert.equal(describeRunOutcome(online({ job_status: 'failed' })), 'feedbackJobs.runOutcome.onlineFailed')
+  assert.equal(describeRunOutcome(online({ job_status: 'cancelled' })), 'feedbackJobs.runOutcome.onlineCancelled')
+  assert.equal(
+    describeRunOutcome(online({ job_status: 'succeeded', passed: true })),
+    'feedbackJobs.runOutcome.onlineSucceededPassed'
+  )
+  assert.equal(
+    describeRunOutcome(online({ job_status: 'succeeded', passed: false })),
+    'feedbackJobs.runOutcome.onlineSucceededFailed'
+  )
+  assert.equal(describeRunOutcome(online()), 'feedbackJobs.runOutcome.onlineUnknown')
+  assert.equal(isTerminalRun({ state: 'online' }), true)
 })
 
 test('failureLabel returns the stable machine code verbatim', () => {

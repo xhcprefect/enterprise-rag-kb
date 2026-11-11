@@ -114,6 +114,11 @@ class FeedbackRegressionRun(Base):
         nullable=False,
     )
     requested_mode: Mapped[str] = mapped_column(String(8), nullable=False)
+    # 轮次执行种类：manual = 旧准备/导出/导入；online = 持久作业执行。
+    # 老库由 init_db 幂等补列并以 ``manual`` 回填，旧轮次语义不变。
+    execution_kind: Mapped[str] = mapped_column(
+        String(16), default="manual", server_default="manual", nullable=False
+    )
     # 准备时冻结的反馈版本与结果指纹：绑定变化后该轮只能作为历史。
     feedback_revision: Mapped[int] = mapped_column(Integer, nullable=False)
     feedback_result_sha256: Mapped[str] = mapped_column(String(64), nullable=False)

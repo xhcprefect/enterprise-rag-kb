@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
  * 这里**不**启动任何被测服务：API / worker / PostgreSQL / 模型替身 / Vite preview
  * 都由 `backend/scripts/e2e_env.py up` 起，Playwright 只负责开 Chromium。
  * 原因有两个：
- *   1. 真实链路要求 API 与 ingest / summary / project 三个 worker 各自独立运行；
+ *   1. 真实链路要求 API 与 ingest / summary / project / regression 四个 worker 各自独立运行；
  *   2. 环境必须独占且可清理，teardown 逻辑只应有一处。
  *
  * 环境变量：

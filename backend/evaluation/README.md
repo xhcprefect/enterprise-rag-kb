@@ -13,8 +13,13 @@
 | `responses.platform.regressed.example.jsonl` | 断言退步样例（两条引用落到错误片段/旧代次） |
 | `responses.platform.slow.example.jsonl` | 断言不变、延迟显著变慢样例 |
 | `responses.platform.missing-metrics.example.jsonl` | 缺少 `first_token_ms` 的缺指标样例 |
-| `baseline.platform.example.json` | 固定 run ID 的离线基线报告（无正文），用于比较门禁 |
+| `baseline.platform.example.json` | 固定 run ID 的离线基线报告（metrics_version=2，无正文），用于比较门禁 |
+| `cases.ranking.example.jsonl` / `responses.ranking.example.jsonl` | 2 条独立合成回放：来源顺序正常、来源标注完整，用于 MRR / precision@K |
+| `responses.ranking.regressed.example.jsonl` | 只改变 trace 顺序的排序退化样例；召回、答案、引用与 v1 指纹不变 |
+| `responses.ranking.missing-trace.example.jsonl` | 应测 case 缺 trace 的 unknown 样例 |
+| `baseline.ranking.example.json` | 排序样例的固定 run ID 离线基线（由 CLI 生成） |
 | `thresholds.example.json` | 延迟/费用的相对阈值示例 |
+| `thresholds.ranking.example.json` | 显式启用 4 项排序门槛的示例 |
 | `templates/` | 真实业务问题标注、结果核验 JSON 模板与人工核验流程（仅模板，无真实资料） |
 
 ## 离线回放
@@ -30,6 +35,7 @@
 - `mode`：`rag`（默认）或 `chat`；`kb_id` 可由命令行覆盖；`top_k` 默认 6。
 - `expected_outcome`：`answer`、`refuse` 或 `clarify`。
 - `expected_sources`：来源身份列表，使用 `filename` / `document_id`，可选 `chunk_index`（从 0 开始）。合并相邻片段时匹配其实际范围。
+- `source_labels_complete`：可选严格布尔值，缺省 `false`。只有标注者确认在**固定检索范围/固定语料快照**下相关来源已完整列入 `expected_sources` 时才设为 `true`；显式 `"expected_sources": []` 加 `true` 表示确认没有相关来源。缺省不会自动写入旧 case，也不会改变旧数据集身份。
 - `required_phrases`、`forbidden_phrases`、`expect_no_citations`：可重复的固定断言。
 - `conversation_id`：可选的预置会话 UUID，用于人工准备过期引用等状态；默认每个 case 新建会话。
 - `actor`：`admin`（默认）或 `member`。普通用户用例使用 `RAG_EVAL_MEMBER_TOKEN`，不会请求管理员专属诊断，避免把诊断接口拒绝误判成知识库权限隔离。
@@ -45,6 +51,17 @@
 - `expected_sources` 新增可选 `index_version`：旧索引代次的引用即使文件名和片段号相同也判失败。
 - `document_ids`（1–5 个 UUID）只允许出现在 `mode=rag` 且没有 `conversation_id` 的新会话 case；真实模式只在首轮传入，续聊沿用会话已保存的范围。`mode=chat` 携带范围会在校验阶段被拒绝。
 
+### 来源排序指标（`metrics_version=2`）
+
+排序指标是观测，不是语义正确率，也不改变原有结果/机器指纹：
+
+- `candidate_source_mrr` / `supplied_source_mrr`：分别在候选 trace 与实际装入生成上下文的 trace 中，按**实际列表原顺序**找到第一个已知正来源，取倒数排名；聚合为可计算 case 的宏平均。没有 `expected_sources` 或对应 trace 缺失时为 `null`；真实空 trace 且有正标注时为 `0`。不按分数重新排序，也不判断来源是否语义支持答案。
+- `candidate_source_precision_at_k` / `supplied_source_precision_at_k`：只在 `source_labels_complete=true` 时计算；`K=case.top_k`（缺省 6），固定分母 `K`，只检查前 `K` 个实际位置，返回不足 `K` 时未返回位置记未命中。未完整标注时保持 `null`，不能把未命中当负相关。
+- 普通对话（`mode=chat`）与预期 HTTP 负例不进入排序质量分母。来源匹配沿用既有 `filename` / `document_id` / `chunk_index` 范围 / `index_version` 规则。
+- 报告顶层给出四项指标及其宏平均；`ranking_coverage` 逐项给出 `status`、`eligible`、`computable`、`eligible_cohort`、`cohort`、`unknown_cohort`。cohort 是稳定 case ID 的有序列表，可从 `results[]` 逐条核对，不能只看数量。
+- `eligible=0` 与“应测但缺 trace/response 的未测量”分开：前者可为 `not_applicable`，后者比较为 `unknown`。`null` 不补 `0`；显式门槛不能在没有适用样本时宣称通过。
+- 四项排名指标已进入阈值白名单。默认门槛不启用排序指标；需要把“召回不变但排序变差”判为退步时，显式提供 `thresholds.ranking.example.json` 中的规则（退出码 3）。
+
 ### 结果指纹
 
 每条 `results[]` 包含两套独立版本化的指纹，原有结果指纹的 v1 语义不变：
@@ -54,6 +71,7 @@
 - `machine_fingerprint_version`：独立的机器断言指纹版本，当前为 `1`。
 - `machine_sha256`：对版本号及 `passed`、`failures`、`outcome`、`expected_outcome`、`expected_http_status`、`http_status`、`error_type`、`citation_count` 做规范 JSON SHA-256；同时绑定 `id` 与 `result_sha256`，防止在不同案例或实际结果间移植摘要。缺失的 `error_type` 与显式 `null` 等价。不包含正文、时间、耗时或摘要自身，在机器字段全部确定后生成。
 - `citation_count`：实际引用条数；`expected_http_status` 与 `http_status` 成对记录，预期 4xx 负例必须精确匹配实际状态。
+- `candidate_source_mrr` / `supplied_source_mrr` / `*_precision_at_k` 与 `ranking_coverage` 是新增观测字段，不进入 `result_sha256` 或 `machine_sha256`；仅改变 trace 顺序不会改变两套 v1 指纹。它们也不继承旧人工核验结果，人工仍需按答案与引用原文复核。
 - 结果指纹变化即表示支持性内容变化。答案、引用片段、索引代次或实际 HTTP 状态任一改变，旧的人工核验即失效，必须重新核验。
 - 默认报告只导出指纹与计数，不导出正文；只有显式 `--include-content` 才在报告和核验模板中携带问题、答案、引用正文与 trace。无正文报告仍可按正常流程得到 `reviewed_pass`，不会强制导出正文。
 
@@ -63,13 +81,13 @@
 
 ## 数据集身份与基线比较
 
-每份报告包含 schema 2 的 `identity`，指标口径为 `metrics_version=1`：
+每份报告包含 schema 2 的 `identity`，指标口径为 `metrics_version=2`：
 
-- `dataset.sha256`：按 case id 排序后对问题、断言和 `document_ids` 等规范 JSON 取摘要；`dataset.case_count` 为用例数。`reviewed`、`stratum`、`verified_by`、`verified_at`、`unknowns` 是核验元数据，不改变数据集摘要。
+- `dataset.sha256`：按 case id 排序后对问题、断言、范围、`source_labels_complete` 等规范 JSON 取摘要；`dataset.case_count` 为用例数。`reviewed`、`stratum`、`verified_by`、`verified_at`、`unknowns` 是核验元数据，不改变数据集摘要。未声明 `source_labels_complete` 的旧 case 不会被注入默认字段，原有数据集身份保持不变；显式声明会改变身份并需要重建基线。
 - `dataset.documents`：`--documents-dir` 声明的完整本地语料树；未指定时使用问题集同级的 `documents/`，不存在则标记 `kind=none`、摘要为 null。完整快照标为 `kind=declared-local-snapshot`，摘要覆盖所有普通文件的相对路径和内容，包含未被 `expected_sources` 点名的干扰资料与子目录，排除 `.git` 目录。报告只保留计数和摘要。
 - `dataset.index_manifest`：可选的索引清单指纹，由 `--index-manifest` 提供，格式见下文。只在两侧都声明时比较，单侧声明或内容变化判为不可比。
 - `config`：仅接受白名单内的公开模型和检索参数，未知键（如 `token`、`base_url`）直接拒绝；模型名称含 URL 或账号信息也拒绝。CLI 根据 `--responses` / `--live` 写入 `mode`，不从配置文件读取模式。
-- `metrics_version`：指标口径版本；变化后旧基线不可比。旧身份 schema 也保持不可比，不隐式升级。
+- `metrics_version`：指标口径版本，当前为 `2`；变化后旧基线不可比。旧 `metrics_version=1` 报告仍可读取，但比较固定为 `incomparable`（退出码 4），不会因缺失排序字段而隐式补零。旧身份 schema 同样保持不可比，不隐式升级。
 
 语料最多 5000 个普通文件、合计 1 GiB；每个文件按 1 MiB 分块读取并按原始字节计算 SHA-256。根目录、子目录或文件为符号链接，或目录无法完整读取时，拒绝生成身份。显式指定的目录不存在也返回配置错误。
 
@@ -130,11 +148,26 @@
 
 # 不可比：换成另一个问题集，退出码 4
 .\.venv\Scripts\python.exe -m scripts.evaluate_rag --dataset evaluation/cases.example.jsonl --responses evaluation/responses.example.jsonl --output evaluation-results/other.json --baseline evaluation/baseline.platform.example.json
+
+# 排序正常：与排序基线一致，退出码 0
+.\.venv\Scripts\python.exe -m scripts.evaluate_rag --dataset evaluation/cases.ranking.example.jsonl --responses evaluation/responses.ranking.example.jsonl --output evaluation-results/ranking.json --baseline evaluation/baseline.ranking.example.json --thresholds evaluation/thresholds.ranking.example.json
+
+# 排序退化：召回、答案、引用与 v1 指纹不变，仅 trace 顺序变差；显式门槛使退出码为 3
+.\.venv\Scripts\python.exe -m scripts.evaluate_rag --dataset evaluation/cases.ranking.example.jsonl --responses evaluation/responses.ranking.regressed.example.jsonl --output evaluation-results/ranking-regressed.json --baseline evaluation/baseline.ranking.example.json --thresholds evaluation/thresholds.ranking.example.json
+
+# 缺 trace：应测 case 未测量，比较为 unknown，退出码 5
+.\.venv\Scripts\python.exe -m scripts.evaluate_rag --dataset evaluation/cases.ranking.example.jsonl --responses evaluation/responses.ranking.missing-trace.example.jsonl --output evaluation-results/ranking-missing.json --baseline evaluation/baseline.ranking.example.json
 ```
 
-旧报告没有 `identity`，或仍使用 schema 1 时，保持可读但比较结论固定为 `incomparable`（退出码 4），不会说成“无退步”。应以相同问题集、完整语料快照和公开配置重新生成基线。
+旧报告没有 `identity`、仍使用 schema 1，或仍是 `metrics_version=1` 时，保持可读但比较结论固定为 `incomparable`（退出码 4），不会说成“无退步”，也不会把缺失的排序字段补零。应以相同问题集、完整语料快照和公开配置重新生成基线。
 
 基线输入按 fail-closed 校验：`results` 必须是列表且与 `cases` 计数一致，`passed` 与各指标必须是有限的非负数（含超出 float 范围的超大整数，不会被当作有效数字），`*_samples` 必须是 0–cases 且样本为 0 时不得带指标值，`identity` 的摘要必须是 SHA-256、`case_count` 必须与 cases 一致。`identity.config` 的每个可比字段还会按写入时同样的规则校验类型与取值（如 `mode` 必须是 `offline`/`live`，`chunk_overlap < chunk_size`），不会把列表/对象当字典键。任一不符返回退出码 2，不会把字符串/对象拿去做减法而抛栈。两侧都缺 `dataset.sha256` 时不会因 `None == None` 判成同一数据集，而是 `dataset_identity_missing`。
+
+排序指标额外 fail closed：四项指标及其 `ranking_coverage` 的计数必须是整数（拒绝布尔/负值/越界），cohort 必须是无重复的有序 case ID 列表；比较时从 `results[]` 重新推导 eligible/computable/unknown cohort 并与摘要核对。某一指标的摘要与逐条结果不一致时，仅该指标判为 `unknown`（`coverage_summary_mismatch`），其他指标仍按自身 cohort 给出结论；`source_ranking_eligible` 与 `mode`/预期 HTTP 状态不一致属于全局标记矛盾，所有排名指标判为 `unknown`，但非排名指标不受影响。
+
+### 更新基线
+
+基线必须由真实离线 CLI 回放生成，不能手填“通过”。使用相同问题集、相同完整语料快照、相同公开配置和相同 run ID 重新运行 `scripts.evaluate_rag --output <baseline>`；`baseline.platform.example.json` 与 `baseline.ranking.example.json` 就是这样生成的固定 run ID 合成基线。若问题集、`source_labels_complete`、语料或关键配置改变，数据集身份随之改变，必须重建基线，不能与旧基线比较后声称无退步。Windows 工作区若换行不同，应在 LF 语料副本上生成和比较；基线文件本身保持无正文。
 
 `--live` 会在任何 HTTP 请求前完成问题集、阈值、配置身份和基线文件的全部校验；`chunk_overlap >= chunk_size`、`model` 含 URL/账号、基线结构损坏等都会先返回退出码 2，不会先产生模型费用再报错。
 
@@ -155,6 +188,7 @@
 - `metrics.<name>.delta = current - baseline`，`relative_delta` 仅在 baseline > 0 时给出；方向由指标本身固定（越高越好 / 越低越好），调用方无法反转。
 - `regressions` / `improvements` / `unknown_metrics` / `not_applicable_metrics` / `reasons` 分别列出结果。
 - 不可比的原因使用稳定标识：`dataset_changed`、`documents_changed`、`documents_identity_missing`、`config_changed:<字段>`、`config_unverifiable:<字段>`、`baseline_identity_missing`、`metrics_version_mismatch`。
+- 排序指标另有 `metrics.<name>.baseline_coverage` / `current_coverage`。`detail` 使用 `no_eligible_cases`、`unmeasured`、`eligible_cohort_mismatch`、`computable_cohort_mismatch`、`coverage_summary_mismatch`、`ranking_marker_inconsistent` 等稳定原因；这些情况均不判为通过。
 - 缺指标：任一侧缺值 → `unknown`；两侧都未测量且未设门槛 → `not_applicable`（不参与结论）；配置了门槛却测不到 → `unknown` 并阻断“无退步”。
 - 覆盖不明：延迟/费用指标有数值但缺 `*_samples` 计数时判 `unknown`（`detail=coverage_unverifiable`），不默认全覆盖；`0 < samples < cases` 同样 `unknown`（`partial_samples`）。
 
@@ -163,6 +197,7 @@
 `--thresholds` 接受 JSON 对象，键为指标名，值为 `{"max_absolute_change": 非负数}` 和/或 `{"max_relative_change": 非负数}`：
 
 - 默认门槛已覆盖断言通过率与三项来源召回、拒答匹配（绝对变化 0）。
+- 四项排序指标在阈值白名单内，但默认不启用；使用 `thresholds.ranking.example.json` 显式设置 `max_absolute_change: 0` 可把“召回不变、排序下降”判为退步（退出码 3）。
 - 延迟与费用默认不设门槛（需要显式给出，避免环境抖动被当退步）；`thresholds.example.json` 给出 p95 与费用的相对阈值示例。
 - `max_relative_change`：baseline 为 0 时不计算比例，任何变差都算超出；基数为 0 且当前仍为 0 视为不变。
 - 同一指标在 `--thresholds` 中给出时完整覆盖默认规则，不会暗中保留默认限制。
@@ -307,10 +342,14 @@
 
 - 每个 case 记录 `stratum` 与 `review_state`。报告增加 `reviewed_cases` / `unreviewed_cases`、各层样本数和固定断言通过率、`review_complete` / `review_incomplete` 及失败原因。
 - 分层与核验元数据不影响数据集身份；修改问题、断言、范围或增减业务样本会改变身份，需要重建基线。
+- 排序指标要求**固定检索范围/固定语料快照**：真实业务抽样中，先登记知识库、文档范围、索引代次和抽样时间，再标注来源。只有确认相关来源已完整列入 `expected_sources` 时才设置 `source_labels_complete: true`；语料或范围变化后必须重新标注，不能沿用旧声明。
+- `expected_sources: []` 配合 `source_labels_complete: true` 明确表示固定范围内没有相关来源；precision@K 因此为 0。未声明完整性的样本不计算 precision@K，未命中只记为未标注，不能当负相关。
+- 排序指标报告 `eligible` / `computable` 数量和稳定 case ID cohort。应测但缺 trace/response 的样本是 `unknown`，不进入宏平均、也不补 0；更换难例或减少可计算样本即使数量相同也不能与旧基线比较。零 eligible 表示该维度不适用，需要显式门槛时不能在无适用样本时宣称通过。
+- 排序指标与原有结果/机器指纹彼此独立：仅改变 trace 顺序不会改 `result_sha256` / `machine_sha256`，但人工核验仍需逐条阅读答案与引用原文。排序变好不等于语义支持正确，排序变差也不自动证明答案错误。
 - 核验元数据齐全只描述问题集的标注状态，固定断言通过不等于模型答案已获人工确认。人工事实正确率、引用支持性、资料可回答率与拒答正确率应按指南另行统计，均须给出样本量和未核验数量。
 - 默认报告不输出核验人原值、问题、答案或引用正文。使用脱敏 case ID 和登记的分层代号；需要正文复核时显式加 `--include-content` 并将产物保存在受控目录。
 - 现有合成样例只验证工具行为，不能用来宣称真实业务质量。
 
 ## 结果脱敏
 
-默认报告只有 case ID、断言结果、召回比例、延迟、样本数和可用用量；不写问题、答案、引用片段。`error` 只记录异常类型名或 `http_error` 状态码，不回显上游错误正文、URL、请求头或令牌。`identity` 不含文件名、文档正文、令牌、base URL 或数据库地址。
+默认报告只有 case ID、断言结果、召回/排序比例、覆盖 cohort、延迟、样本数和可用用量；不写问题、答案、引用片段。`error` 只记录异常类型名或 `http_error` 状态码，不回显上游错误正文、URL、请求头或令牌。`identity` 不含文件名、文档正文、令牌、base URL 或数据库地址。

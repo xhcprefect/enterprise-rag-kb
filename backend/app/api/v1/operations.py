@@ -28,6 +28,8 @@ from app.core.observability import CONTENT_TYPE, metrics
 from app.db import session as db_session
 from app.models import Document, DocumentStatus
 from app.schemas.common import ApiResponse
+from app.schemas.operations import WorkersStatusRead
+from app.services import worker_status as worker_status_service
 
 router = APIRouter(prefix="/operations", tags=["运维"])
 logger = logging.getLogger(__name__)
@@ -59,6 +61,93 @@ def _check_metrics_token(credentials: HTTPAuthorizationCredentials | None) -> No
         )
 
 
+def _render_worker_metrics(worker_payload: dict) -> list[str]:
+    """固定 role 的 worker 存活/队列指标。
+
+    - ``ragkb_worker_enabled`` 只来自 API 配置，任何数据库状态下都输出；
+    - ``ragkb_workers_available`` 标明本次角色观测是否成功；
+    - 数据库失败/超时时，存活与队列指标整体省略——未知绝不能伪装成 0，
+      否则“采不到”会被告警读成“队列为空/进程已停”；
+    - 最近失败只输出白名单安全码与时间戳，不含原始异常/路径/UUID。
+    """
+    role_lines: list[str] = [
+        "# HELP ragkb_worker_enabled Whether this worker role is enabled by the API configuration (1/0).",
+        "# TYPE ragkb_worker_enabled gauge",
+    ]
+    roles = worker_payload.get("roles") or []
+    for item in roles:
+        role_lines.append(
+            f'ragkb_worker_enabled{{role="{item["role"]}"}} {1 if item["enabled"] else 0}'
+        )
+
+    lines = role_lines + [
+        "# HELP ragkb_workers_available Whether the worker heartbeat/queue observation query succeeded in this scrape.",
+        "# TYPE ragkb_workers_available gauge",
+    ]
+    degraded = bool(worker_payload.get("degraded"))
+    lines.append(f"ragkb_workers_available {0 if degraded else 1}")
+    if degraded:
+        return lines
+
+    lines += [
+        "# HELP ragkb_worker_alive Fresh worker instances (heartbeat within 45s).",
+        "# TYPE ragkb_worker_alive gauge",
+    ]
+    for item in roles:
+        lines.append(f'ragkb_worker_alive{{role="{item["role"]}"}} {int(item["alive_count"] or 0)}')
+    for field, name in (
+        ("pending", "ragkb_worker_pending_tasks"),
+        ("processing", "ragkb_worker_processing_tasks"),
+        ("stale_tasks", "ragkb_worker_stale_tasks"),
+    ):
+        lines += [
+            f"# HELP {name} Worker queue tasks by role ({field.replace('_', ' ')}).",
+            f"# TYPE {name} gauge",
+        ]
+        for item in roles:
+            lines.append(f'{name}{{role="{item["role"]}"}} {int(item[field] or 0)}')
+    lines += [
+        "# HELP ragkb_worker_oldest_pending_age_seconds Age of the oldest pending task by role (omitted when no pending task).",
+        "# TYPE ragkb_worker_oldest_pending_age_seconds gauge",
+    ]
+    for item in roles:
+        age = item.get("oldest_pending_age_seconds")
+        if age is not None:
+            lines.append(
+                f'ragkb_worker_oldest_pending_age_seconds{{role="{item["role"]}"}} {float(age):.3f}'
+            )
+    lines += [
+        "# HELP ragkb_worker_last_failure_timestamp_seconds Update time of the latest failed task by role (omitted when none).",
+        "# TYPE ragkb_worker_last_failure_timestamp_seconds gauge",
+        "# HELP ragkb_worker_last_failure_info Latest failed task code by role, restricted to a fixed safe allowlist.",
+        "# TYPE ragkb_worker_last_failure_info gauge",
+    ]
+    for item in roles:
+        failure = item.get("last_failure")
+        if not failure:
+            continue
+        updated_at = failure["updated_at"]
+        if isinstance(updated_at, str):
+            updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        code = failure["code"]
+        lines.append(
+            f'ragkb_worker_last_failure_timestamp_seconds{{role="{item["role"]}"}} '
+            f"{updated_at.timestamp():.3f}"
+        )
+        lines.append(
+            f'ragkb_worker_last_failure_info{{role="{item["role"]}",code="{_metric_label(code)}"}} 1'
+        )
+    return lines
+
+
+def _metric_label(value: object) -> str:
+    """标签只允许白名单稳定码；其余字符一律去除，绝不回显原始文本。"""
+    text_value = str(value or "")
+    return "".join(ch for ch in text_value if ch.isascii() and (ch.isalnum() or ch in "-_"))[:64] or "failed"
+
+
 @router.get("/metrics", include_in_schema=False)
 async def get_metrics(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
@@ -74,8 +163,17 @@ async def get_metrics(
     # 复用管理员摘要的有界查询（anyio 超时 + statement_timeout），
     # 让队列/心跳/连接池也能被 Prometheus 直接告警。
     database = await _database_summary()
+    # worker 角色观测与队列摘要是**两次独立查询**：任一方失败都不影响另一方，
+    # 也绝不能让失败被渲染成 0（见 _render_worker_metrics）。
+    try:
+        workers = await worker_status_service.collect_worker_status()
+    except Exception as exc:  # noqa: BLE001 - worker 观测异常不得破坏现有采集
+        logger.warning("worker 指标采集失败: %s", type(exc).__name__)
+        workers = {"status": "unavailable", "error": "query_failed"}
+    worker_payload = worker_status_service.build_worker_status(workers)
     base = metrics.render()
     extra = _render_database_metrics(database)
+    extra += _render_worker_metrics(worker_payload)
     body = base + "".join(f"{line}\n" for line in extra)
     return Response(content=body, media_type=CONTENT_TYPE)
 
@@ -252,6 +350,28 @@ async def _database_summary() -> dict:
             "error_type": type(exc).__name__,
             "pool": _pool_stats(),
         }
+
+
+@router.get(
+    "/workers",
+    response_model=ApiResponse[WorkersStatusRead],
+    summary="worker 角色心跳与队列状态（管理员）",
+)
+async def get_workers(response: Response, _admin=Depends(require_admin)):
+    """固定 ingest/summary/project/regression 顺序的实例心跳与任务队列观测。
+
+    鉴权由 ``require_admin`` 先于任何数据库读取执行；``no-store`` 避免中间缓存
+    把过期的运维状态当作当前状态返回。查询失败时 ``degraded=true`` 且计数为
+    ``null``，绝不补零。
+    """
+    try:
+        stats = await worker_status_service.collect_worker_status()
+    except Exception as exc:  # noqa: BLE001 - 只回安全错误类别，不回连接串/凭据
+        logger.warning("worker 状态接口查询失败: %s", type(exc).__name__)
+        stats = {"status": "unavailable", "error": "query_failed"}
+    payload = worker_status_service.build_worker_status(stats)
+    response.headers["Cache-Control"] = "no-store"
+    return ApiResponse(data=payload, message="ok")
 
 
 @router.get("/summary", response_model=ApiResponse[dict], summary="管理员运维摘要")

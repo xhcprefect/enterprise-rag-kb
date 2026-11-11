@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models import ChatTurn, Conversation, KnowledgeBase, Message, User
-from app.services import answer_sources
+from app.services import answer_sources, kb_access
 from app.services.answer_sources import SourceSnapshotError, SourceVerificationError
 from app.services.chat_turns import ChatLeaseLost, Reservation
 
@@ -22,7 +22,7 @@ def load_rag_history(db: Session, reservation: Reservation) -> list[dict]:
             raise ChatLeaseLost("登录状态已改变，请重新登录")
         kb = db.scalar(select(KnowledgeBase).where(KnowledgeBase.id == reservation.kb_id)
                        .execution_options(populate_existing=True))
-        if kb is None or not (user.is_admin or kb.is_public or kb.owner_id == user.id):
+        if kb is None or not kb_access.can_read_kb(db, kb, user):
             raise ChatLeaseLost("知识库权限已改变，请刷新会话")
         conv = db.scalar(select(Conversation).where(Conversation.id == reservation.conversation_id)
                          .execution_options(populate_existing=True))

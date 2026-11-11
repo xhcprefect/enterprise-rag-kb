@@ -174,6 +174,262 @@ class CaseHelperTests(unittest.TestCase):
             mode="rag", cause="retrieval")))
 
 
+class LegacyBindingCompatibilityTests(unittest.TestCase):
+    """Q 新增排序观测不得改变旧 case 的绑定、数据集摘要或 v1 指纹。"""
+
+    def test_legacy_case_binding_and_dataset_digests_are_unchanged(self):
+        case = _base_case()
+        fingerprints = fre.case_fingerprints(case)
+        self.assertEqual(fingerprints["case_sha256"],
+                         "9f1f46a710344b0f89a9a0f7b1c0478adc6bb5214766de2f846d647772e5e590")
+        self.assertEqual(fingerprints["dataset_sha256"],
+                         "21fe6ec747ce4ff1e68f60dddc9950288ab13bbc2b20debc368902f2c1810a9e")
+        payload = fre.base_binding_payload(
+            case, feedback=_Feedback, resolved_sources=[dict(SOURCE)], kb_id=KB_ID,
+            mode="rag", cause="retrieval")
+        self.assertEqual(fre.binding_sha256(payload),
+                         "2c7b184681744d270ab1f0c364955bf4f55de639c8b0edacc4ffc8f974e450d0")
+
+    def test_legacy_grade_case_keeps_v1_result_and_machine_fingerprints(self):
+        result = ev.grade_case(_base_case(), _response())
+        self.assertEqual(result["result_fingerprint_version"], 1)
+        self.assertEqual(result["machine_fingerprint_version"], 1)
+        self.assertEqual(result["result_sha256"],
+                         "540aa8fca281c4f74eddd175c222df5e7c9b710fe442bd4c0e805f163e7272f9")
+        self.assertEqual(result["machine_sha256"],
+                         "71d7877bb4ee028bf6357c089b5d5bb214c4db395b6eb037617ca5a1bac5df1e")
+        # 新观测字段不进入指纹，也不会被注入回原 case。
+        self.assertNotIn("source_labels_complete", _base_case())
+        self.assertIn("candidate_source_mrr", result)
+
+    def test_complete_source_declaration_changes_identity_and_binding(self):
+        from app.services import evaluation as _ev
+        case = _base_case(source_labels_complete=True)
+        self.assertTrue(_ev.validate_cases([case])[0]["source_labels_complete"])
+        legacy = fre.case_fingerprints(_base_case())
+        declared = fre.case_fingerprints(case)
+        self.assertNotEqual(legacy["case_sha256"], declared["case_sha256"])
+        self.assertNotEqual(legacy["dataset_sha256"], declared["dataset_sha256"])
+        left = fre.base_binding_payload(_base_case(), feedback=_Feedback,
+                                        resolved_sources=[dict(SOURCE)], kb_id=KB_ID,
+                                        mode="rag", cause="retrieval")
+        right = fre.base_binding_payload(case, feedback=_Feedback,
+                                         resolved_sources=[dict(SOURCE)], kb_id=KB_ID,
+                                         mode="rag", cause="retrieval")
+        self.assertNotEqual(fre.binding_sha256(left), fre.binding_sha256(right))
+
+
+class ProjectIdentityEvaluationTests(unittest.TestCase):
+    SNAPSHOT_A = "00000000-0000-4000-8000-0000000000a1"
+    SNAPSHOT_B = "00000000-0000-4000-8000-0000000000a2"
+    PROJECT_SOURCE = "00000000-0000-4000-8000-0000000000b1"
+    FILE_VERSION = "00000000-0000-4000-8000-0000000000c1"
+    OTHER_FILE_VERSION = "00000000-0000-4000-8000-0000000000c2"
+
+    def _project_source(self, **overrides):
+        source = {
+            "source_kind": "project",
+            "document_id": self.FILE_VERSION,
+            "file_version_id": self.FILE_VERSION,
+            "snapshot_id": self.SNAPSHOT_A,
+            "source_id": self.PROJECT_SOURCE,
+            "relative_path": "src/main.py",
+            "manifest_fingerprint": "d" * 64,
+            "config_fingerprint": "e" * 64,
+            "chunk_index": 1,
+        }
+        source.update(overrides)
+        return source
+
+    def test_same_file_version_in_different_snapshot_does_not_match(self):
+        expected = self._project_source()
+        actual = {
+            **expected,
+            "snapshot_id": self.SNAPSHOT_B,
+            "filename": "src/main.py",
+        }
+        self.assertFalse(ev._matches(expected, actual))
+
+        different_file = {
+            **expected,
+            "document_id": self.OTHER_FILE_VERSION,
+            "file_version_id": self.OTHER_FILE_VERSION,
+            "filename": "src/main.py",
+        }
+        self.assertFalse(ev._matches(expected, different_file))
+        mismatches = (
+            {"source_id": "00000000-0000-4000-8000-0000000000b2"},
+            {"relative_path": "src/other.py", "filename": "src/other.py"},
+            {"manifest_fingerprint": "f" * 64},
+            {"config_fingerprint": "a" * 64},
+        )
+        for values in mismatches:
+            with self.subTest(values=values):
+                self.assertFalse(ev._matches(expected, {**expected, **values}))
+        self.assertTrue(ev._matches(expected, {**expected, "filename": "src/main.py"}))
+
+    def test_conflicting_identity_aliases_never_match(self):
+        expected = self._project_source()
+        # document_id 与 file_version_id 是同一身份的两个别名：任一不符即不命中。
+        self.assertFalse(ev._matches(
+            expected,
+            {**expected, "document_id": self.OTHER_FILE_VERSION},
+        ))
+        self.assertFalse(ev._matches(
+            expected,
+            {**expected, "file_version_id": self.OTHER_FILE_VERSION},
+        ))
+        # 路径别名矛盾。
+        self.assertFalse(ev._matches(expected, {**expected, "filename": "src/other.py"}))
+        self.assertFalse(ev._matches(expected, {**expected, "relative_path": "src/other.py"}))
+        # manifest/config 权威与 metadata 别名同时出现且矛盾。
+        self.assertFalse(ev._matches(
+            expected, {**expected, "snapshot_manifest_fingerprint": "f" * 64}
+        ))
+        self.assertFalse(ev._matches(
+            expected, {**expected, "snapshot_config_fingerprint": "a" * 64}
+        ))
+        # 反向：权威键与别名相反的方向也必须拒绝。
+        canonical_expected = self._project_source()
+        alias_actual = {
+            **expected,
+            "manifest_fingerprint": "d" * 64,
+            "snapshot_manifest_fingerprint": "0" * 64,
+            "config_fingerprint": "e" * 64,
+            "snapshot_config_fingerprint": "1" * 64,
+        }
+        self.assertFalse(ev._matches(canonical_expected, alias_actual))
+        # 期望需要的身份在 actual 中完全没有（所有别名都缺失）时不命中。
+        actual = {**expected}
+        for key in ("file_version_id", "document_id"):
+            actual.pop(key)
+        self.assertFalse(ev._matches(expected, actual))
+        actual = {**expected}
+        for key in ("manifest_fingerprint", "snapshot_manifest_fingerprint"):
+            actual.pop(key, None)
+        self.assertFalse(ev._matches(expected, actual))
+        actual = {**expected}
+        for key in ("relative_path", "filename"):
+            actual.pop(key, None)
+        self.assertFalse(ev._matches(expected, actual))
+        # 只提供一个别名（同一身份，非矛盾）仍应按该别名命中。
+        actual = {**expected}
+        actual.pop("file_version_id")
+        self.assertTrue(ev._matches(expected, actual))
+
+    def test_metadata_alias_actual_matches_canonical_expected(self):
+        expected = self._project_source()
+        alias_actual = {
+            "source_kind": "project",
+            "document_id": self.FILE_VERSION,
+            "file_version_id": self.FILE_VERSION,
+            "snapshot_id": self.SNAPSHOT_A,
+            "source_id": self.PROJECT_SOURCE,
+            "relative_path": "src/main.py",
+            "filename": "src/main.py",
+            "snapshot_manifest_fingerprint": "d" * 64,
+            "snapshot_config_fingerprint": "e" * 64,
+            "chunk_index": 1,
+        }
+        self.assertTrue(ev._matches(expected, alias_actual))
+        # 公开引用兼容字段 index_version=0 不是上传身份，不得影响项目匹配。
+        self.assertTrue(ev._matches(expected, {**alias_actual, "index_version": 0}))
+
+    def test_upload_expected_never_matches_project_actual(self):
+        upload_expected = {
+            "document_id": self.FILE_VERSION,
+            "filename": "src/main.py",
+            "chunk_index": 1,
+        }
+        project_actual = {
+            "source_kind": "project",
+            "document_id": self.FILE_VERSION,
+            "file_version_id": self.FILE_VERSION,
+            "snapshot_id": self.SNAPSHOT_A,
+            "source_id": self.PROJECT_SOURCE,
+            "relative_path": "src/main.py",
+            "filename": "src/main.py",
+            "manifest_fingerprint": "d" * 64,
+            "config_fingerprint": "e" * 64,
+            "chunk_index": 1,
+            "index_version": 0,
+        }
+        self.assertFalse(ev._matches(upload_expected, project_actual))
+        self.assertFalse(ev._matches(
+            {**upload_expected, "index_version": 0}, project_actual
+        ))
+
+    def test_real_rag_to_citations_project_reference_matches(self):
+        from langchain_core.documents import Document as LCDocument
+
+        from app.services import rag
+
+        citations = rag.to_citations([(
+            LCDocument(page_content="项目正文", metadata={
+                "document_id": self.FILE_VERSION,
+                "file_version_id": self.FILE_VERSION,
+                "snapshot_id": self.SNAPSHOT_A,
+                "source_id": self.PROJECT_SOURCE,
+                "relative_path": "src/main.py",
+                "filename": "src/main.py",
+                "chunk_index": 1,
+                "index_version": 0,
+                "source_kind": "project",
+                "snapshot_manifest_fingerprint": "d" * 64,
+                "snapshot_config_fingerprint": "e" * 64,
+                "citation_score": 0.9,
+            }),
+            0.1,
+        )])
+        self.assertEqual(citations[0]["index_version"], 0)
+        self.assertEqual(citations[0]["manifest_fingerprint"], "d" * 64)
+        self.assertTrue(ev._matches(self._project_source(), citations[0]))
+
+    def test_project_case_identity_is_validated_strictly(self):
+        case = _base_case(
+            expected_sources=[self._project_source()],
+            project_identity={
+                "snapshot_id": self.SNAPSHOT_A,
+                "source_id": self.PROJECT_SOURCE,
+                "manifest_fingerprint": "d" * 64,
+                "config_fingerprint": "e" * 64,
+            },
+        )
+        self.assertIs(ev.validate_cases([case])[0], case)
+
+        invalid_file_identity = self._project_source(
+            document_id=self.OTHER_FILE_VERSION
+        )
+        with self.assertRaises(ev.EvaluationError):
+            ev.validate_cases([_base_case(expected_sources=[invalid_file_identity])])
+
+        with self.assertRaises(ev.EvaluationError):
+            ev.validate_cases([_base_case(expected_sources=[self._project_source(index_version=1)])])
+
+        with self.assertRaises(ev.EvaluationError):
+            ev.validate_cases([_base_case(
+                expected_sources=[self._project_source()],
+                project_identity={"snapshot_id": self.SNAPSHOT_A},
+            )])
+
+    def test_project_chunk_index_requires_strict_non_negative_int(self):
+        for invalid in (-1, True, False, 1.0, "1", [1]):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ev.EvaluationError):
+                    ev.validate_cases([_base_case(
+                        expected_sources=[self._project_source(chunk_index=invalid)]
+                    )])
+        for valid in (0, 3):
+            with self.subTest(valid=valid):
+                case = _base_case(
+                    expected_sources=[self._project_source(chunk_index=valid)]
+                )
+                self.assertEqual(
+                    ev.validate_cases([case])[0]["expected_sources"][0]["chunk_index"],
+                    valid,
+                )
+
+
 class ReportValidationTests(unittest.TestCase):
     def test_offline_report_without_content_is_consistency_only(self):
         case = fre.mark_mode(_base_case(), "offline")

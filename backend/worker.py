@@ -1,13 +1,14 @@
 """独立 worker：按角色消费数据库任务。
 
 角色（--role，默认 ingest 与旧行为完全一致）：
-- ingest    ：上传文档入库（原 worker 行为，KEEP 原有 graceful/stale/checkpoint）。
-- summary   ：普通对话摘要压缩（独立启动，避免与长文档入库互饿）。
-- project   ：本地项目文档/源码索引与手动增量同步（独立启动）。
+- ingest     ：上传文档入库（原 worker 行为，KEEP 原有 graceful/stale/checkpoint）。
+- summary    ：普通对话摘要压缩（独立启动，避免与长文档入库互饿）。
+- project    ：本地项目文档/源码索引与手动增量同步（独立启动）。
+- regression ：反馈回归的后台重跑（独立启动，消费管理员显式提交的在线作业）。
 
-summary/project 角色启动后按需动态 import 各自服务 worker 并调用
-``run(stop_event)``——只有被选中的角色才被 import，因此任一角色的服务模块缺依赖
-（例如暂未装 tree-sitter）都不会影响其他角色。Docker Compose 通过 summary/project
+非 ingest 角色启动后按需动态 import 各自服务 worker 并调用 ``run(stop_event)``——
+只有被选中的角色才被 import，因此任一角色的服务模块缺依赖（例如 project worker
+未装 tree-sitter）都不会影响其他角色。Docker Compose 通过 summary/project/regression
 可选 profile 启动对应服务；本地开发也需为每个启用的角色单独启动进程。
 
 为什么入库不在 API 进程里（旧的 BackgroundTasks 方案）：
@@ -41,6 +42,7 @@ from app.core.logging import setup_logging
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.models import Document, DocumentStatus
+from app.services import worker_status
 from app.services.ingest import ingest_document_task
 from app.services.upload import cleanup_expired
 
@@ -56,16 +58,20 @@ stop_event = threading.Event()
 # 兼容旧导入（``worker._running``）的只读视图，不再是唯一退出条件。
 _running = True
 
-# 角色常量与 supervisor 分发。summary/project 角色只有在被选中时才动态 import
-# 各自的服务 worker，从而与旧 ingest 行为、单角色独立启动完全解耦。
+# 角色常量与 supervisor 分发。summary/project/regression 角色只有在被选中时才
+# 动态 import 各自的服务 worker，从而与旧 ingest 行为、单角色独立启动完全解耦。
+# regression 的执行器固定为 app.services.regression_worker（契约 run(stop_event)）；
+# 模块缺失时只影响该角色自身启动，不会波及 ingest 或其他角色。
 ROLE_INGEST = "ingest"
 ROLE_SUMMARY = "summary"
 ROLE_PROJECT = "project"
-ROLES = (ROLE_INGEST, ROLE_SUMMARY, ROLE_PROJECT)
+ROLE_REGRESSION = "regression"
+ROLES = (ROLE_INGEST, ROLE_SUMMARY, ROLE_PROJECT, ROLE_REGRESSION)
 # role -> (package, module)，每个独立启动的 supervisor 调用其 ``run(stop_event)``。
 _ROLE_WORKERS = {
     ROLE_SUMMARY: ("app.services", "memory_worker"),
     ROLE_PROJECT: ("app.services", "project_worker"),
+    ROLE_REGRESSION: ("app.services", "regression_worker"),
 }
 
 
@@ -76,7 +82,7 @@ def parse_role(argv: list[str] | None = None) -> str:
         "--role",
         choices=ROLES,
         default=ROLE_INGEST,
-        help="worker 角色：ingest(默认) / summary / project",
+        help="worker 角色：ingest(默认) / summary / project / regression",
     )
     args = parser.parse_args(argv)
     return args.role
@@ -88,16 +94,34 @@ def _import_role_worker(role: str):  # noqa: ANN202 - 返回被 import 的模块
     return importlib.import_module(f"{package}.{module}")
 
 
+def _start_heartbeat(role: str):  # noqa: ANN202 - 返回 reporter 或 None
+    """进程级心跳（独立线程，10 秒短事务）；失败返回 None，绝不影响角色循环。"""
+    return worker_status.start_worker_heartbeat(role)
+
+
+def _stop_heartbeat(reporter) -> None:  # noqa: ANN001
+    worker_status.stop_worker_heartbeat(reporter)
+
+
 def _run_role(role: str) -> int:
-    """summary/project 角色：独立 supervisor，转发 stop_event 并调用服务的 run()。"""
+    """非 ingest 角色：独立 supervisor，转发 stop_event 并调用服务的 run()。
+
+    ingest/summary/project/regression 四个角色都由 worker_status 登记进程心跳；
+    心跳失败只记录告警并返回 None，不影响该角色的主循环。
+    """
     setup_logging(f"worker-{role}")
     # 不建管理员：那是 API 的职责。worker 只保证表结构就绪。
     init_db(create_admin=False)
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     logger.info("%s worker 启动", role)
-    module = _import_role_worker(role)
-    module.run(stop_event)
+    heartbeat = _start_heartbeat(role)
+    try:
+        module = _import_role_worker(role)
+        module.run(stop_event)
+    finally:
+        # 有界 join，并在心跳线程内尽力写 stopped_at；退出路径不再同步碰数据库。
+        _stop_heartbeat(heartbeat)
     logger.info("%s worker 已退出", role)
     return 0
 
@@ -154,7 +178,7 @@ def claim_one(db: Session) -> tuple[uuid.UUID, uuid.UUID] | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """角色入口。默认 ingest；summary/project 显式 --role 独立启动。"""
+    """角色入口。默认 ingest；其他角色显式 --role 独立启动。"""
     role = parse_role(argv)
     if role == ROLE_INGEST:
         return _ingest_main()
@@ -177,46 +201,51 @@ def _ingest_main() -> int:
     last_recover = last_cleanup = 0.0
     with SessionLocal() as db:
         recover_stale(db)
+    # 进程级心跳：独立线程 10 秒短事务续期，空闲/长任务都有；失败只记日志。
+    heartbeat = _start_heartbeat(ROLE_INGEST)
+    try:
+        while not stop_event.is_set():
+            now = time.monotonic()
+            # 恢复扫描与上传清理拆开：stale 判定要更频繁，上传会话保留 24h，无需同步跟跑。
+            if now - last_recover > RECOVER_INTERVAL_SECONDS:
+                last_recover = now
+                try:
+                    with SessionLocal() as db:
+                        recover_stale(db)
+                except Exception:  # noqa: BLE001 - 单次清理失败不应影响主循环
+                    logger.exception("周期恢复扫描失败")
+            if now - last_cleanup > CLEANUP_INTERVAL_SECONDS:
+                last_cleanup = now
+                try:
+                    with SessionLocal() as db:
+                        cleanup_expired(db)
+                except Exception:  # noqa: BLE001
+                    logger.exception("周期上传清理失败")
 
-    while not stop_event.is_set():
-        now = time.monotonic()
-        # 恢复扫描与上传清理拆开：stale 判定要更频繁，上传会话保留 24h，无需同步跟跑。
-        if now - last_recover > RECOVER_INTERVAL_SECONDS:
-            last_recover = now
-            try:
-                with SessionLocal() as db:
-                    recover_stale(db)
-            except Exception:  # noqa: BLE001 - 单次清理失败不应影响主循环
-                logger.exception("周期恢复扫描失败")
-        if now - last_cleanup > CLEANUP_INTERVAL_SECONDS:
-            last_cleanup = now
-            try:
-                with SessionLocal() as db:
-                    cleanup_expired(db)
-            except Exception:  # noqa: BLE001
-                logger.exception("周期上传清理失败")
-
-        with SessionLocal() as db:
-            claimed = claim_one(db)
-
-        if claimed is None:
-            # 可被信号立即唤醒，不必等满 IDLE_POLL_SECONDS。
-            if stop_event.wait(IDLE_POLL_SECONDS):
-                break
-            continue
-
-        doc_id, lease_id = claimed
-        if stop_event.is_set():
-            # 领取与停机竞态：刚领到但还没开始处理，直接交回 pending，避免留下
-            # 一个只有本进程知道租约的 processing 文档。
             with SessionLocal() as db:
-                _release(db, doc_id, lease_id)
-            break
-        logger.info("领取任务: %s", doc_id)
-        try:
-            ingest_document_task(str(doc_id), lease_id, stop_event=stop_event)
-        except Exception:  # noqa: BLE001 - ingest 内部已兜底，这里只保 worker 存活
-            logger.exception("任务异常退出: %s", doc_id)
+                claimed = claim_one(db)
+
+            if claimed is None:
+                # 可被信号立即唤醒，不必等满 IDLE_POLL_SECONDS。
+                if stop_event.wait(IDLE_POLL_SECONDS):
+                    break
+                continue
+
+            doc_id, lease_id = claimed
+            if stop_event.is_set():
+                # 领取与停机竞态：刚领到但还没开始处理，直接交回 pending，避免留下
+                # 一个只有本进程知道租约的 processing 文档。
+                with SessionLocal() as db:
+                    _release(db, doc_id, lease_id)
+                break
+            logger.info("领取任务: %s", doc_id)
+            try:
+                ingest_document_task(str(doc_id), lease_id, stop_event=stop_event)
+            except Exception:  # noqa: BLE001 - ingest 内部已兜底，这里只保 worker 存活
+                logger.exception("任务异常退出: %s", doc_id)
+    finally:
+        # 有界 join，并在心跳线程内尽力写 stopped_at；退出路径不再同步碰数据库。
+        _stop_heartbeat(heartbeat)
 
     logger.info("worker 已退出")
     return 0

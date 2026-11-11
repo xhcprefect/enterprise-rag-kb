@@ -1,0 +1,204 @@
+{
+  "run_id": "00000000-0000-4000-8000-000000000020",
+  "cases": 2,
+  "passed": 2,
+  "assertion_pass_rate": 1.0,
+  "candidate_source_recall": 1.0,
+  "supplied_source_recall": 1.0,
+  "citation_source_recall": 1.0,
+  "candidate_source_mrr": 0.75,
+  "supplied_source_mrr": 0.75,
+  "candidate_source_precision_at_k": 0.75,
+  "supplied_source_precision_at_k": 0.75,
+  "ranking_coverage": {
+    "candidate_source_mrr": {
+      "status": "computed",
+      "eligible": 2,
+      "computable": 2,
+      "eligible_cohort": [
+        "ranking-late",
+        "ranking-order"
+      ],
+      "cohort": [
+        "ranking-late",
+        "ranking-order"
+      ],
+      "unknown_cohort": []
+    },
+    "supplied_source_mrr": {
+      "status": "computed",
+      "eligible": 2,
+      "computable": 2,
+      "eligible_cohort": [
+        "ranking-late",
+        "ranking-order"
+      ],
+      "cohort": [
+        "ranking-late",
+        "ranking-order"
+      ],
+      "unknown_cohort": []
+    },
+    "candidate_source_precision_at_k": {
+      "status": "computed",
+      "eligible": 2,
+      "computable": 2,
+      "eligible_cohort": [
+        "ranking-late",
+        "ranking-order"
+      ],
+      "cohort": [
+        "ranking-late",
+        "ranking-order"
+      ],
+      "unknown_cohort": []
+    },
+    "supplied_source_precision_at_k": {
+      "status": "computed",
+      "eligible": 2,
+      "computable": 2,
+      "eligible_cohort": [
+        "ranking-late",
+        "ranking-order"
+      ],
+      "cohort": [
+        "ranking-late",
+        "ranking-order"
+      ],
+      "unknown_cohort": []
+    }
+  },
+  "refusal_match_rate": 1.0,
+  "first_token_ms_mean": 22.5,
+  "total_ms_mean": 110.0,
+  "generation_cost_estimate": null,
+  "first_token_ms_p50": 22.5,
+  "first_token_ms_p95": 24.75,
+  "total_ms_p50": 110.0,
+  "total_ms_p95": 119.0,
+  "first_token_ms_samples": 2,
+  "total_ms_samples": 2,
+  "generation_cost_samples": 0,
+  "reviewed_cases": 0,
+  "unreviewed_cases": 2,
+  "strata": {
+    "unclassified": {
+      "cases": 2,
+      "passed": 2,
+      "assertion_pass_rate": 1.0,
+      "reviewed": 0,
+      "unreviewed": 2,
+      "review_complete": 0,
+      "review_incomplete": 0,
+      "failure_reasons": {}
+    }
+  },
+  "failure_reasons": {},
+  "result_fingerprint_version": 1,
+  "notes": [
+    "固定断言和来源匹配不是语义事实正确率。",
+    "费用只包含已返回实际用量的回答生成，不包含追问补全、向量化和重排。",
+    "首字延迟针对最后一轮；总耗时包含 case 的所有准备轮次。",
+    "p50/p95 只使用实际返回的样本；样本数为 0 时保持 null，不补 0。",
+    "result_sha256 覆盖完整答案、引用身份/索引代次/实际片段内容和实际 HTTP 状态，不含时间或耗时；默认报告只导出摘要，不导出正文。",
+    "reviewed_cases 只表示核验元数据齐全，不代表语义准确率。",
+    "candidate/supplied_source_mrr 使用实际 trace 原顺序的首个已知正来源倒数排名；空 trace 记 0，缺 trace 或无正来源标注记 null。",
+    "candidate/supplied_source_precision_at_k 只在 source_labels_complete=true 时计算，固定分母为 case.top_k，未返回的位置按未命中计。",
+    "排名指标只回答既有来源身份/片段范围匹配出现多早，不证明引用语义支持，也不代表语义准确率。",
+    "ranking_coverage 从逐条结果推导 eligible/computable/unknown case ID cohort；缺 trace 的应测 case 是 unknown，不补 0，零 eligible 与未测量分开。",
+    "排名指标只是观测，不改变既有机器断言与答案引用指纹，也不代表语义准确率。"
+  ],
+  "results": [
+    {
+      "id": "ranking-order",
+      "passed": true,
+      "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
+      "mode": "rag",
+      "expected_outcome": "answer",
+      "outcome": "answer",
+      "expected_http_status": null,
+      "http_status": 200,
+      "citation_count": 2,
+      "candidate_source_recall": 1.0,
+      "supplied_source_recall": 1.0,
+      "citation_source_recall": 1.0,
+      "candidate_source_mrr": 1.0,
+      "supplied_source_mrr": 1.0,
+      "candidate_source_precision_at_k": 1.0,
+      "supplied_source_precision_at_k": 1.0,
+      "source_ranking_eligible": true,
+      "source_label_count": 2,
+      "source_labels_complete": true,
+      "top_k": 2,
+      "rewrite_ms": null,
+      "retrieve_ms": null,
+      "generation_ms": null,
+      "refusal_match": true,
+      "first_token_ms": 20.0,
+      "total_ms": 100.0,
+      "generation_usage": null,
+      "generation_cost_estimate": null,
+      "result_fingerprint_version": 1,
+      "result_sha256": "8f32ac7c35d80cb4a6212b587aef82e8cb505591946e5ea99420de793e0b742b",
+      "machine_fingerprint_version": 1,
+      "machine_sha256": "935501a896973b8919513ff37cc4db09a82834f0e2788e14e400a269d027a57c"
+    },
+    {
+      "id": "ranking-late",
+      "passed": true,
+      "failures": [],
+      "stratum": "unclassified",
+      "review_state": "unreviewed",
+      "mode": "rag",
+      "expected_outcome": "answer",
+      "outcome": "answer",
+      "expected_http_status": null,
+      "http_status": 200,
+      "citation_count": 1,
+      "candidate_source_recall": 1.0,
+      "supplied_source_recall": 1.0,
+      "citation_source_recall": 1.0,
+      "candidate_source_mrr": 0.5,
+      "supplied_source_mrr": 0.5,
+      "candidate_source_precision_at_k": 0.5,
+      "supplied_source_precision_at_k": 0.5,
+      "source_ranking_eligible": true,
+      "source_label_count": 1,
+      "source_labels_complete": true,
+      "top_k": 2,
+      "rewrite_ms": null,
+      "retrieve_ms": null,
+      "generation_ms": null,
+      "refusal_match": true,
+      "first_token_ms": 25.0,
+      "total_ms": 120.0,
+      "generation_usage": null,
+      "generation_cost_estimate": null,
+      "result_fingerprint_version": 1,
+      "result_sha256": "936618b82c3e0ff9da7c895e903601a63d191bab30bc90178bf7f45941775800",
+      "machine_fingerprint_version": 1,
+      "machine_sha256": "df8e372414a95dba6a55b073779c46571e5b08a2283a823529f2fa2a2e2a3b97"
+    }
+  ],
+  "identity": {
+    "schema": 2,
+    "metrics_version": 2,
+    "dataset": {
+      "schema": 2,
+      "case_count": 2,
+      "sha256": "0eb3aba41959f1ec17ff2be389d33d38cde4dd14d82bbcec1983395f32f18f45",
+      "documents": {
+        "kind": "declared-local-snapshot",
+        "files": 6,
+        "sha256": "768eb7020e2d194e1be11385f270d371cb4909a05dd9cf361310197a642841aa"
+      }
+    },
+    "config": {
+      "mode": "offline",
+      "sha256": "6e04489c2b5d28e4204e8eddc3c4dc55a962ae1046ce54f957a67068bd1afc22"
+    }
+  },
+  "mode": "offline"
+}

@@ -36,6 +36,12 @@ export interface KnowledgeBase {
   project_active_snapshot_id?: string | null
   project_ready?: boolean
   project_revoked?: boolean
+  /** 服务端计算的成员授权版本；旧响应可能缺失，缺失时不能当作已知版本。 */
+  membership_revision?: number
+  /** 服务端判定当前用户能否维护该库文档；缺失或非 true 一律按 false 处理。 */
+  can_manage_documents?: boolean
+  /** 服务端判定当前用户能否管理该库成员；缺失或非 true 一律按 false 处理。 */
+  can_manage_members?: boolean
 }
 
 /** 知识库是否为项目索引库（项目库不走文档上传/公开性编辑）。 */
@@ -373,8 +379,15 @@ export type FeedbackRegressionCause =
   | 'other'
 
 export type FeedbackRegressionMode = 'offline' | 'live'
-export type FeedbackRegressionRunState = 'awaiting_report' | 'imported' | 'stale'
+export type FeedbackRegressionRunState = 'awaiting_report' | 'imported' | 'stale' | 'online'
 export type FeedbackRegressionValidationLevel = 'consistency_only' | 'content_regraded'
+export type FeedbackRegressionExecutionKind = 'manual' | 'online'
+export type FeedbackRegressionJobRunStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
 
 /** 一轮重跑的白名单摘要；不含样例/报告正文。 */
 export interface FeedbackRegressionRun {
@@ -382,6 +395,13 @@ export interface FeedbackRegressionRun {
   attempt_no: number
   is_current: boolean
   state: FeedbackRegressionRunState
+  /** manual 是旧准备/导入轮次；online 只能通过作业比较/核验。 */
+  execution_kind: FeedbackRegressionExecutionKind
+  /** 在线轮次永远 false；旧响应可能缺省。 */
+  can_import?: boolean
+  job_id?: string | null
+  job_status?: FeedbackRegressionJobRunStatus | null
+  job_revision?: number | null
   requested_mode: FeedbackRegressionMode
   protocol_version: number
   case_sha256: string
