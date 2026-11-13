@@ -14,6 +14,7 @@ import {
   createGovernanceWriteController,
   createGovernanceWriteLock,
   createSupersedeController,
+  formatLocalGovernanceInput,
   governanceSessionState,
   governanceWriteKey,
   invalidateGovernanceRevision,
@@ -341,15 +342,17 @@ test('row replacement only touches the matching row and never appends', () => {
 })
 
 test('control precision (seconds) does not rewrite an unchanged millisecond value', () => {
-  // 同一秒：控件回显视为未修改
-  assert.equal(
-    sameGovernanceInputInstant('2026-01-01T00:00:00.750Z', '2026-01-01T08:00:00'),
-    true
-  )
+  const instant = '2026-01-01T00:00:00.750Z'
+  const controlEcho = formatLocalGovernanceInput(instant)
+  // 同一秒：控件回显视为未修改，不依赖运行环境时区
+  assert.equal(sameGovernanceInputInstant(instant, controlEcho), true)
   // 不同秒 / 任一侧为空 / 任一侧非法：都视为修改
-  assert.equal(sameGovernanceInputInstant('2026-01-01T00:00:00Z', '2026-01-01T08:00:01'), false)
+  assert.equal(
+    sameGovernanceInputInstant('2026-01-01T00:00:00Z', formatLocalGovernanceInput('2026-01-01T00:00:01Z')),
+    false
+  )
   assert.equal(sameGovernanceInputInstant('2026-01-01T00:00:00Z', ''), false)
-  assert.equal(sameGovernanceInputInstant('bad', '2026-01-01T08:00:00'), false)
+  assert.equal(sameGovernanceInputInstant('bad', controlEcho), false)
 })
 
 // ---------- 并发写入控制器的真实行为 ----------
@@ -592,8 +595,9 @@ test('microsecond values survive an unchanged form without rewriting precision b
   })
   assert.deepEqual(plan, { status: 'empty' })
   // 控件回显（秒级、本地时区）也与微秒原值视为同一时刻
+  const controlEcho = formatLocalGovernanceInput('2026-01-01T00:00:00.123456Z')
   assert.equal(
-    sameGovernanceInputInstant('2026-01-01T00:00:00.123456Z', '2026-01-01T08:00:00'),
+    sameGovernanceInputInstant('2026-01-01T00:00:00.123456Z', controlEcho),
     true
   )
 })
@@ -736,16 +740,17 @@ test('same-millisecond but different-microsecond window is legal (exact comparis
 
 test('untouched sub-millisecond values are never rewritten to control precision', () => {
   // 控件只能回显到秒；没改就不发该字段（含微秒原值因此完整保留）
-  const snapshot = { ...baseSnapshot, last_reviewed_at: '2026-01-01T00:00:00.123456+00:00' }
+  const original = '2026-01-01T00:00:00.123456+00:00'
+  const snapshot = { ...baseSnapshot, last_reviewed_at: original }
   const plan = planGovernancePatch(snapshot, {
     ...baseForm,
-    last_reviewed_at: '2026-01-01T08:00:00'
+    last_reviewed_at: formatLocalGovernanceInput(original)
   })
   assert.deepEqual(plan, { status: 'empty' })
   // 真正改了才发，且发出去的是毫秒精度 ISO（datetime-local 无法表达微秒）
   const changed = planGovernancePatch(snapshot, {
     ...baseForm,
-    last_reviewed_at: '2026-01-02T08:00:00'
+    last_reviewed_at: formatLocalGovernanceInput('2026-01-02T00:00:00Z')
   })
   assert.equal(changed.status, 'ok')
   if (changed.status === 'ok') assert.equal(changed.body.last_reviewed_at, '2026-01-02T00:00:00.000Z')
