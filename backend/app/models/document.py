@@ -117,6 +117,19 @@ class Document(Base, TimestampMixin):
     # 索引代次隔离重建前后的向量；lease_id 阻止超时旧任务继续写入。
     index_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # 当前索引代次已失败次数：每次失败（含永久失败）+1；停机/失租不计。
+    # ready、cancelled、手工 reindex 清零；暂态故障达到预算上限后停止重试。
+    ingest_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    # 失败后的退避解禁时刻；领取时清空，停机恢复不新增退避。
+    # pending 且未取消时只能在 NULL/到期后领取；取消清理不等待退避。
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 最后一次失败的分类代号（见 ingest_failures.FAILURE_CODES）：只存稳定代号，
+    # 不存异常正文、路径或上游文案，便于告警聚合而不泄露内容。
+    last_error_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

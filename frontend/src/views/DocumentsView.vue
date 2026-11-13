@@ -195,7 +195,7 @@
         striped
         striped-flow
         :duration="1.2"
-        :format="queueFormat"
+        :format="uploadQueueFormat"
         :stroke-width="8"
         class="upload-progress pending-progress"
       />
@@ -296,7 +296,7 @@
         </el-table-column>
 
         <!-- 状态与进度合并：就绪/失败/取消显示标签，排队与处理中直接显示进度条 -->
-        <el-table-column :label="t('documents.table.status')" width="160">
+        <el-table-column :label="t('documents.table.status')" width="180">
           <template #default="{ row }">
             <el-progress
               v-if="row.status === 'pending' || (row.status === 'processing' && !row.progress)"
@@ -304,7 +304,7 @@
               striped
               striped-flow
               :duration="1.2"
-              :format="queueFormat"
+              :format="() => retryHint(row) || (row.status === 'processing' ? statusText(row.status) : queueFormat())"
               :stroke-width="6"
               :text-inside="false"
               class="pending-progress"
@@ -317,7 +317,7 @@
             />
             <el-tooltip
               v-else-if="row.status === 'failed'"
-              :content="row.error_message || t('documents.failedFallback')"
+              :content="ingestFailureMessage(row.error_message, retryTooltip(row), t('documents.failedFallback'))"
               placement="top"
             >
               <el-tag type="danger" size="small" effect="light">{{ t('documents.status.failed') }}</el-tag>
@@ -335,6 +335,18 @@
             <el-tag v-else :type="statusType(row.status)" size="small" effect="light">
               {{ statusText(row.status) }}
             </el-tag>
+            <el-tooltip
+              v-if="retryHint(row)"
+              :content="retryTooltip(row)"
+              placement="top"
+            >
+              <div
+                class="retry-hint"
+                :class="{ 'retry-hint-terminal': row.status === 'failed' }"
+                :data-retry-phase="retryStateFor(row).phase"
+                data-testid="ingest-retry-hint"
+              >{{ retryHint(row) }}</div>
+            </el-tooltip>
           </template>
         </el-table-column>
 
@@ -515,6 +527,8 @@ import {
   selectPickedFiles
 } from '@/utils/documentIdentity'
 import { isLatestResponse, isStalePoll, makeQuery, queryParams, shouldPoll } from '@/utils/documentList'
+import { ingestFailureMessage, retryState, type RetryState } from '@/utils/documentRetry'
+import { ingestRetryMessages } from '@/i18n/messages/documentRetry'
 import { runWorkerGroup } from '@/utils/documentChunks'
 import {
   belongsToGovernanceSession,
@@ -545,6 +559,7 @@ interface UploadTask {
   chunksDone: number
   /** 服务端文档状态，用于复用失败/取消时提示重建索引 */
   docStatus: string
+  retryDocument?: DocumentItem
   /** 分片已传完、正在等待服务端合并；此时不能暂停（合并无法中断） */
   completing: boolean
 }
@@ -573,7 +588,7 @@ const SEARCH_DEBOUNCE_MS = 300
 
 const route = useRoute()
 const router = useRouter()
-const { t } = useI18n()
+const { t } = useI18n({ useScope: 'global', messages: ingestRetryMessages })
 
 const kbId = route.params.kbId as string
 const kb = ref<KnowledgeBase | null>(null)
@@ -605,6 +620,7 @@ const emptyDescription = computed(() => {
 const docs = ref<DocumentItem[]>([])
 const loading = ref(false)
 const hashing = ref(false)
+const retryNow = ref(Date.now())
 const page = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
@@ -664,10 +680,45 @@ const canReindexExisting = computed(() => {
 // 入库阶段的 0 表示"worker 还没领取 / 还没落第一批进度"，不是"进度为零"。
 const ingestQueued = computed(() => {
   const task = uploadTask.value
-  return !!task && isIngestQueued(task.phase, task.percent)
+  return !!task && (isIngestQueued(task.phase, task.percent) ||
+    (task.phase === 'ingesting' && retryStateFor(task.retryDocument).phase === 'waiting'))
 })
 
 const queueFormat = () => t('documents.queued')
+const uploadQueueFormat = () => retryHint(uploadTask.value?.retryDocument) || queueFormat()
+
+function retryStateFor(row: unknown): RetryState {
+  return retryState(row, retryNow.value)
+}
+
+function retryMessage(key: string, values: Record<string, string | number> = {}): string {
+  return t(`documents.ingestRetry.${key}`, values)
+}
+
+function retryHint(row: unknown): string {
+  const state = retryStateFor(row)
+  if (state.phase === 'none') return ''
+  if (state.phase === 'waiting') {
+    return state.waitSeconds ? retryMessage('waiting', { seconds: state.waitSeconds })
+      : retryMessage('waitingSoon')
+  }
+  if (state.phase === 'permanent' && state.code === 'authentication') {
+    return retryMessage('authentication')
+  }
+  return retryMessage(state.phase)
+}
+
+function retryTooltip(row: unknown): string {
+  const state = retryStateFor(row)
+  if (state.phase === 'none') return ''
+  const failures = retryMessage('failures', { count: state.attempts })
+  const code = retryMessage(`code.${state.code ?? 'unknown'}`)
+  const key = state.phase === 'waiting'
+    ? (state.waitSeconds ? 'waitingTip' : 'waitingSoonTip')
+    : state.phase === 'permanent' && state.code === 'authentication'
+      ? 'authenticationTip' : `${state.phase}Tip`
+  return retryMessage(key, { failures, code, seconds: state.waitSeconds ?? 0 })
+}
 
 const uploadHint = computed(() => {
   const task = uploadTask.value
@@ -677,6 +728,9 @@ const uploadHint = computed(() => {
   if (task.phase === 'uploading') return t('documents.hint.uploading', { percent: task.percent })
   if (task.phase === 'paused') return t('documents.hint.paused', { percent: task.percent })
   if (task.phase === 'ingesting') {
+    const hint = retryHint(task.retryDocument)
+    if (hint) return `${hint} · ${retryTooltip(task.retryDocument)}`
+    if (task.retryDocument?.cancel_requested) return t('documents.toast.cancelSubmitted')
     if (task.deduplicated) return t('documents.hint.reusedIngesting')
     // 0 时不要显示 "0%"，否则看起来像卡死了
     return task.percent === 0
@@ -685,6 +739,11 @@ const uploadHint = computed(() => {
   }
   if (task.phase === 'done') return t('documents.hint.done')
   if (task.phase === 'cancelled') return t('documents.hint.cancelled')
+  if (task.phase === 'failed' && task.retryDocument?.status === 'failed') {
+    return `${retryHint(task.retryDocument)} · ${ingestFailureMessage(
+      task.retryDocument.error_message, retryTooltip(task.retryDocument), t('documents.failedFallback')
+    )}`
+  }
   return task.deduplicated
     ? t('documents.hint.reusedNeedsReindex')
     : t('documents.hint.failed')
@@ -927,6 +986,7 @@ function resumeAfterCapabilityRecovery() {
 
 /** 请求已明确返回 401/403/404：收起能力，停止队列与上传，不当作普通网络故障重试。 */
 function markCapabilityFailure(error: unknown) {
+  if (disposed) return
   capabilityState.value = { status: 'unknown' }
   capabilityNotice.value = revokesCapability(error) ? 'revoked' : 'unavailable'
   // 权限类失败后不再展示旧文档行，也不保留可能属于撤权前后的完成回执。
@@ -984,7 +1044,7 @@ async function recheckCapability(): Promise<KbCapabilityState> {
     const found = data.find((k) => k.id === kbId) || null
     return capabilitiesFromKb(found)
   } catch (err: unknown) {
-    if (revokesCapability(err)) {
+    if (!disposed && revokesCapability(err)) {
       capabilityState.value = { status: 'unknown' }
       capabilityNotice.value = 'revoked'
       // 明确撤权：暂存的完成回执不能再在日后恢复时重放。
@@ -1016,6 +1076,7 @@ async function tryRecoverPendingCompletion() {
 
 /** 用户主动动作前的能力门禁；未知/只读/已撤销都不发写请求。 */
 function ensureCanManage(): boolean {
+  if (disposed) return false
   if (canManageDocuments.value) return true
   const key =
     capabilityNotice.value === 'revoked'
@@ -1028,6 +1089,7 @@ function ensureCanManage(): boolean {
 }
 
 function handleActionError(error: unknown): boolean {
+  if (disposed) return true
   if (isCancel(error)) return true
   if (revokesCapability(error)) {
     markCapabilityFailure(error)
@@ -1075,6 +1137,7 @@ async function load() {
 
     if (docResult.status === 'fulfilled') {
       // KB 读取已明确拒绝时上面已经 return；这里只处理能力仍可读取的情况。
+      retryNow.value = Date.now()
       docs.value = docResult.value.data.items
       total.value = docResult.value.data.total
       if (shouldPoll(docs.value.map((d) => d.status), currentEntry.value?.phase === 'ingesting')) {
@@ -1090,7 +1153,7 @@ async function load() {
       }
     }
   } finally {
-    if (loadEpoch.value === sequence) loading.value = false
+    if (!disposed && loadEpoch.value === sequence) loading.value = false
   }
 }
 
@@ -1124,10 +1187,13 @@ function onSizeChange(value: number) {
 function startPolling() {
   stopPolling()
   if (disposed) return
+  retryNow.value = Date.now()
   timer = window.setInterval(pollOnce, 1500)
 }
 
 async function pollOnce() {
+  if (disposed) return
+  retryNow.value = Date.now()
   // 用户触发的加载优先：它自会决定是否继续轮询，避免两个响应互相覆盖
   if (pollInFlight || disposed || loading.value) return
   const snapshot = query.value
@@ -1162,13 +1228,17 @@ async function pollOnce() {
       stopPolling()
       return
     }
+    retryNow.value = Date.now()
     docs.value = data.items
     total.value = data.total
     const entry = currentEntry.value
     if (entry && entry.key === pollKey && entry.phase === 'ingesting' && entry.task.docId) {
       try {
         const { data: active } = await docApi.get(kbId, entry.task.docId)
-        if (!disposed && queueState.value.current?.key === pollKey) syncUploadEntry(active)
+        if (isLatestResponse(epoch, listEpoch.value, snapshot, query.value, disposed) &&
+            queueState.value.current?.key === pollKey && canManageDocuments.value) {
+          syncUploadEntry(active)
+        }
       } catch (err: any) {
         const stale = isStalePoll(pollKey, queueState.value.current?.key, epoch, listEpoch.value, disposed)
         if (err?.response?.status === 404) {
@@ -1384,7 +1454,8 @@ async function reindexExisting(entry: UploadEntry) {
     }, ['failed'], disposed)
   }
   try {
-    await docApi.reindex(kbId, entry.task.docId)
+    const { data } = await docApi.reindex(kbId, entry.task.docId)
+    if (stillOurs() && canManageDocuments.value) entry.task.retryDocument = data
   } catch (err: unknown) {
     if (handleActionError(err)) return
     // 失败提示同样只对原条目有效，且卸载后静默
@@ -1496,10 +1567,14 @@ function syncUploadEntry(row: DocumentItem) {
   const entry = queueState.value.current
   if (!entry || entry.phase !== 'ingesting' || entry.task.docId !== row.id) return
   entry.task.docStatus = row.status
+  entry.task.retryDocument = row
+  retryNow.value = Date.now()
   if (row.status === 'ready') {
     markDone(entry.key)
   } else if (row.status === 'failed') {
-    markFailed(entry.key, row.error_message || undefined)
+    markFailed(entry.key, ingestFailureMessage(
+      row.error_message, retryTooltip(row), t('documents.toast.ingestFailed')
+    ))
   } else if (row.status === 'cancelled') {
     markCancelled(entry.key)
   } else {
@@ -1682,6 +1757,7 @@ function handleCompleted(key: string, completed: UploadCompleteResult) {
   Object.assign(entry.task, {
     docId: doc.id,
     docStatus: doc.status,
+    retryDocument: doc,
     percent: doc.progress
   })
 
@@ -1812,7 +1888,7 @@ function clearResume(uploadId: string) {
 
 async function restoreResume() {
   // 能力未知或不足时绝不自动恢复上传（恢复可能触发服务端会话写入）。
-  if (!canManageDocuments.value) return
+  if (disposed || !canManageDocuments.value) return
   const raw = localStorage.getItem(RESUME_KEY(kbId))
   if (!raw) return
   const saved = readResume(localStorage, kbId)
@@ -1912,6 +1988,11 @@ async function cancelIngestById(docId: string, filename: string, entryKey?: stri
 
 async function reindex(row: DocumentItem) {
   if (!ensureCanManage()) return
+  const entry = currentEntry.value
+  if (entry?.phase === 'failed' && entry.task.docId === row.id) {
+    await reindexExisting(entry)
+    return
+  }
   try {
     await docApi.reindex(kbId, row.id)
   } catch (err: unknown) {
@@ -1957,7 +2038,7 @@ async function remove(row: DocumentItem) {
 onMounted(async () => {
   await load()
   // 恢复"未完成上传"提示：只恢复当前会话，等待队列里的 File 不跨刷新
-  void restoreResume()
+  if (!disposed) void restoreResume()
 })
 onBeforeUnmount(() => {
   disposed = true
@@ -2342,6 +2423,19 @@ onBeforeUnmount(() => {
   font-size: 12.5px;
 }
 
+.retry-hint {
+  margin-top: 5px;
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.retry-hint-terminal {
+  color: var(--danger);
+}
+
 .row-actions {
   display: flex;
   align-items: center;
@@ -2404,6 +2498,22 @@ onBeforeUnmount(() => {
 
   .upload-head {
     align-items: flex-start;
+  }
+
+  .upload-file {
+    max-width: 100%;
+  }
+
+  .upload-hint {
+    overflow-wrap: anywhere;
+  }
+
+  .panel-tools {
+    flex-wrap: wrap;
+  }
+
+  .table :deep(.el-table-fixed-column--right) {
+    position: static !important;
   }
 
   .upload-actions {

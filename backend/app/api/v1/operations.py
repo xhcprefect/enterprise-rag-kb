@@ -239,6 +239,16 @@ def _render_database_metrics(database: dict) -> list[str]:
                 "# TYPE ragkb_ingest_oldest_pending_age_seconds gauge",
             ]
             lines.append(f"ragkb_ingest_oldest_pending_age_seconds {float(oldest):.3f}")
+        lines += [
+            "# HELP ragkb_ingest_retry_waiting_documents Pending documents inside a failure backoff window.",
+            "# TYPE ragkb_ingest_retry_waiting_documents gauge",
+        ]
+        lines.append(f"ragkb_ingest_retry_waiting_documents {int(database.get('retry_waiting') or 0)}")
+        lines += [
+            "# HELP ragkb_ingest_failed_documents Documents that exhausted or hit permanent ingest failures.",
+            "# TYPE ragkb_ingest_failed_documents gauge",
+        ]
+        lines.append(f"ragkb_ingest_failed_documents {int(database.get('failed') or 0)}")
 
     pool = database.get("pool") or {}
     for field, name in _POOL_METRICS.items():
@@ -308,6 +318,22 @@ def _collect_db_stats(timeout_seconds: float) -> dict:
                     Document.status == DocumentStatus.PENDING.value
                 )
             )
+            # 尚未到解禁时刻、且未请求取消的 pending 才受退避约束。
+            # 它们仍属于 queued；独立指标用于识别上游抖动，取消清理可立即领取。
+            retry_waiting = conn.scalar(
+                select(func.count()).select_from(Document).where(
+                    Document.status == DocumentStatus.PENDING.value,
+                    Document.cancel_requested.is_(False),
+                    Document.next_attempt_at.is_not(None),
+                    Document.next_attempt_at > datetime.now(timezone.utc),
+                )
+            ) or 0
+            # 已耗尽重试的终结失败：这批才是真正需要人工介入的集合。
+            exhausted = conn.scalar(
+                select(func.count()).select_from(Document).where(
+                    Document.status == DocumentStatus.FAILED.value,
+                )
+            ) or 0
     oldest_age = None
     if oldest_pending is not None:
         if oldest_pending.tzinfo is None:
@@ -318,6 +344,8 @@ def _collect_db_stats(timeout_seconds: float) -> dict:
         "statuses": statuses,
         "queued": int(queued),
         "stale_processing": int(stale),
+        "retry_waiting": int(retry_waiting),
+        "failed": int(exhausted),
         "oldest_pending_age_seconds": oldest_age,
         "pool": _pool_stats(),
     }
@@ -387,6 +415,8 @@ async def get_summary(_admin=Depends(require_admin)):
             "statuses": database["statuses"],
             "queued": database["queued"],
             "stale_processing": database["stale_processing"],
+            "retry_waiting": database["retry_waiting"],
+            "failed": database["failed"],
             "oldest_pending_age_seconds": database["oldest_pending_age_seconds"],
             "state": _queue_summary_from_counts(database["statuses"]),
         }

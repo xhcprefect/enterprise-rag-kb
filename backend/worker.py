@@ -134,7 +134,11 @@ def _stop(signum, frame):  # noqa: ANN001, ARG001 - signal handler 签名固定
 
 
 def recover_stale(db: Session) -> int:
-    """把心跳超时的 processing 文档退回 pending，续传时保留已入库的分块。"""
+    """把心跳超时的 processing 文档退回 pending，续传时保留已入库的分块。
+
+    ``next_attempt_at`` 不动：这里恢复的是"进程死了"，不是任务失败。
+    正在处理的任务领取时已清退避；恢复不消耗失败预算。
+    """
     deadline = datetime.now(timezone.utc) - timedelta(seconds=settings.INGEST_STALE_SECONDS)
     result = db.execute(
         update(Document)
@@ -151,10 +155,21 @@ def recover_stale(db: Session) -> int:
 
 
 def claim_one(db: Session) -> tuple[uuid.UUID, uuid.UUID] | None:
-    """原子领取一个待处理文档。"""
+    """原子领取一个待处理文档。
+
+    失败退避未到期的文档（``next_attempt_at`` 在未来）不会被领取：
+    取消任务除外：清理不发模型请求，应立即参与竞争。这条条件必须与
+    ``ingest._claim`` 的校验保持一致，否则绕过 worker 的调用会提前拿走任务。
+    """
+    now = datetime.now(timezone.utc)
     doc_id = db.scalar(
         select(Document.id)
-        .where(Document.status == DocumentStatus.PENDING.value)
+        .where(
+            Document.status == DocumentStatus.PENDING.value,
+            (Document.cancel_requested.is_(True))
+            | (Document.next_attempt_at.is_(None))
+            | (Document.next_attempt_at <= now),
+        )
         .order_by(Document.created_at)
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -171,6 +186,7 @@ def claim_one(db: Session) -> tuple[uuid.UUID, uuid.UUID] | None:
             status=DocumentStatus.PROCESSING.value,
             lease_id=lease_id,
             heartbeat_at=datetime.now(timezone.utc),
+            next_attempt_at=None,
         )
     )
     db.commit()
@@ -252,7 +268,11 @@ def _ingest_main() -> int:
 
 
 def _release(db: Session, doc_id: uuid.UUID, lease_id: uuid.UUID) -> None:
-    """把刚领取、尚未处理的任务按租约条件退回 pending。"""
+    """把刚领取、尚未处理的任务按租约条件退回 pending。
+
+    ``next_attempt_at`` 保持原值：这是停机交回，不是一次失败，
+    不应清掉失败退避留下的解禁时刻。
+    """
     try:
         result = db.execute(
             update(Document)

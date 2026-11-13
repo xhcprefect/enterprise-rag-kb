@@ -137,12 +137,23 @@ class DatabaseTests(unittest.TestCase):
         return {doc.metadata["document_id"] for doc, _ in rag.retrieve(self.kb.collection_name, "q", 6)}
 
     def test_partial_failure_is_not_searchable(self):
+        from tests._memory_project_test_gate import verify
+
+        verify(TEST_URL,
+               os.environ.get("TEST_DATABASE_OWNER", "") or os.environ.get("TEST_EXPECTED_OWNER", ""),
+               db_session.engine)
         did = self.add_doc(2)
         self.embeddings.fail_on = 2
         with self.assertLogs("app.services.ingest", level="ERROR"):
             ingest.ingest_document_task(str(did))
         with SessionLocal() as db:
-            self.assertEqual(db.get(Document, did).status, "failed")
+            doc = db.get(Document, did)
+            self.assertEqual(doc.status, "pending")
+            self.assertEqual(doc.ingest_attempts, 1)
+            self.assertGreater(doc.next_attempt_at, datetime.now(timezone.utc))
+            self.assertEqual(db.scalar(select(func.count()).select_from(DocumentChunk).where(
+                DocumentChunk.document_id == did, DocumentChunk.embedded.is_(True),
+            )), 1)
             self.assertEqual(db.scalar(select(func.count()).select_from(self.store.EmbeddingStore)), 1)
         self.assertNotIn(str(did), self.retrieve_ids())
 

@@ -25,7 +25,6 @@ _TEST_URL = TEST_URL
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
-from sqlalchemy.engine import make_url
 
 from app.api.v1 import operations
 from app.core.config import settings
@@ -45,28 +44,20 @@ from app.models import (
 from app.services import worker_status as ws
 
 
-def _bind_engine() -> None:
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-
-    if not _TEST_URL:
-        return
-    target = make_url(_TEST_URL)
-    if db_session.engine.url != target:
-        db_session.engine.dispose()
-        db_session.engine = create_engine(
-            _TEST_URL, pool_pre_ping=True, pool_size=5, max_overflow=5, pool_recycle=1800
-        )
-        db_session.SessionLocal.configure(bind=db_session.engine)
+from tests._memory_project_test_gate import verify  # noqa: E402
 
 
-_bind_engine()
+def _assert_owned_test_database():
+    return verify(_TEST_URL,
+                  os.environ.get("TEST_DATABASE_OWNER", "") or os.environ.get("TEST_EXPECTED_OWNER", ""),
+                  db_session.engine)
 
-from app.db.base import Base  # noqa: E402
-import app.models  # noqa: E402,F401  确保所有表已注册
 
+# 不重绑实际 app engine；配置不匹配必须在连接/建表之前失败。
 if _TEST_URL:
-    Base.metadata.create_all(bind=db_session.engine)
+    _assert_owned_test_database()
+    from app.db.init_db import init_db
+    init_db(create_admin=False)
 
 
 def _async_return(value):
@@ -89,6 +80,7 @@ def build_app() -> FastAPI:
 class OperationsTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        _assert_owned_test_database()
         cls.app = build_app()
         cls.client = TestClient(cls.app)
         cls._purge()
@@ -122,6 +114,7 @@ class OperationsTestCase(unittest.TestCase):
             db.commit()
 
     def setUp(self):
+        _assert_owned_test_database()
         metrics.reset()
 
     def tearDown(self):
@@ -135,11 +128,11 @@ class OperationsTestCase(unittest.TestCase):
         token = create_access_token(str(self.member.id), self.member.role, token_version=self.member.token_version)
         return {"Authorization": f"Bearer {token}"}
 
-    def _add_document(self, status=DocumentStatus.PENDING.value, heartbeat=None, lease_id=None):
+    def _add_document(self, status=DocumentStatus.PENDING.value, heartbeat=None, lease_id=None, **retry):
         with db_session.SessionLocal() as db:
             doc = Document(kb_id=self.kb.id, filename=f"ops_test_{uuid.uuid4().hex[:8]}.txt",
                            file_ext="txt", file_size=1, stored_path="ops_test.txt",
-                           status=status, heartbeat_at=heartbeat, lease_id=lease_id)
+                           status=status, heartbeat_at=heartbeat, lease_id=lease_id, **retry)
             db.add(doc)
             db.commit()
             db.refresh(doc)
@@ -232,6 +225,41 @@ class OperationsTestCase(unittest.TestCase):
         finally:
             self._purge()
 
+    def test_retry_waiting_and_terminal_failures_match_real_database_and_metrics(self):
+        self._purge()
+        before = operations._collect_db_stats(2.0)
+        now = datetime.now(timezone.utc)
+        self._add_document(ingest_attempts=1, last_error_code="network",
+                           next_attempt_at=now + timedelta(minutes=10))
+        self._add_document(ingest_attempts=2, last_error_code="timeout",
+                           next_attempt_at=now - timedelta(seconds=1))
+        self._add_document()  # 从未失败的普通 pending 仍计入 queued。
+        self._add_document(ingest_attempts=1, last_error_code="network", cancel_requested=True,
+                           next_attempt_at=now + timedelta(minutes=10))  # 取消清理可立即领，不算等待。
+        self._add_document(DocumentStatus.PROCESSING.value, heartbeat=now, lease_id=uuid.uuid4(),
+                           ingest_attempts=1, last_error_code="network")
+        self._add_document(DocumentStatus.FAILED.value, ingest_attempts=1, last_error_code="empty_content")
+        self._add_document(DocumentStatus.FAILED.value, ingest_attempts=3, last_error_code="network")
+        try:
+            response = self.client.get("/api/v1/operations/summary", headers=self._admin_headers())
+            self.assertEqual(response.status_code, 200)
+            queue = response.json()["data"]["queue"]
+            self.assertEqual(queue["retry_waiting"], before["retry_waiting"] + 1)
+            self.assertEqual(queue["failed"], before["failed"] + 2)
+            self.assertEqual(queue["queued"], before["queued"] + 5)
+            self.assertEqual(queue["queued"], queue["statuses"]["pending"] + queue["statuses"]["processing"])
+            with patch.object(settings, "METRICS_TOKEN", "t0ken"):
+                metrics_response = self.client.get("/api/v1/operations/metrics",
+                                                   headers={"Authorization": "Bearer t0ken"})
+            self.assertEqual(metrics_response.status_code, 200)
+            for field, metric in (("retry_waiting", "ragkb_ingest_retry_waiting_documents"),
+                                  ("failed", "ragkb_ingest_failed_documents"),
+                                  ("queued", "ragkb_ingest_queued_documents")):
+                values = [line for line in metrics_response.text.splitlines() if line.startswith(metric + " ")]
+                self.assertEqual(values, [f"{metric} {queue[field]}"])
+        finally:
+            self._purge()
+
     def test_metrics_omits_unknown_queue_values_when_database_unavailable(self):
         from sqlalchemy import create_engine
 
@@ -251,6 +279,8 @@ class OperationsTestCase(unittest.TestCase):
         self.assertNotIn("ragkb_ingest_queued_documents", text)
         self.assertNotIn("ragkb_ingest_stale_processing_documents", text)
         self.assertNotIn("ragkb_ingest_oldest_pending_age_seconds", text)
+        self.assertNotIn("ragkb_ingest_retry_waiting_documents", text)
+        self.assertNotIn("ragkb_ingest_failed_documents", text)
         self.assertNotIn("bad", text)
 
     def test_metrics_auth_is_checked_before_touching_the_database(self):
@@ -284,6 +314,8 @@ class OperationsTestCase(unittest.TestCase):
         self.assertIn("ragkb_db_available 0", response.text)
         self.assertNotIn("ragkb_ingest_queued_documents", response.text)
         self.assertNotIn('ragkb_ingest_documents{status="pending"} 0', response.text)
+        self.assertNotIn("ragkb_ingest_retry_waiting_documents", response.text)
+        self.assertNotIn("ragkb_ingest_failed_documents", response.text)
 
     # ---- summary ------------------------------------------------------
     def test_summary_requires_admin(self):
