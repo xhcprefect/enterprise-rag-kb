@@ -147,6 +147,8 @@ class UploadCompletionLockTests(unittest.TestCase):
             created_at=datetime.now(timezone.utc), chunk_count=0, char_count=0,
             progress=0, cancel_requested=False, index_version=0, maintainer="",
             enabled=True, governance_revision=0,
+            # 失败重试三列的 ORM 默认值（真实 INSERT 时由 SQLAlchemy 填）。
+            ingest_attempts=0, next_attempt_at=None, last_error_code=None,
         ).items():
             setattr(document, name, value)
 

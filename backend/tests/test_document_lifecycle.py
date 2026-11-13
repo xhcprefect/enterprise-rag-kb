@@ -257,6 +257,9 @@ def _read_payload(**overrides):
         "char_count": 0,
         "progress": 0,
         "cancel_requested": False,
+        "ingest_attempts": 0,
+        "next_attempt_at": None,
+        "last_error_code": None,
         "created_at": BASE,
         "index_version": 1,
         "maintainer": "ops",
@@ -304,6 +307,28 @@ class DocumentReadSchemaTests(unittest.TestCase):
     def test_document_read_governance_revision_negative_rejected(self):
         with self.assertRaises(ValidationError):
             DocumentRead.model_validate(_read_payload(governance_revision=-1))
+
+    def test_document_read_retry_fields_default_when_absent(self):
+        """重试字段是新增的运维信息，不是治理契约：旧数据缺失时给确定默认，而不是 500。"""
+        payload = _read_payload()
+        for key in ("ingest_attempts", "next_attempt_at", "last_error_code"):
+            payload.pop(key)
+        dto = DocumentRead.model_validate(payload)
+        self.assertEqual(dto.ingest_attempts, 0)
+        self.assertIsNone(dto.next_attempt_at)
+        self.assertIsNone(dto.last_error_code)
+
+    def test_document_read_negative_ingest_attempts_rejected(self):
+        with self.assertRaises(ValidationError):
+            DocumentRead.model_validate(_read_payload(ingest_attempts=-1))
+
+    def test_document_read_next_attempt_at_serializes_as_utc(self):
+        """与既有时间字段一致：aware 值规范到 UTC 后再输出，naive 不补时区。"""
+        dto = DocumentRead.model_validate(_read_payload(
+            next_attempt_at=datetime(2026, 1, 1, 8, 0, tzinfo=timezone(timedelta(hours=8)))
+        ))
+        dumped = dto.model_dump(mode="json")
+        self.assertEqual(dumped["next_attempt_at"], "2026-01-01T00:00:00+00:00")
 
     def test_document_read_naive_date_not_fabricated(self):
         dto = DocumentRead.model_validate(_read_payload(valid_from=datetime(2026, 1, 1)))

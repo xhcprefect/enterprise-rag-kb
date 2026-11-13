@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from langchain_core.documents import Document as LCDocument
@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import Document, DocumentChunk, DocumentStatus, KnowledgeBase
+from app.services import ingest_failures
 from app.services.cloud_models import EmbeddingStopped, embedding_stop_scope
 from app.services.structured_documents import iter_structured_chunks
 from app.services.hybrid_search import build_search_text
@@ -167,11 +168,18 @@ def _claim(db: Session, document_id: uuid.UUID, lease_id: uuid.UUID | None) -> I
     if lease_id is None:
         if doc.status != DocumentStatus.PENDING.value:
             raise IngestLeaseLost
+        # 取消只做清理，不能被失败退避挡住；其余任务必须等到解禁时刻。
+        # 此条件与 worker.claim_one 保持一致，直接调用也不能提前执行重试。
+        now = _now()
+        if not doc.cancel_requested and doc.next_attempt_at is not None and doc.next_attempt_at > now:
+            raise IngestLeaseLost
         doc.lease_id = uuid.uuid4()
         doc.status = DocumentStatus.PROCESSING.value
     elif doc.status != DocumentStatus.PROCESSING.value or doc.lease_id != lease_id:
         raise IngestLeaseLost
     doc.error_message = None
+    # next_attempt_at 表示任务是否仍处于退避；领取后清掉过期计划时刻。
+    doc.next_attempt_at = None
     doc.heartbeat_at = _now()
     job = IngestJob(doc.id, doc.kb_id, doc.filename, doc.stored_path, doc.index_version, doc.lease_id, getattr(doc, "uploaded_by", None))
     db.commit()
@@ -283,6 +291,9 @@ def _cancel_job(db: Session, job: IngestJob) -> None:
         doc.status, doc.error_message = DocumentStatus.CANCELLED.value, "已取消入库"
         doc.progress = doc.chunk_count = doc.char_count = 0
         doc.parse_done, doc.lease_id = False, None
+        # 取消是显式终结：清掉失败重试状态，避免残留的退避时刻或次数
+        # 影响用户后续的重新入库。
+        doc.ingest_attempts, doc.next_attempt_at, doc.last_error_code = 0, None, None
         db.commit()
     except IngestLeaseLost:
         db.rollback()
@@ -316,6 +327,7 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None, *,
     """
     started = time.perf_counter()
     job: IngestJob | None = None
+    parsing = False
     with SessionLocal() as db:
         try:
             # 已停止且没有拿到租约：不领取任何新任务。已经由 worker 领取的
@@ -324,6 +336,8 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None, *,
                 logger.info("已收到停机信号，跳过领取: %s", document_id)
                 return
             job = _claim(db, uuid.UUID(document_id), lease_id)
+            _locked_doc(db, job)  # 取消优先，且不初始化/调用向量模型。
+            db.commit()
             if _stop_requested(stop_event):
                 raise IngestStopped
             kb = db.get(KnowledgeBase, job.kb_id)
@@ -343,6 +357,7 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None, *,
                     # 正常返回即代表整份文件已切分并落库；中途停机由 _persist_chunks
                     # 抛 IngestStopped，因此这里可以安全地置 parse_done。即便此刻已收到
                     # 停机信号，完整解析也应当作为检查点保留，供下次直接向量化。
+                    parsing = True
                     total = _persist_chunks(db, job, stop_event)
                     if not total:
                         raise ValueError("切分后无有效内容")
@@ -351,6 +366,7 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None, *,
                     doc.parse_done = True
                     doc.progress = PARSE_TO
                     db.commit()
+                    parsing = False
                 else:
                     total = db.scalar(select(func.count()).select_from(DocumentChunk).where(
                         DocumentChunk.document_id == job.document_id)) or 0
@@ -374,6 +390,9 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None, *,
                 doc.chunk_count, doc.char_count = total, int(chars)
                 doc.progress, doc.status = 100, DocumentStatus.READY.value
                 doc.heartbeat_at, doc.lease_id = _now(), None
+                # 成功即清零重试状态：下一次失败重新从第 1 次开始计，
+                # 不会因为历史抖动用掉本次的真实重试额度。
+                doc.ingest_attempts, doc.next_attempt_at, doc.last_error_code = 0, None, None
                 db.commit()
             logger.info("文档入库完成: %s (%d chunks, %.1fs)", job.filename, total, time.perf_counter() - started)
         except IngestLeaseLost:
@@ -413,26 +432,71 @@ def ingest_document_task(document_id: str, lease_id: uuid.UUID | None = None, *,
                     return
             logger.exception("文档处理失败: %s", document_id)
             if job is not None:
+                # 先分类，再决定是"退避重试"还是"终结为 failed"。
+                # 分类本身是纯函数，不访问数据库，因此放在事务外也不会读到脏状态。
+                failure_code = ingest_failures.classify_failure(exc, parsing=parsing)
+                safe_message = _safe_parse_message(exc)
                 try:
-                    doc = _locked_doc(db, job, allow_cancel=True)
-                    doc.status = DocumentStatus.FAILED.value
-                    # 只有专用解析错误可以给出固定/有边的安全提示；其它异常（含
-                    # PyMuPDF、数据库或网络的第三方消息）保持原通用文案，绝不回显
-                    # str(exc)、路径或原文。
-                    doc.error_message = (_safe_parse_message(exc)
-                                         or "文档处理失败，请联系管理员检查日志")
-                    doc.lease_id = None
-                    db.commit()
+                    # 网络异常和取消可以并发发生；重新锁行时租约优先，其次取消，
+                    # 绝不能把已请求取消的文档写成退避 pending 或 failed。
+                    doc = _locked_doc(db, job)
+                    doc.ingest_attempts = (doc.ingest_attempts or 0) + 1
+                    doc.last_error_code = failure_code
+                    if (ingest_failures.is_retryable(failure_code)
+                            and doc.ingest_attempts < settings.INGEST_MAX_ATTEMPTS):
+                        # 有界重试：退回 pending 并设置解禁时刻，等待由队列而非
+                        # worker 线程承担，期间不占任何执行资源。
+                        delay = ingest_failures.retry_delay_seconds(
+                            doc.ingest_attempts,
+                            base=settings.INGEST_RETRY_BASE_SECONDS,
+                            maximum=settings.INGEST_RETRY_MAX_SECONDS,
+                        )
+                        doc.status = DocumentStatus.PENDING.value
+                        doc.next_attempt_at = _now() + timedelta(seconds=delay)
+                        doc.error_message = None
+                        doc.lease_id, doc.heartbeat_at = None, None
+                        db.commit()
+                        logger.warning(
+                            "文档入库失败，%d 秒后重试（第 %d/%d 次，code=%s）: %s",
+                            delay, doc.ingest_attempts, settings.INGEST_MAX_ATTEMPTS,
+                            failure_code, document_id,
+                        )
+                    else:
+                        # 不可恢复，或重试次数已用尽：终结为 failed，交由人工处理。
+                        # 保留 ingest_attempts/last_error_code，供运维页与告警区分
+                        # "抖动耗尽"和"文件本身有问题"。
+                        doc.status = DocumentStatus.FAILED.value
+                        doc.next_attempt_at = None
+                        # 只有专用解析错误可以给出固定/有边的安全提示；其它异常（含
+                        # PyMuPDF、数据库或网络的第三方消息）保持原通用文案，绝不回显
+                        # str(exc)、路径或原文。
+                        doc.error_message = (safe_message
+                                             or "文档处理失败，请联系管理员检查日志")
+                        doc.lease_id = None
+                        db.commit()
+                        logger.warning(
+                            "文档入库终结失败（第 %d/%d 次，code=%s）: %s",
+                            doc.ingest_attempts, settings.INGEST_MAX_ATTEMPTS,
+                            failure_code, document_id,
+                        )
+                except IngestCancelled:
+                    db.rollback()
+                    _cancel_job(db, job)
                 except IngestLeaseLost:
                     db.rollback()
 
 
 def reset_document_for_reindex(db: Session, doc: Document) -> None:
-    """切换代次并重新排队；旧向量立即失去可检索资格。"""
+    """切换代次并重新排队；旧向量立即失去可检索资格。
+
+    人工重建索引是显式的"再给一次机会"：重试次数、退避时刻与失败代号
+    全部清零，让这次重建拥有完整的重试额度，而不是继承上一次已耗尽的计数。
+    """
     db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == doc.id))
     doc.index_version += 1
     doc.status, doc.error_message = DocumentStatus.PENDING.value, None
     doc.progress = doc.chunk_count = doc.char_count = 0
     doc.cancel_requested, doc.parse_done = False, False
     doc.heartbeat_at = doc.lease_id = None
+    doc.ingest_attempts, doc.next_attempt_at, doc.last_error_code = 0, None, None
     db.commit()

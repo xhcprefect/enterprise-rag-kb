@@ -28,6 +28,11 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "parse_done": "BOOLEAN NOT NULL DEFAULT FALSE",
         "index_version": "INTEGER NOT NULL DEFAULT 0",
         "lease_id": "UUID",
+        # 任务级重试：失败次数、退避解禁时刻、安全错误分类代号。
+        # 失败次数带 server DEFAULT 0；时间/错误码可空，旧行无需伪造计划与错误。
+        "ingest_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "next_attempt_at": "TIMESTAMPTZ",
+        "last_error_code": "VARCHAR(32)",
         # 服务端真实内容摘要；老数据保持 NULL，由 backfill 脚本按需补齐。
         "content_sha256": "VARCHAR(64)",
         # ---- 文档治理（T3 冻结契约）----
@@ -286,6 +291,14 @@ def init_db(create_admin: bool = True) -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_model_usage_turn_operation ON model_usage (turn_id, operation)"))
         # R1b：在线回归用量关联索引；老库由这里幂等补齐（create_all 不补缺失索引）。
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_model_usage_regression_job ON model_usage (regression_job_id)"))
+        if "documents" in table_names:
+            # 入库领取查询的核心条件（status + next_attempt_at），部分索引只覆盖队列态，
+            # 不把已 ready 的历史文档也纳入索引维护成本。
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_documents_ingest_queue "
+                "ON documents (next_attempt_at, created_at) "
+                "WHERE status IN ('pending', 'processing')"
+            ))
         if "feedback_regression_runs" in table_names:
             # 兼容曾经手工补过可空列/缺省值的老库：已知 NULL 语义只可能是旧 manual。
             conn.execute(text(

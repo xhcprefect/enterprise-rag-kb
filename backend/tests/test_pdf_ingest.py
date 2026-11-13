@@ -269,7 +269,9 @@ class PdfIngestTests(unittest.TestCase):
             raise RuntimeError(leaked)
             yield  # pragma: no cover
 
-        with patch.object(ingest, "iter_structured_chunks", explode):
+        # 此用例验证终结后的安全提示；默认预算下 unknown 会先有限重试。
+        with patch.object(ingest, "iter_structured_chunks", explode), \
+             patch.object(settings, "INGEST_MAX_ATTEMPTS", 1):
             with self.assertLogs("app.services.ingest", level="ERROR"):
                 self.run_ingest(doc_id)
         state = self.snapshot(doc_id)
@@ -284,8 +286,10 @@ class PdfIngestTests(unittest.TestCase):
     def test_image_probe_failure_fails_the_document_instead_of_publishing(self):
         path = self.scan_mixed_pdf()
         doc_id = self.add_document(path)
+        # 单次预算保持本例“不能发布/不泄露正文”的终结场景。
         with patch.object(pymupdf.Page, "get_image_info",
-                          side_effect=RuntimeError("probe failed at /private/secret")):
+                          side_effect=RuntimeError("probe failed at /private/secret")), \
+             patch.object(settings, "INGEST_MAX_ATTEMPTS", 1):
             with self.assertLogs("app.services.ingest", level="ERROR"):
                 self.run_ingest(doc_id)
         state = self.snapshot(doc_id)

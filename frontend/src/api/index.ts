@@ -61,6 +61,15 @@ export interface DocumentItem {
   char_count: number
   progress: number
   cancel_requested: boolean
+  /**
+   * 入库失败重试状态（后端白名单代号）。
+   * - ingest_attempts：已失败次数，成功入库后清零；
+   * - next_attempt_at：退避解禁时刻，UTC ISO；只有可恢复失败才有值；
+   * - last_error_code：稳定代号（不是给用户看的中文，需要前端映射）。
+   */
+  ingest_attempts?: number
+  next_attempt_at?: string | null
+  last_error_code?: string | null
   created_at: string
   /** 当前索引代次；非负整数。 */
   index_version: number

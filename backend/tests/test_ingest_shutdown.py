@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -107,6 +108,7 @@ class IngestShutdownTests(unittest.TestCase):
             return {
                 "status": doc.status, "progress": doc.progress, "parse_done": doc.parse_done,
                 "lease": doc.lease_id, "heartbeat": doc.heartbeat_at, "error": doc.error_message,
+                "attempts": doc.ingest_attempts, "next": doc.next_attempt_at, "code": doc.last_error_code,
                 "chunk_count": doc.chunk_count, "chunks": len(chunks),
                 "embedded": sum(1 for c in chunks if c.embedded), "vectors": vectors,
             }
@@ -279,12 +281,29 @@ class IngestShutdownTests(unittest.TestCase):
         self.assertEqual(state["embedded"], 0)
         self.assertEqual(self.embeddings.calls, 1)
 
-    def test_network_failure_without_stop_still_fails(self):
+    def test_network_failure_without_stop_schedules_retry_and_keeps_checkpoints(self):
         doc_id = self.make_doc(parse_done=True, chunks=2)
         self.embeddings.fail_on = 1
         ingest.ingest_document_task(str(doc_id))
         state = self.snapshot(doc_id)
+        self.assertEqual(state["status"], DocumentStatus.PENDING.value)
+        self.assertEqual(state["attempts"], 1)
+        self.assertGreater(state["next"], datetime.now(timezone.utc))
+        self.assertTrue(state["parse_done"])
+        self.assertEqual(state["chunks"], 2)
+        self.assertEqual(state["embedded"], 0)
+        self.assertIsNone(state["error"])
+        self.assertIsNone(state["lease"])
+
+    def test_single_attempt_budget_still_finishes_failed(self):
+        doc_id = self.make_doc(parse_done=True, chunks=2)
+        self.embeddings.fail_on = 1
+        with patch.object(settings, "INGEST_MAX_ATTEMPTS", 1):
+            ingest.ingest_document_task(str(doc_id))
+        state = self.snapshot(doc_id)
         self.assertEqual(state["status"], DocumentStatus.FAILED.value)
+        self.assertEqual(state["attempts"], 1)
+        self.assertIsNone(state["next"])
         self.assertIsNotNone(state["error"])
         self.assertIsNone(state["lease"])
 

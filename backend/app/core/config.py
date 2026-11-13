@@ -136,6 +136,16 @@ class Settings(BaseSettings):
     INGEST_BATCH_SIZE: int = 8                 # 每批向量化的分块数
     INGEST_STALE_SECONDS: int = 300            # 心跳超时判定（大于单批耗时的数倍）
     CHUNK_PERSIST_BATCH: int = 500             # 分块落库批大小
+    # 任务级重试：传输层（cloud_models._post）已经对 429/5xx/超时/网络错误
+    # 内部重试 3 次；这里的次数覆盖"整轮尝试都失败"的情况，避免一次上游抖动
+    # 就把文档永久钉在 failed、只能靠人工 reindex 恢复。
+    # 只对可恢复错误排队重试（见 ingest_failures.classify_failure）；永久失败仍计一次失败。
+    INGEST_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    # 退避基数：第 n 次失败后等待 RETRY_BASE * 2**(n-1) 秒（1→30s，2→60s…），
+    # 上限 INGEST_RETRY_MAX_SECONDS。等待发生在队列里（status=pending +
+    # next_attempt_at），不占用 worker 线程，也不阻塞其他文档。
+    INGEST_RETRY_BASE_SECONDS: int = Field(default=30, ge=1, le=3600)
+    INGEST_RETRY_MAX_SECONDS: int = Field(default=600, ge=1, le=86400)
 
     # ===== 普通对话摘要压缩（默认关闭，不新增后台模型调用）=====
     CHAT_MEMORY_ENABLED: bool = False          # false = 完全回到现有窗口裁剪
@@ -214,6 +224,8 @@ class Settings(BaseSettings):
             raise ValueError("上传大小配置不合法")
         if self.INGEST_STALE_SECONDS < 3 or self.THREAD_POOL_SIZE < 1:
             raise ValueError("入库超时或线程池配置不合法")
+        if self.INGEST_RETRY_MAX_SECONDS < self.INGEST_RETRY_BASE_SECONDS:
+            raise ValueError("INGEST_RETRY_MAX_SECONDS 不能小于 INGEST_RETRY_BASE_SECONDS")
         if self.CHAT_MEMORY_ENABLED and self.MEMORY_HISTORY_TOKEN_BUDGET > (
             self.LLM_CONTEXT_WINDOW_TOKENS - self.LLM_MAX_OUTPUT_TOKENS - self.CONTEXT_TOKEN_SAFETY_MARGIN
         ):

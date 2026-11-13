@@ -208,6 +208,16 @@ docker compose --profile summary --profile project --profile regression up -d
 | `RETRIEVAL_TOP_K` | 默认检索条数（问答页滑块初值；调用方未显式指定时生效） | 6 |
 | `RETRIEVAL_MAX_PER_DOC` | 单份文档最多占几条检索结果 | 3 |
 | `MAX_UPLOAD_MB` | 单文件大小上限 | 50 |
+| `INGEST_MAX_ATTEMPTS` | 可恢复的文档入库总尝试次数（含首次） | 3 |
+| `INGEST_RETRY_BASE_SECONDS` / `INGEST_RETRY_MAX_SECONDS` | 任务级指数退避的起始/最大秒数 | 30 / 600 |
+
+### 文档入库失败重试
+
+入库 worker 对明确可恢复的网络、模型上游、限流、存储及数据库故障进行有界重试，等待以 `pending` 任务留在数据库队列，不占 worker 执行线程。`INGEST_MAX_ATTEMPTS` 是任务级总尝试次数，包含首次处理；默认最多 3 次。每次失败等待时间按 `INGEST_RETRY_BASE_SECONDS × 2^(已失败次数-1)` 增长，并封顶于 `INGEST_RETRY_MAX_SECONDS`，默认退避为 30 秒、60 秒。
+
+不支持的格式、无可提取内容、损坏或加密文件、源文件缺失及明确的模型鉴权拒绝不会自动重试；请修复配置或文件后重新上传，或对可恢复的源文档执行“重建索引”。权限/磁盘等存储错误仍受最大尝试次数限制。运维接口和指标分别暴露等待退避与终结失败数量；文档列表用安全的错误码映射显示重试阶段、剩余等待和下一步操作，不展示任意上游异常正文。
+
+`ingest_attempts` 记录当前索引代次内失败的任务级尝试次数（永久失败也记一次），不是单次上游 HTTP 请求次数。未知异常也受同一次数上限约束，不会无限重试。成功入库、明确取消或手工重建索引会清空计数与退避时间；重试沿用已经完整保存的解析/向量批次检查点。进程停机与租约超时属于任务交回，不消耗失败次数。退避中的取消请求可立即被领取清理，不必等倒计时结束；运维的 `retry_waiting` 排除这些取消请求，既有 `queued` 仍包含全部 pending/processing 文档。
 
 ### DeepSeek 关闭思考模式
 

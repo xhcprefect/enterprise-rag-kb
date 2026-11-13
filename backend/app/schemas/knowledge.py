@@ -59,6 +59,12 @@ class DocumentRead(BaseModel):
     char_count: int
     progress: int
     cancel_requested: bool
+    # 失败重试状态：让前端/运维能区分"偶发抖动正在退避"和"文件本身处理不了"。
+    # 带默认值而非必填：老客户端/未 flush 的 ORM 对象不会因此 500；数据库列本身
+    # 非空且有 server DEFAULT，真实读出的行始终有确定值。
+    ingest_attempts: int = Field(default=0, ge=0)
+    next_attempt_at: datetime | None = None
+    last_error_code: str | None = None
     created_at: datetime
     # ---- 治理字段（冻结契约：所有 list/detail/upload/reindex/cancel/complete 路径）----
     # 全部 REQUIRED：缺失/None 会直接校验失败，绝不靠宽松默认放行伪装成治理值。
@@ -77,7 +83,7 @@ class DocumentRead(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    @field_serializer("created_at", "last_reviewed_at", "valid_from", "valid_until", "superseded_at")
+    @field_serializer("created_at", "last_reviewed_at", "valid_from", "valid_until", "superseded_at", "next_attempt_at")
     def _serialize_aware(self, value: datetime | None) -> str | None:
         """统一输出 ISO；aware 值规范到 UTC，naive 值不捏造时区（原样输出）。
 
