@@ -157,6 +157,9 @@ test('page setup merges the real global composer once and switches both language
     i18n.global.setLocaleMessage(locale, catalog)
   }
   for (const locale of ['zh-CN', 'en-US'] as const) assert.equal(i18n.global.te('operations.title', locale), false)
+  // The app's locale comes from browser preferences/navigator.language; pin this
+  // fixture so the first SSR render and later locale round trips are deterministic.
+  i18n.global.locale.value = 'zh-CN'
 
   const merge = mock.method(i18n.global, 'mergeLocaleMessage')
   const app = createSSRApp({
