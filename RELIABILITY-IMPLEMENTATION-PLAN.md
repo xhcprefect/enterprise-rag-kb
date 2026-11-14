@@ -46,4 +46,19 @@
 - 2026-11-14最终浏览器：全新独占PG/API/四worker/回环替身/生产前端，首次UI进入运维页、四角色真实运行数据、中英文切换、一次GET网络失败清旧数据、错误文案切语种、刷新恢复、390×844通过；主代理查看5张截图。随后运维2项+管理员列表6项真实E2E全部通过（37.0s，0失败/重试/跳过），英文深色390px及列表恢复截图已查看。成功数据来自真实API；一次网络中断及延迟真实响应仅用于故障/竞态验证。证据为2026-11-14独占环境acceptance/operations和acceptance/final-regression；14个冻结实现/测试文件指纹在主验前后均一致。
 - P2 CI Actions：10处固定版本更新静态主审通过，PyYAML对照基线仅允许指定uses变化，2026-11-14复核通过。Node22/Python3.12、测试命令、owner/清理门禁、权限、产物路径白名单与保留期不变。Action自身Node24运行、托管runner版本和实际artifact上传仍待云端验证。
 - 隔离资源：2026-11-13后端测试专库已按精确ID清理。旧应用环境恢复时report为failed且无STOPPED收据，旧容器已不存在、复用的无关PID未触碰，失败历史和证据保留。2026-11-14新应用环境按owner/nonce执行down返回0，STOPPED精确归属、report=stopped、原容器不存在；七个子进程与orchestrator均已退出，web/API/stub端口均ECONNREFUSED，全部验收材料保留。没有关闭Docker或清理其他资源。
-- 云端main CI #38原记录：backend/frontend/maintenance成功，browser32/33通过；summary worker publishes and resets real conversation memory失败。本地相同Playwright摘要用例随后1/1通过。本地验收完成时尚未提交推送，2026-11-14已进入用户授权的正式交付阶段；新提交的云端全量、Linux平台检查和artifact实际内容需逐项核实，通过前不声称远程全绿。真实业务质量、生产恢复/告警/ACL、容量与24/72h持续运行仍按ACCEPTANCE-EXECUTION-PLAN.md待外部输入，离线/零网络预检不计实际通过。
+- 云端main CI #38原记录：backend/frontend/maintenance成功，browser32/33通过；summary worker publishes and resets real conversation memory失败。本地相同Playwright摘要用例随后1/1通过。本地验收完成时尚未提交推送；以下记录2026-11-14正式交付后的实际结果，前文“待云端”保留为当时的阶段状态。
+
+## 2026-11-14正式交付与main复验
+
+- db2e427提交完整可靠性修复；首次云端前端423通过/1失败，暴露operations SSR测试依赖主机默认语言。原实施者只固定fixture初始zh-CN并在finally恢复，6af3550提交该三行修复，产品默认语言逻辑保持。主代理独立模拟en-US和zh-CN，各运行7项运维测试及424项前端全量，均无失败或跳过。
+- 准确6af3550的push和pull_request两组共8项检查全部成功，PR #4合并为main提交f567994b43eb98bc5312483621e6e8116f267932。合并后main独立run43557201762四项检查全部成功；实际日志后端2171项、179.937秒、OK(skipped=17)，17项为Linux上的Windows专属检查，目录symlink及两项真实SIGTERM实际通过。前端424/424、0失败/跳过；完整浏览器39/39、8.0分钟，原摘要发布/重置用例通过，harness正常清理。
+- 实际runner2.338.2、Ubuntu24.04镜像20261111.127.1，固定Action版本及其Node24运行时已在云端执行。main诊断包14098864144共89个文件：71个.artifacts、8个.report、10个harness日志/报告，均在既有白名单内，没有manifest、env、browser-state或token/secret命名文件。该核验覆盖归档路径与文件名，不等同于逐文件正文秘密扫描。
+- 原feature分支保留。准确SHA检查报告、原始日志摘要、实际artifact目录核验和本地证据均保留在仓库外；不会为阶段时间状态反复新增提交。
+
+## 额外隔离恢复演练
+
+- 首次运行现有restore-drill.sh --isolated --keep失败，exit2：默认socket pg_isready在bootstrap临时PostgreSQL上提前报告healthy，首个psql遇到临时服务关闭而得到database system is shutting down。该次不计通过，失败report与日志保留。
+- 失败owner drill-20261114121624-1989-246724248的完整容器ID、卷和网络先核对owner/project，再精确删除，项目资源0残留；无关容器未触碰，仓库外失败现场目录保留。drill.env只含合成凭据，不提交或上传。
+- 后续修复独立分支fix/restore-drill-readiness：deploy/tests/drill-compose.yml仅将pg_isready改为显式-h 127.0.0.1，保留现有超时、标签、端口与卷；test-drill-guard.sh新增读取实际probe的三阶段回归。主代理独立8项守卫通过，旧socket配置在bootstrap阶段被准确拒绝、exit1，新TCP配置bootstrap/shutdown失败而ready成功。执行参数经shlex解析后subprocess(argv)运行，不用eval。
+- 主代理用两个全新owner/空数据卷实际执行恢复，两次均exit0，完整脚本耗时18.015秒和20.519秒（含启动/备份/恢复/校验，不能当production RTO）。每次25行逐列一致、4文件SHA256一致、单字节篡改检测有效；另外独立查询恢复后的owner及25行、重算源文件SHA256，并核对恢复文件仅预期篡改项多一字节。第一次额外核验器漏识别Windows sha256sum二进制标记，已修仓库外核验器并对保留证据复核通过；原诊断保留。两次容器/卷/网络均按精确ID与owner清理，项目0残留，原始报告和归档留仓库外。
+- 该合成脚本覆盖测试数据库及uploads，未覆盖production备份、RTO/RPO或projects文件归档。真实业务质量、生产恢复/告警/ACL、容量与24/72h持续运行仍按ACCEPTANCE-EXECUTION-PLAN.md待外部输入，离线/零网络预检不计实际通过。
