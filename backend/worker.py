@@ -27,6 +27,7 @@
 import argparse
 import importlib
 import logging
+import re
 import signal
 import sys
 import threading
@@ -34,7 +35,19 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from psycopg import OperationalError as PsycopgOperationalError
+from psycopg.errors import ConnectionTimeout as PsycopgConnectionTimeout
 from sqlalchemy import select, update
+from sqlalchemy.exc import (
+    DBAPIError,
+    DataError,
+    DisconnectionError,
+    IntegrityError,
+    NotSupportedError,
+    ProgrammingError,
+    SQLAlchemyError,
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -51,6 +64,19 @@ logger = logging.getLogger("worker")
 IDLE_POLL_SECONDS = 2
 RECOVER_INTERVAL_SECONDS = 30   # stale processing 恢复扫描；与上传清理互相独立
 CLEANUP_INTERVAL_SECONDS = 600  # 过期上传会话清理间隔
+DATABASE_RETRY_BASE_SECONDS = 2
+DATABASE_RETRY_MAX_SECONDS = 30
+
+_RETRYABLE_SQLSTATES = frozenset({
+    "40001",  # serialization_failure
+    "40P01",  # deadlock_detected
+    "53300",  # too_many_connections
+    "55P03",  # lock_not_available
+    "57P01",  # admin_shutdown
+    "57P02",  # crash_shutdown
+    "57P03",  # cannot_connect_now
+})
+_STOPPED = object()
 
 # 停机信号只置位该事件；任务与主循环都通过它协作退出。
 stop_event = threading.Event()
@@ -101,6 +127,104 @@ def _start_heartbeat(role: str):  # noqa: ANN202 - 返回 reporter 或 None
 
 def _stop_heartbeat(reporter) -> None:  # noqa: ANN001
     worker_status.stop_worker_heartbeat(reporter)
+
+
+def _database_sqlstate(error: BaseException) -> str | None:
+    """Return only a syntactically valid SQLSTATE; never inspect exception text."""
+    original = error.orig if isinstance(error, DBAPIError) else error
+    state = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    return state if isinstance(state, str) and re.fullmatch(r"[0-9A-Z]{5}", state) else None
+
+
+def _is_recoverable_database_error(error: BaseException) -> bool:
+    """Recognize only concrete connection and explicitly transient database errors."""
+    if isinstance(error, (SQLAlchemyTimeoutError, DisconnectionError)):
+        return True
+    if not isinstance(error, DBAPIError):
+        return False
+    if isinstance(error, (ProgrammingError, IntegrityError, DataError, NotSupportedError)):
+        return False
+
+    state = _database_sqlstate(error)
+    if state is not None:
+        # SQLSTATE 比断连标志更具体：鉴权、schema、约束等永久错误不可因失效标志重试。
+        return state.startswith("08") or state in _RETRYABLE_SQLSTATES
+    if isinstance(error.orig, PsycopgOperationalError):
+        if isinstance(error.orig, PsycopgConnectionTimeout):
+            return True
+        # pgconn on a failed connect carries no reliable SQLSTATE: a password
+        # rejection can look like a transport failure. Never infer retryability
+        # from needs_password/used_password or the driver's exception message.
+        if error.orig.pgconn is not None:
+            return False
+    return bool(error.connection_invalidated)
+
+
+class _DatabaseRetryBackoff:
+    """Consecutive worker database failures use exponential, capped delays."""
+
+    def __init__(self) -> None:
+        self.failures = 0
+
+    def next_delay(self) -> int:
+        self.failures += 1
+        exponent = min(self.failures - 1, 30)
+        return min(DATABASE_RETRY_MAX_SECONDS, DATABASE_RETRY_BASE_SECONDS * (2 ** exponent))
+
+    def reset(self) -> None:
+        self.failures = 0
+
+
+def _raise_database_failure(stage: str, error: SQLAlchemyError) -> None:
+    """Fail fast without an exception chain that could disclose SQL or credentials."""
+    state = _database_sqlstate(error) or "none"
+    error_name = type(error).__name__
+    logger.error(
+        "worker 数据库操作不可恢复 stage=%s error=%s sqlstate=%s",
+        stage, error_name, state,
+    )
+    raise RuntimeError(
+        f"worker database operation failed permanently "
+        f"(stage={stage}, error={error_name}, sqlstate={state})"
+    ) from None
+
+
+def _run_database_operation(stage: str, operation, backoff: _DatabaseRetryBackoff):
+    """Retry a whole short database operation, with each attempt owning its Session."""
+    while True:
+        if stop_event.is_set():
+            return _STOPPED
+        try:
+            result = operation()
+        except SQLAlchemyError as exc:
+            state = _database_sqlstate(exc)
+            error_name = type(exc).__name__
+            if not _is_recoverable_database_error(exc):
+                _raise_database_failure(stage, exc)
+
+            if stop_event.is_set():
+                return _STOPPED
+            delay = backoff.next_delay()
+            logger.warning(
+                "worker 数据库暂时不可用 stage=%s error=%s sqlstate=%s retry_in=%ss",
+                stage, error_name, state or "none", delay,
+            )
+            if stop_event.wait(delay):
+                return _STOPPED
+        else:
+            # 成功完成的操作包括 claim 返回 None，均视为故障已恢复。
+            backoff.reset()
+            return result
+
+
+def _recover_stale_in_new_session() -> int:
+    with SessionLocal() as db:
+        return recover_stale(db)
+
+
+def _claim_in_new_session():
+    with SessionLocal() as db:
+        return claim_one(db)
 
 
 def _run_role(role: str) -> int:
@@ -203,44 +327,54 @@ def main(argv: list[str] | None = None) -> int:
 
 def _ingest_main() -> int:
     setup_logging("worker")
-    # 不建管理员：那是 API 的职责。worker 只保证表结构就绪，否则两个容器并发启动时
-    # worker 可能抢先用默认密码建出 admin，让 .env 里配置的密码永远不生效。
-    init_db(create_admin=False)
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    logger.info(
-        "worker 启动：batch=%d, stale=%ds, chunk=%d",
-        settings.INGEST_BATCH_SIZE, settings.INGEST_STALE_SECONDS, settings.CHUNK_SIZE,
-    )
-
-    last_recover = last_cleanup = 0.0
-    with SessionLocal() as db:
-        recover_stale(db)
-    # 进程级心跳：独立线程 10 秒短事务续期，空闲/长任务都有；失败只记日志。
+    # 进程级心跳先启动，使初始化与启动恢复退避期间也可观测，并保证失败退出时收尾。
     heartbeat = _start_heartbeat(ROLE_INGEST)
+    backoff = _DatabaseRetryBackoff()
     try:
+        # 不建管理员：那是 API 的职责。worker 只保证表结构就绪，否则两个容器并发启动时
+        # worker 可能抢先用默认密码建出 admin，让 .env 里配置的密码永远不生效。
+        initialized = _run_database_operation(
+            "initialize", lambda: init_db(create_admin=False), backoff,
+        )
+        if initialized is _STOPPED:
+            return 0
+        logger.info(
+            "worker 启动：batch=%d, stale=%ds, chunk=%d",
+            settings.INGEST_BATCH_SIZE, settings.INGEST_STALE_SECONDS, settings.CHUNK_SIZE,
+        )
+        if _run_database_operation("startup_recovery", _recover_stale_in_new_session, backoff) is _STOPPED:
+            return 0
+
+        last_recover = last_cleanup = 0.0
         while not stop_event.is_set():
             now = time.monotonic()
             # 恢复扫描与上传清理拆开：stale 判定要更频繁，上传会话保留 24h，无需同步跟跑。
             if now - last_recover > RECOVER_INTERVAL_SECONDS:
                 last_recover = now
-                try:
-                    with SessionLocal() as db:
-                        recover_stale(db)
-                except Exception:  # noqa: BLE001 - 单次清理失败不应影响主循环
-                    logger.exception("周期恢复扫描失败")
+                if _run_database_operation("recovery_scan", _recover_stale_in_new_session, backoff) is _STOPPED:
+                    break
             if now - last_cleanup > CLEANUP_INTERVAL_SECONDS:
                 last_cleanup = now
                 try:
                     with SessionLocal() as db:
                         cleanup_expired(db)
-                except Exception:  # noqa: BLE001
-                    logger.exception("周期上传清理失败")
+                except SQLAlchemyError as exc:
+                    if _is_recoverable_database_error(exc):
+                        logger.warning(
+                            "worker 数据库暂时不可用 stage=upload_cleanup error=%s sqlstate=%s",
+                            type(exc).__name__, _database_sqlstate(exc) or "none",
+                        )
+                    else:
+                        _raise_database_failure("upload_cleanup", exc)
+                except Exception as exc:  # noqa: BLE001 - 清理失败不应影响主循环
+                    logger.warning("worker cleanup failed stage=upload_cleanup error=%s", type(exc).__name__)
 
-            with SessionLocal() as db:
-                claimed = claim_one(db)
-
+            claimed = _run_database_operation("claim", _claim_in_new_session, backoff)
+            if claimed is _STOPPED:
+                break
             if claimed is None:
                 # 可被信号立即唤醒，不必等满 IDLE_POLL_SECONDS。
                 if stop_event.wait(IDLE_POLL_SECONDS):
@@ -257,8 +391,8 @@ def _ingest_main() -> int:
             logger.info("领取任务: %s", doc_id)
             try:
                 ingest_document_task(str(doc_id), lease_id, stop_event=stop_event)
-            except Exception:  # noqa: BLE001 - ingest 内部已兜底，这里只保 worker 存活
-                logger.exception("任务异常退出: %s", doc_id)
+            except Exception as exc:  # noqa: BLE001 - ingest 内部已兜底，这里只保 worker 存活
+                logger.error("worker task failed error=%s", type(exc).__name__)
     finally:
         # 有界 join，并在心跳线程内尽力写 stopped_at；退出路径不再同步碰数据库。
         _stop_heartbeat(heartbeat)
@@ -283,9 +417,9 @@ def _release(db: Session, doc_id: uuid.UUID, lease_id: uuid.UUID) -> None:
         db.commit()
         if result.rowcount:
             logger.info("停机竞态：任务已交回 pending: %s", doc_id)
-    except Exception:  # noqa: BLE001 - 交回失败时留给 stale 扫描兜底
+    except Exception as exc:  # noqa: BLE001 - 交回失败时留给 stale 扫描兜底
         db.rollback()
-        logger.warning("停机时交回任务失败: %s", doc_id, exc_info=True)
+        logger.warning("停机时交回任务失败 stage=release error=%s", type(exc).__name__)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 from tests import _ingest_shutdown_env as env
 from tests._ingest_shutdown_env import SessionLocal, engine
+from tests._memory_project_test_gate import verify as verify_test_database
 
 from langchain_core.embeddings import Embeddings
 from sqlalchemy import func, select
@@ -63,6 +64,11 @@ class _WorkerDbFixtureMixin:
 
     @classmethod
     def setUpClass(cls):
+        verify_test_database(
+            os.environ.get("TEST_DATABASE_URL", ""),
+            os.environ.get("TEST_DATABASE_OWNER", "") or os.environ.get("TEST_EXPECTED_OWNER", ""),
+            engine,
+        )
         env.assert_owned_test_database()
         init_db(create_admin=False)
 
@@ -71,6 +77,12 @@ class _WorkerDbFixtureMixin:
         engine.dispose()
 
     def setUp(self):
+        verify_test_database(
+            os.environ.get("TEST_DATABASE_URL", ""),
+            os.environ.get("TEST_DATABASE_OWNER", "") or os.environ.get("TEST_EXPECTED_OWNER", ""),
+            engine,
+        )
+        env.assert_owned_test_database()
         env.truncate_all()
         worker.stop_event.clear()
         worker._running = True

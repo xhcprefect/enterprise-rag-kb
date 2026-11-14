@@ -33,6 +33,16 @@
       </div>
     </div>
 
+    <el-alert
+      v-if="listError"
+      :title="t('errors.request')"
+      type="error"
+      :closable="false"
+      show-icon
+      role="alert"
+      data-testid="audit-load-error"
+    />
+
     <div class="panel">
       <div class="panel-head">
         <div class="panel-title">
@@ -103,13 +113,14 @@
 
       <div class="panel-foot">
         <el-pagination
-          v-model:current-page="page"
-          v-model:page-size="pageSize"
+          :current-page="page"
+          :page-size="pageSize"
           :total="total"
+          :disabled="loading"
           :page-sizes="[20, 50, 100]"
           layout="total, sizes, prev, pager, next"
-          @current-change="load"
-          @size-change="load"
+          @update:current-page="onPageChange"
+          @update:page-size="onPageSizeChange"
         />
       </div>
     </div>
@@ -117,11 +128,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Search } from '@element-plus/icons-vue'
 import client from '@/api/client'
 import { formatDateTime } from '@/i18n/format'
+import { useAuditActionsI18n } from '@/i18n/messages/auditActions'
+import { createAdminListLoader } from '@/utils/adminList'
 
 interface LogItem {
   id: string
@@ -134,9 +147,11 @@ interface LogItem {
 }
 
 const { t } = useI18n()
+const { aa } = useAuditActionsI18n()
 
 const logs = ref<LogItem[]>([])
 const loading = ref(false)
+const listError = ref(false)
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(20)
@@ -155,6 +170,8 @@ const ACTION_TEXT = computed<Record<string, string>>(() => ({
   kb_create: t('audit.actions.kbCreate'),
   kb_update: t('audit.actions.kbUpdate'),
   kb_delete: t('audit.actions.kbDelete'),
+  kb_member_update: aa('kbMemberUpdate'),
+  kb_member_remove: aa('kbMemberRemove'),
   document_upload: t('audit.actions.documentUpload'),
   document_delete: t('audit.actions.documentDelete'),
   chat_query: t('audit.actions.chatQuery'),
@@ -170,11 +187,18 @@ const ACTION_TEXT = computed<Record<string, string>>(() => ({
   feedback_regression_enroll: t('audit.actions.feedbackRegressionEnroll'),
   feedback_regression_prepare: t('audit.actions.feedbackRegressionPrepare'),
   feedback_regression_export: t('audit.actions.feedbackRegressionExport'),
-  feedback_regression_import: t('audit.actions.feedbackRegressionImport')
+  feedback_regression_import: t('audit.actions.feedbackRegressionImport'),
+  feedback_regression_job_create: aa('feedbackRegressionJobCreate'),
+  feedback_regression_batch_create: aa('feedbackRegressionBatchCreate'),
+  feedback_regression_job_cancel: aa('feedbackRegressionJobCancel'),
+  feedback_regression_job_review: aa('feedbackRegressionJobReview'),
+  feedback_regression_batch_cancel: aa('feedbackRegressionBatchCancel')
 }))
 
 function actionText(action: string) {
-  return ACTION_TEXT.value[action] || action
+  return Object.prototype.hasOwnProperty.call(ACTION_TEXT.value, action)
+    ? ACTION_TEXT.value[action]
+    : action
 }
 
 function actionType(action: string) {
@@ -212,30 +236,51 @@ function detailText(detail: Record<string, unknown> | null) {
   return summarize(detail)
 }
 
+const listLoader = createAdminListLoader(
+  { items: logs, total, loading, error: listError },
+  async (params: { page: number; page_size: number; action?: string; username?: string }, signal) => {
+    const { data } = await client.get<{ total: number; items: LogItem[] }>('/audit-logs', { params, signal })
+    return data
+  }
+)
+
+function load() {
+  return listLoader.load({
+    page: page.value,
+    page_size: pageSize.value,
+    action: actionFilter.value || undefined,
+    username: usernameFilter.value || undefined
+  })
+}
+
 function onFilter() {
   page.value = 1
-  load()
+  void load()
 }
 
-async function load() {
-  loading.value = true
-  try {
-    const { data } = await client.get<{ total: number; items: LogItem[] }>('/audit-logs', {
-      params: {
-        page: page.value,
-        page_size: pageSize.value,
-        action: actionFilter.value || undefined,
-        username: usernameFilter.value || undefined
-      }
-    })
-    logs.value = data.items
-    total.value = data.total
-  } finally {
-    loading.value = false
-  }
+function onPageChange(value: number) {
+  // 清空 total 会触发组件自动改页；在途反馈不能反过来覆盖请求的页码快照。
+  if (loading.value || page.value === value) return
+  page.value = value
+  void load()
 }
+
+function onPageSizeChange(value: number) {
+  if (loading.value || pageSize.value === value) return
+  pageSize.value = value
+  page.value = 1
+  void load()
+}
+
+// 响应后再收敛页码，不能让加载时的临时 total=0 把页码改回第一页。
+watch(loading, busy => {
+  if (busy || listError.value) return
+  const lastPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+  if (page.value > lastPage) onPageChange(lastPage)
+})
 
 onMounted(load)
+onBeforeUnmount(listLoader.dispose)
 </script>
 
 <style scoped>
