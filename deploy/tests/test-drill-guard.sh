@@ -120,4 +120,9 @@ sys.exit(0 if up else 2)
 print('   ok: probe 在 socket-only bootstrap 拒绝、TCP ready 才通过')
 PY
 
-echo '演练守卫回归通过：默认 dry-run、参数校验、失败清理、项目冲突拒绝、owner 守卫、不读真实 .env、健康检查 TCP ready 门禁。'
+echo "== 9. drill-backup-check 纯本地回归（真实归档成功/缺失/篡改/清单缺项重复外来） =="
+# helper 与它的回归都用固定 prefix 的 mktemp 自有根；这里只确保独占执行 + 输出汇总。
+bash "$root/deploy/tests/test-drill-backup-check.sh" 2>&1 | sed 's/^/   /'
+echo "   ok: drill-backup-check 回归"
+
+echo '演练守卫回归通过：默认 dry-run、参数校验、失败清理、项目冲突拒绝、owner 守卫、不读真实 .env、健康检查 TCP ready 门禁、备份三件套 helper 本地回归。'
