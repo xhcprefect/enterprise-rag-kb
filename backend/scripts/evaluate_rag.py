@@ -8,16 +8,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from app.services.evaluation import (EvaluationError, build_identity, compare_reports, comparison_exit_code,
-                                     grade_case, make_report, read_json_document, read_jsonl,
+from app.services.evaluation import (EvaluationError, PUBLIC_CONFIG_KEYS, build_identity, compare_reports,
+                                     comparison_exit_code, grade_case, make_report, read_json_document, read_jsonl,
                                      require_reviewed_cases, run_live_case, validate_cases, validate_comparison_report,
                                      validate_responses, validate_thresholds)
 
 # 允许进入配置身份的键；未知键直接拒绝，避免把令牌、URL 等私密值写进报告。
-# 这里不含 RERANK_BASE_URL / RERANK_API_KEY：重排服务地址和密钥永远不进报告。
-CONFIG_KEYS = ("model", "embedding_model", "chunk_size", "chunk_overlap", "retrieval_top_k", "retrieval_rewrite",
-               "hybrid_retrieval_enabled", "rerank_enabled", "rerank_model", "retrieval_min_similarity",
-               "retrieval_neighbor_chunks", "retrieval_max_per_doc", "rerank_max_chars", "keyword_candidates")
+# 与预检入口共用 evaluation 的公开白名单；旧评测运行逻辑保持不变。
+CONFIG_KEYS = PUBLIC_CONFIG_KEYS
 
 
 def _load_config(path):

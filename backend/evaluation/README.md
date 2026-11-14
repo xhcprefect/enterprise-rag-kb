@@ -20,7 +20,7 @@
 | `baseline.ranking.example.json` | 排序样例的固定 run ID 离线基线（由 CLI 生成） |
 | `thresholds.example.json` | 延迟/费用的相对阈值示例 |
 | `thresholds.ranking.example.json` | 显式启用 4 项排序门槛的示例 |
-| `templates/` | 真实业务问题标注、结果核验 JSON 模板与人工核验流程（仅模板，无真实资料） |
+| `templates/` | 2 题字段模板、20 槽位空白采集模板、结果核验 JSON 模板与人工核验流程（仅模板，无真实资料） |
 
 ## 离线回放
 
@@ -78,6 +78,31 @@
 核验入口始终重算并校验 `machine_sha256`，无正文时也不能直接信任机器字段；有正文时仍额外重算原有 `result_sha256` 并核对引用条数。机器指纹缺失、版本非法或摘要格式非法返回 `report_result_fingerprint_missing`（退出码 `4`）；摘要不匹配返回 `report_result_tampered`（退出码 `4`）。缺少机器绑定的旧报告须重新生成，不能直接进入人工核验。
 
 两种 SHA-256 都是不带密钥的一致性检查，不是签名或真实性证明：能重写整份报告并重新生成摘要的人仍能伪造自洽内容，工具无法据此证明报告来自可信评测执行。报告与人工核验文件仍须受控保存和传递。
+
+## 业务基线本地输入预检（不执行评测）
+
+`python -m scripts.preflight_evaluation` 是独立的纯本地准备检查。它只读取命令行显式声明的问题集、公开配置、语料目录和可选索引清单；不读响应文件、令牌、URL、`app.core` 配置、`.env`、数据库或模型，也不创建 HTTP 客户端、写报告或改动输入。命令只用仓库外的私有输入，不直接运行模板或仓库内合成样例的 live：
+
+```powershell
+# 在 backend 目录执行；C:/private 是资料所有者控制的仓库外目录
+$env:RAG_DISABLE_DOTENV = "1"; $env:LOG_STDOUT_ONLY = "1"
+.\.venv\Scripts\python.exe -X utf8 -m scripts.preflight_evaluation --dataset C:/private/cases.jsonl --documents-dir C:/private/corpus --config-file C:/private/public-config.json
+
+# 可选显式索引清单；调整本地输入上限（默认 20，合法 1–1000）
+.\.venv\Scripts\python.exe -X utf8 -m scripts.preflight_evaluation --dataset C:/private/cases.jsonl --documents-dir C:/private/corpus --config-file C:/private/public-config.json --index-manifest C:/private/index-manifest.json --max-cases 20
+```
+
+参数仅有上述五个：`--dataset` 必填，其余可选；没有 responses/live/token/base-url/输出文件/overwrite 选项。stdout 只输出固定 JSON schema，不回显 case ID、问题、答案、来源文件名/ID、模型名、核验人、unknowns 正文、路径或异常正文；非法输入只有稳定错误码。指纹字段明确是**本地输入指纹**（case SHA + schema、语料 SHA/文件数、配置 SHA、索引清单 SHA/条目数），不是完整 live 评测身份；修改任一输入应重跑预检。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | `ready`：本地声明的输入结构就绪，未执行任何评测，未取得业务质量结论 |
+| 2 | `invalid`：参数、JSON/JSONL 结构、显式路径、符号链接或语料树读取不合法；只输出稳定错误码 |
+| 5 | `blocked`：一项或多项本地准备缺失，不虚构余下检查结论 |
+
+完整批次始终一起校验，超过 `--max-cases` 只报 `case_limit_exceeded`，**不切片**。有效结构的输入会在一次结果中聚合阻断：占位符/未核验或核验未决、未明确 `expected_outcome`（预期 HTTP 4xx 负例除外）、`unclassified` 分层、RAG 应答案例缺 `expected_sources`、公开配置缺 live 必填和开关开启时的条件字段、缺/空语料、空显式索引清单、空集和超限。阻断原因只含稳定代号及 1 起始序号；单条反馈回归协议问题集不属于此入口，直接按输入错误拒绝。公开配置沿用 [配置身份](#公开配置身份) 的白名单和数值/URL/凭据校验，已给值非法为退出码 2；不自动读取 `config.live.example.json`。语料目录不提供或为空为阻断，不存在、符号链接或不可读为退出码 2；没有隐式的问题集旁 `documents/`。可选索引清单沿用 [严格结构](#可选索引清单)，省略不阻断，空清单阻断。
+
+结果显式声明 `measured=false`、`business_acceptance=false`、`human_approval=false`，以及网络/模型/数据库/响应/令牌/服务地址/应用配置模块/.env/本地文件写入均未发生。因此 `ready` **不是**资料授权、目标实例、调用预算、远端索引一致性、人工审批或业务质量通过的证明；语料与索引摘要只是调用者声明的本地快照。20 题是首批采集规模建议，不是统计充分性证明。问题标注的 `reviewed`/`verified_by`/`verified_at` 与本轮答案的逐条人工核验是两件事，后者须用 `review_evaluation` 另做。需要实际执行 `--live` 时，仍须由责任人另行授权资料范围、实例、预算与人工核验安排，再使用 `scripts.evaluate_rag`。
 
 ## 数据集身份与基线比较
 
@@ -336,7 +361,7 @@
 
 ## 真实业务问题与人工核验
 
-[字段模板](templates/business-questions.template.jsonl)、[结果核验模板](templates/result-reviews.template.json) 与 [人工核验指南](templates/README.md) 给出真实业务问题的标注和本轮结果核验流程。该目录只有模板，不含真实资料；原始问题集模板可通过默认结构校验，但不能通过严格核验。结果核验必须从本轮报告用 `review_evaluation --create-template` 生成并逐条填写，不能用模板里的占位值伪造绑定。
+[2 题字段模板](templates/business-questions.template.jsonl)、[20 槽位空白采集模板](templates/business-baseline-20.template.jsonl)、[结果核验模板](templates/result-reviews.template.json) 与 [人工核验指南](templates/README.md) 给出真实业务问题的标注、本地输入预检和本轮结果核验流程。该目录只有模板，不含真实资料；原始问题集模板可通过默认结构校验，但不能通过严格核验。结果核验必须从本轮报告用 `review_evaluation --create-template` 生成并逐条填写，不能用模板里的占位值伪造绑定。
 
 为私有业务问题集添加 `--require-reviewed`。它在创建 HTTP 客户端之前拒绝缺少有效 `verified_by` / `verified_at`、显式 `reviewed: false`、仍有 `unknowns`，或含明确模板标记的样本。合法的普通技术文本，如 `str.replace` 或 `TODO`，不会仅因这些词被当成模板。`unknowns` 是正式输入字段，保留未解决问题即可；问题解决后设为空列表，不必删除该字段。
 
