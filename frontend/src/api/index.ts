@@ -565,8 +565,8 @@ export interface ImportResult {
 }
 
 export const userApi = {
-  list: (params: { page?: number; page_size?: number; keyword?: string }) =>
-    client.get<PageResult<User>>('/users', { params }),
+  list: (params: { page?: number; page_size?: number; keyword?: string }, signal?: AbortSignal) =>
+    client.get<PageResult<User>>('/users', { params, signal }),
   create: (data: Partial<User> & { username: string; password: string }) =>
     client.post<User>('/users', data),
   update: (id: string, data: Partial<User> & { password?: string }) =>

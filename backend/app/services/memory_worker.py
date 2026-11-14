@@ -50,7 +50,8 @@ def _job_messages(snapshot: dict) -> list:
     旧摘要（``snapshot['previous']``）与本次正文（``snapshot['text']``，带 message_id
     标签）分别经 ``build_summary_human`` 做凭据清洗后合入同一条 ``HumanMessage``；
     **绝不**把旧摘要序列化进 System。旧 summary 的来源 id 与内容仍在 Human 完整提供给
-    模型以合法延续，正文里已有的 message_id 标签原样保留供模型引用。不伪造 AI 配对。
+    模型以合法延续；快照 ``message_ids`` 白名单内唯一的来源标签 ID 保留供引用，
+    正文中的伪标签/UUID 不会获得清洗豁免。不伪造 AI 配对。
     """
     previous = snapshot.get("previous")
     rules = build_summary_system(
@@ -62,6 +63,7 @@ def _job_messages(snapshot: dict) -> list:
     human = build_summary_human(
         previous_summary=previous,
         batch_text=snapshot.get("text", "") or "",
+        trusted_message_ids=snapshot.get("message_ids"),
         use_ascii_json=True,
     )
     return [SystemMessage(content=rules), HumanMessage(content=human)]

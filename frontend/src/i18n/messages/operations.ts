@@ -1,4 +1,8 @@
-export default {
+import { useI18n } from 'vue-i18n'
+import { i18n } from '../index.ts'
+
+/** 仅随懒加载运维页加载，保留原有完整的双语目录。 */
+export const operationsMessages = {
   'zh-CN': {
     operations: {
       eyebrow: 'OPERATIONS',
@@ -103,4 +107,21 @@ export default {
       }
     }
   }
+} as const
+
+let merged = false
+
+/** 在运维页 setup 时合并两种语言，重复进入页面不会重复注册。 */
+export function ensureOperationsMessages(): void {
+  if (merged) return
+  i18n.global.mergeLocaleMessage('zh-CN', operationsMessages['zh-CN'])
+  i18n.global.mergeLocaleMessage('en-US', operationsMessages['en-US'])
+  merged = true
+}
+
+/** 保留完整 key 与全局 locale，静态检查按 operations 命名空间校验懒加载目录。 */
+export function useOperationsI18n() {
+  ensureOperationsMessages()
+  const { t, locale } = useI18n({ useScope: 'global' })
+  return { t, locale }
 }

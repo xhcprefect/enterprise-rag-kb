@@ -17,6 +17,9 @@
           @keyup.enter="onSearch"
           @clear="onSearch"
         />
+        <el-button :loading="loading" @click="load">
+          <el-icon><Refresh /></el-icon>{{ t('common.refresh') }}
+        </el-button>
         <el-button @click="openImport">
           <el-icon><Upload /></el-icon>{{ t('users.importButton') }}
         </el-button>
@@ -25,6 +28,16 @@
         </el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="listError"
+      :title="t('errors.request')"
+      type="error"
+      :closable="false"
+      show-icon
+      role="alert"
+      data-testid="users-load-error"
+    />
 
     <div class="panel">
       <div class="panel-head">
@@ -104,13 +117,14 @@
 
       <div class="panel-foot">
         <el-pagination
-          v-model:current-page="page"
-          v-model:page-size="pageSize"
+          :current-page="page"
+          :page-size="pageSize"
           :total="total"
+          :disabled="loading"
           :page-sizes="[10, 20, 50]"
           layout="total, sizes, prev, pager, next"
-          @current-change="load"
-          @size-change="load"
+          @update:current-page="onPageChange"
+          @update:page-size="onPageSizeChange"
         />
       </div>
     </div>
@@ -324,7 +338,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   ElMessage,
@@ -343,12 +357,14 @@ import {
 } from '@/api'
 import { formatDateTime, formatNumber } from '@/i18n/format'
 import { useUserStore } from '@/stores/user'
+import { createAdminListLoader } from '@/utils/adminList'
 
 const { t, locale } = useI18n()
 const userStore = useUserStore()
 
 const users = ref<User[]>([])
 const loading = ref(false)
+const listError = ref(false)
 const keyword = ref('')
 const page = ref(1)
 const pageSize = ref(20)
@@ -394,24 +410,35 @@ function formatSize(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
-async function load() {
-  loading.value = true
-  try {
-    const { data } = await userApi.list({
-      page: page.value,
-      page_size: pageSize.value,
-      keyword: keyword.value
-    })
-    users.value = data.items
-    total.value = data.total
-  } finally {
-    loading.value = false
+const listLoader = createAdminListLoader(
+  { items: users, total, loading, error: listError },
+  async (params: { page: number; page_size: number; keyword: string }, signal) => {
+    const { data } = await userApi.list(params, signal)
+    return data
   }
+)
+
+function load() {
+  return listLoader.load({ page: page.value, page_size: pageSize.value, keyword: keyword.value })
 }
 
 function onSearch() {
   page.value = 1
-  load()
+  void load()
+}
+
+function onPageChange(value: number) {
+  // 清空 total 会触发组件自动改页；在途反馈不能反过来覆盖请求的页码快照。
+  if (loading.value || page.value === value) return
+  page.value = value
+  void load()
+}
+
+function onPageSizeChange(value: number) {
+  if (loading.value || pageSize.value === value) return
+  pageSize.value = value
+  page.value = 1
+  void load()
 }
 
 function openCreate() {
@@ -638,7 +665,15 @@ async function downloadTemplate() {
   }
 }
 
+// 响应后再收敛页码，保留删除末页最后一项时自动回到有效页的行为。
+watch(loading, busy => {
+  if (busy || listError.value) return
+  const lastPage = Math.max(1, Math.ceil(total.value / pageSize.value))
+  if (page.value > lastPage) onPageChange(lastPage)
+})
+
 onMounted(load)
+onBeforeUnmount(listLoader.dispose)
 </script>
 
 <style scoped>

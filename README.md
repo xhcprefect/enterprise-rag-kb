@@ -219,6 +219,10 @@ docker compose --profile summary --profile project --profile regression up -d
 
 `ingest_attempts` 记录当前索引代次内失败的任务级尝试次数（永久失败也记一次），不是单次上游 HTTP 请求次数。未知异常也受同一次数上限约束，不会无限重试。成功入库、明确取消或手工重建索引会清空计数与退避时间；重试沿用已经完整保存的解析/向量批次检查点。进程停机与租约超时属于任务交回，不消耗失败次数。退避中的取消请求可立即被领取清理，不必等倒计时结束；运维的 `retry_waiting` 排除这些取消请求，既有 `queued` 仍包含全部 pending/processing 文档。
 
+Ingest worker 启动初始化、stale 恢复扫描与领取短事务遇到已建立连接失效、连接池超时、驱动明确的 `ConnectionTimeout` 或 PostgreSQL 连接/事务瞬态 SQLSTATE 时，会用新 Session/事务重新执行，失效连接由连接池处理；进程级退避从 2 秒指数增长，封顶 30 秒，可由 SIGTERM/SIGINT 即时打断。每次成功扫描或领取（包括队列为空）都会清零连续故障退避。认证、schema、SQL/约束、编程错误等永久数据库错误会立即使 worker 失败退出，交由 supervisor/Compose 的进程重启策略处理；异常日志只包含阶段、类型和安全 SQLSTATE，不包含 SQL、连接 URL 或异常正文。若 claim 的提交确认丢失，worker 不会重放旧任务对象或执行任务；新事务重新查询，已提交但确认未知的租约留给 stale 恢复扫描，数据库领取故障不会占用文档失败预算。
+
+psycopg/libpq 在建连失败时可能只返回无 SQLSTATE 的 `OperationalError`，真实密码认证失败也属于此类。`pgconn.needs_password` / `used_password` 不能区分临时网络故障与永久配置错误，因此普通无 SQLSTATE 建连失败保守退出，不按异常正文判断；连接拒绝若只提供这种不明确诊断，也不会在进程内重试。只有明确的 `ConnectionTimeout`、SQLAlchemy 确认的已建立连接失效、连接池超时或白名单 SQLSTATE 会触发恢复。
+
 ### DeepSeek 关闭思考模式
 
 示例配置使用 DeepSeek 官方 `https://api.deepseek.com`、`deepseek-flash` 模型，并设置

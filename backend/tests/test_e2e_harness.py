@@ -219,13 +219,35 @@ class WorkerRoleTests(unittest.TestCase):
             self.assertEqual(env["PROJECT_STORAGE_DIR"], str(out / "project-blobs"))
             self.assertIn("ALPHA_VERSION_ONE", (out / "project-source" / "notes.md").read_text(encoding="utf-8"))
 
-    def test_summary_stub_returns_verifiable_source_ids(self):
-        source_id = "11111111-1111-4111-8111-111111111111"
-        raw = stub.Handler._summary_answer(f"[user 1 message_id={source_id}]\n使用独立 worker\n\n")
-        from app.services.memory_prompt import parse_summary
-        result = parse_summary(raw)
-        self.assertEqual(result["confirmed_facts"][0]["source_message_ids"], [source_id])
-        self.assertIn("使用独立 worker", result["confirmed_facts"][0]["text"])
+    def test_summary_stub_returns_verifiable_source_ids_after_worker_redaction(self):
+        from app.services import memory_worker
+        from app.services.memory_prompt import parse_summary, validate_sources
+
+        # 必须经过生产 _job_messages/build_summary_human；直接把未清洗标签交给 stub
+        # 会掩盖银行卡正则误伤数字段 UUID、随后 ready 却全空的原始故障。
+        text = "使用独立 worker，卡号 4111111111111111，API Key=sk-summarysecret123456"
+        for source_id in ("11111111-1111-4111-8111-111111111111",
+                          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"):
+            with self.subTest(source_id=source_id):
+                snapshot = {
+                    "previous": None,
+                    "text": f"[user 1 message_id={source_id}]\n{text}\n\n",
+                    "message_ids": [source_id],
+                }
+                messages = memory_worker._job_messages(snapshot)
+                raw = stub.Handler._summary_answer(messages[1].content)
+                result = parse_summary(raw, allowed_message_ids=snapshot["message_ids"])
+                self.assertEqual(result["confirmed_facts"], [{
+                    "text": "用户说：使用独立 worker，卡号 [已隐藏凭据]，[已隐藏凭据]",
+                    "source_message_ids": [source_id],
+                    "verification": "confirmed_by_user",
+                }])
+                self.assertNotIn("4111111111111111", messages[1].content)
+                self.assertNotIn("sk-summarysecret123456", messages[1].content)
+                job = type("Job", (), {"id": 901, "input_snapshot": snapshot})()
+                self.assertEqual(memory_worker._parse_or_none(raw, job), result)
+                self.assertEqual(validate_sources(result, allowed_message_ids=snapshot["message_ids"]),
+                                 ({source_id}, set()))
 
 
 class LoopbackTests(unittest.TestCase):

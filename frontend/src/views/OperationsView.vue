@@ -122,7 +122,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import type { Component } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useOperationsI18n } from '@/i18n/messages/operations'
 import {
   CircleCheck, CircleClose, Clock, InfoFilled, Loading, QuestionFilled, Refresh, Remove, Warning
 } from '@element-plus/icons-vue'
@@ -132,7 +132,7 @@ import {
   formatWorkerTimestamp, isCancelledRequest, normalizeWorkerState, statusTone, workerLabelKey
 } from '@/utils/operations'
 
-const { t, locale } = useI18n()
+const { t, locale } = useOperationsI18n()
 const snapshot = ref<WorkerStatusSnapshot | null>(null)
 const loading = ref(true)
 const loadFailed = ref(false)
