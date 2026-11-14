@@ -1,8 +1,27 @@
 # 真实业务问题标注与人工核验
 
-本目录只提供 [问题集字段模板](business-questions.template.jsonl) 和 [结果核验 JSON 模板](result-reviews.template.json)，不含真实业务资料。模板采用合法的分层代号和空核验元数据，便于先做结构校验；其中的 `REPLACE-*` 和中文占位符仍必须替换。开启 `--require-reviewed` 后，原始问题集模板会在任何真实调用前被拒绝。结果核验模板只是格式示例，必须用 `scripts.review_evaluation --create-template` 从本轮报告生成，不能手工伪造 `run_id`/指纹绑定。
+本目录只提供 [2 题字段模板](business-questions.template.jsonl)、[20 槽位首批采集模板](business-baseline-20.template.jsonl) 和 [结果核验 JSON 模板](result-reviews.template.json)，不含真实业务资料。模板采用合法的分层代号和空核验元数据，便于先做结构校验；其中的 `REPLACE-*` 和中文占位符仍必须替换。开启 `--require-reviewed` 后，原始问题集模板会在任何真实调用前被拒绝。结果核验模板只是格式示例，必须用 `scripts.review_evaluation --create-template` 从本轮报告生成，不能手工伪造 `run_id`/指纹绑定。
 
 合成问题和预置响应只验证评测工具，不能据此宣称真实业务准确率或拒答质量。
+
+## 首批 20 槽位采集模板与本地输入预检
+
+`business-baseline-20.template.jsonl` 是**空白采集结构**：事实 6、跨文档 4、流程时效 4、无答案拒答 4、需澄清 2。全部 `reviewed=false`、核验人和日期为 `null`、`unknowns` 非空、`source_labels_complete=false`，并带明显 `REPLACE-*` / 中文占位符；不含真实业务标准或答案。20 题只是首批可操作规模的建议，**不是统计充分性证明**，不能把填满模板当作正式抽样、人工核验或业务质量通过。
+
+把模板复制到仓库外的受控私有目录，由资料所有者填写真实问题、来源身份、预期处置和固定断言，再逐条人工核验、清空 `unknowns`、填写核验人代号与日期并设 `reviewed=true`。问题集里的 `reviewed`/`verified_by`/`verified_at` 只表示**问题标注**已核验；本轮模型答案是否正确仍须按下文的结果核验流程逐条判断，两者不能互相替代。
+
+在 `backend` 目录可对仓库外私有输入做纯本地预检，命令只读取显式给出的文件，不写报告、不执行评测：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m scripts.preflight_evaluation --dataset C:/private/cases.jsonl --documents-dir C:/private/corpus --config-file C:/private/public-config.json --index-manifest C:/private/index-manifest.json
+```
+
+- 参数仅 `--dataset`（必填）、`--documents-dir`、`--config-file`、`--index-manifest`、`--max-cases`（默认 20，合法 1–1000）；没有 responses/live/token/base-url/输出文件/overwrite 开关。典型命令还可设 `RAG_DISABLE_DOTENV=1`、`LOG_STDOUT_ONLY=1`。
+- 退出码 `0` 是**本地输入就绪**，`5` 是缺准备项，`2` 是输入或 I/O 不合法；stdout 只有固定 JSON。完整批次一律校验，超限只阻断、不切片。
+- 阻断项包括空集、占位符/未完成人工核验、未明确预期处置（预期 HTTP 4xx 负例除外）、未分类分层、RAG 应答案例缺 `expected_sources`、公开配置缺 live 必填或开关开启时的条件字段、缺/空语料、空索引清单及超过上限。原因只使用稳定代号和 1 起始序号，不回显原 case ID 或正文。
+- 显式语料目录必须合法且非空；不指定为阻断，不存在、符号链接或不可读为退出码 2。不自动读取问题集旁的 `documents/`，不自动使用 [公开配置样例](../config.live.example.json)。索引清单可选，省略不阻断。
+- 输出明确标记 `measured=false`、`business_acceptance=false` 及零网络/模型/数据库/令牌/服务地址/配置模块/.env/文件写入访问，并给出可取得的本地输入指纹；`config` 指纹只含摘要，不含模型名或参数值。语料指纹只是读取时的本地快照声明，不证明远端索引一致。
+- `ready` 不核对资料授权、目标实例、调用预算、远端索引装载状态或人工审批，也不验证本轮答案质量；不能据此宣称上线验收通过。`live` 真实评测仍须另行明确授权范围、可用实例、预算和资料权限，并使用独立评测入口执行。
 
 ## 抽样与标注
 

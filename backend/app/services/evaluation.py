@@ -979,12 +979,14 @@ def dataset_identity(cases):
     return {"schema": IDENTITY_SCHEMA, "case_count": len(ordered), "sha256": _digest(ordered)}
 
 
-# 配置身份只接受这些字段；其余字段由调用方显式登记，避免把凭据写进报告。
+# 公开配置身份白名单；两个评测入口共用，避免各维护一套键集合。
+# 这里不含 RERANK_BASE_URL / RERANK_API_KEY：重排服务地址和密钥永远不进报告。
 _CRITICAL_CONFIG_FIELDS = ("mode", "model", "embedding_model", "chunk_size", "chunk_overlap",
                            "retrieval_top_k", "retrieval_rewrite",
                            "hybrid_retrieval_enabled", "rerank_enabled", "rerank_model",
                            "retrieval_min_similarity", "retrieval_neighbor_chunks",
                            "retrieval_max_per_doc", "rerank_max_chars", "keyword_candidates")
+PUBLIC_CONFIG_KEYS = _CRITICAL_CONFIG_FIELDS[1:]
 _BOOLEAN_CONFIG_FIELDS = ("hybrid_retrieval_enabled", "rerank_enabled")
 # 比较必须能证明影响口径的配置一致。离线回放直接用预置响应打分，
 # 不经过分块/检索/模型，因此不强制声明；真实评测缺这些身份就没有可比性。
@@ -1041,6 +1043,23 @@ def _check_config_relations(values):
         raise EvaluationError("rerank_max_chars 必须为 128–8000")
     if values["keyword_candidates"] is not None and not 1 <= values["keyword_candidates"] <= 200:
         raise EvaluationError("keyword_candidates 必须为 1–200")
+
+
+def missing_live_config_fields(config, *, mode="live"):
+    """列出公开配置中缺失的 live 必填键和开关开启时的条件键。
+
+    只为本地输入预检提供缺项清单；值的合法性仍由 ``config_identity`` 按原有
+    白名单和数值/URL/凭据规则判定。``mode`` 与 ``_REQUIRED_CONFIG`` 的键一致，
+    不读取服务配置或环境变量，也不自动使用示例配置补全。
+    """
+    if not isinstance(config, dict):
+        raise EvaluationError("公开配置必须是对象")
+    missing = [name for name in _REQUIRED_CONFIG.get(mode, _REQUIRED_CONFIG["live"])
+               if config.get(name) is None]
+    for name, (gate, gate_value) in _CONDITIONAL_CONFIG.items():
+        if config.get(gate) == gate_value and config.get(name) is None:
+            missing.append(name)
+    return tuple(name for name in PUBLIC_CONFIG_KEYS if name in missing)
 
 
 def config_identity(*, mode, model=None, embedding_model=None, chunk_size=None, chunk_overlap=None,

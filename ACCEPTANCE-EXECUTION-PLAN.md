@@ -8,7 +8,11 @@
 
 交付责任：业务资料所有者确认可用资料与时效；标注者给出标准要点/来源；核验者阅读本轮答案与引用。关键问题建议独立复核。工具执行者固定配置与身份，不代替业务判断。
 
-首批建议20题（样本规模建议，不代表统计充分）：事实6、跨文档4、流程时效4、无答案4、澄清2；包含版本、编号、单位和过期口径。不得用模型自行生成的答案当标准答案。以backend/evaluation/templates/business-questions.template.jsonl为结构起点，填写expected_outcome、expected_sources、必要/禁止要点、stratum、核验人代号与日期；unknowns全部解决后才reviewed=true。仅在相关来源完整标注、范围固定时source_labels_complete=true。
+首批建议20题（样本规模建议，不代表统计充分）：事实6、跨文档4、流程时效4、无答案4、澄清2；包含版本、编号、单位和过期口径。不得用模型自行生成的答案当标准答案。backend/evaluation/templates/business-questions.template.jsonl保留2题字段示例；新增business-baseline-20.template.jsonl提供20题空白采集结构，全部未核验且带占位符，须复制到仓库外由资料所有者标注。填写expected_outcome、expected_sources、必要/禁止要点、stratum、核验人代号与日期；unknowns全部解决后才reviewed=true。仅在相关来源完整标注、范围固定时source_labels_complete=true。澄清使用expected_outcome=clarify，stratum必须另选已登记代号；两个澄清槽位采用process_sla，因此该分层合计6题。
+
+2026-11-14按BUSINESS-BASELINE-PREFLIGHT-PLAN.md完成独立离线输入预检。先在backend执行：`python -X utf8 -m scripts.preflight_evaluation --dataset PRIVATE_DIR/cases.jsonl --documents-dir PRIVATE_DIR/documents --config-file PRIVATE_DIR/config.json --index-manifest PRIVATE_DIR/index.json --max-cases 20`。PRIVATE_DIR必须替换为已核对的仓库外目录；索引清单参数可省略。stdout仅JSON：0=ready（本地声明的输入就绪）、5=blocked（缺准备项）、2=invalid（输入或I/O不合法）。检查完整批次，超过上限阻断而不切片；不提供隐式同级语料或自动示例配置。预检不读取业务.env、数据库、令牌、远端配置，不运行模型、不写报告；输出只含计数、稳定原因与输入摘要。输入就绪与本轮答案人工核验是不同状态；任何预检成功都不能代替资料授权、目标实例/预算确认、远端索引核对或业务质量验收。
+
+主代理实际验收：相关7模块197项全部通过、无skip；Python3.13.15与Python3.12.10各27次真实CLI调用，共54次通过，覆盖就绪、缺项/模板、条件配置、超上限完整检查、HTTP负例分层及非法输入。合成3题的case/语料/config摘要与既有算法独立计算完全一致；子进程网络/敏感模块/.env/令牌/文件写入拦截均无事件。20题原模板保持blocked、unreviewed=20，并逐条返回placeholder_case；这验证准备工具，不计真实业务通过。原始命令和结果保存在仓库外ragkb-business-preflight-20261114-6c84目录；首次主审发现HTTP负例误跳过分层，已返回同一实施者修复并回归通过。
 
 执行步骤（工作目录backend；以下PRIVATE_DIR、API_ORIGIN、KB_UUID均需替换成已核对的实际值，不能直接执行占位命令）：
 
