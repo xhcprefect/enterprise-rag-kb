@@ -28,10 +28,10 @@
 
 ## 2. 部署版本、备份与恢复证据
 
-**当前状态：本地合成数据库/uploads恢复已两次通过；真实生产版本、备份和RTO/RPO未知，projects文件归档未覆盖。** 2026-11-13主代理用现有verify_deployment.py执行带模板的dry-run结构核验：network_requests=0、pass=0/fail=0/unknown=14、acceptance=false，按证据未知契约退出3；报告存仓库外ragkb-rel-deployment-dryrun-20261113-8d42.json。2026-11-14实际隔离演练先发现PG初始化socket就绪竞争并保留失败证据，修复为正式TCP探针后，两次全新owner/空卷演练均exit0：25行逐列、4文件SHA256及篡改负向检测通过，完整脚本18.015/20.519秒；主代理另行复核数据与文件，按精确归属清理全部演练Docker资源。结果仅为local-synthetic，未填写production pass或把脚本耗时当生产RTO。不对未获授权的业务DATA_DIR运行restore/backup命令。
+**当前状态：本地合成数据库/uploads/projects三件套恢复已两次通过；真实生产版本、备份和RTO/RPO未知。** 2026-11-13主代理用现有verify_deployment.py执行带模板的dry-run结构核验：network_requests=0、pass=0/fail=0/unknown=14、acceptance=false，按证据未知契约退出3；报告存仓库外ragkb-rel-deployment-dryrun-20261113-8d42.json。2026-11-14先前数据库/uploads演练修复PG初始化socket就绪竞争后两次通过，18.015/20.519秒历史证据保留。本轮按PROJECTS-RESTORE-DRILL-PLAN.md扩展项目blob与manifest；首轮发现Windows清单格式和先校引用后解包问题，修复后主代理用两个全新owner/空卷真实演练均exit0（21.819/18.877秒）。独立SQL逐列核25行（含NULL/中文）与4条blob引用、Node crypto/zlib/tar读取核3归档/4上传文件/4项目blob、两类恢复副本单字节篡改。18个真正helper CLI正负场景全部符合预期且输入未改。另一个新owner在项目归档被替换成非gzip、清单SHA仍匹配时，恢复前拒绝exit1；独立SQL确认原25行/4引用仍完整、恢复目录空。所有完整资源ID+owner+project清理后无本轮容器/卷/网残留，原容器未动；仓库外证据ragkb-projects-restore-20261114-4e87。结果仅为local-synthetic，未填写production pass或把脚本耗时当生产RTO。不对未获授权的业务DATA_DIR运行restore/backup命令。
 
 1. 版本负责人在目标环境记录部署commit/image digest、环境名、部署时间、操作者和UTC时间；确保与问题集/监控证据属于同一版本。
-2. 在隔离演练中使用`./deploy/tests/restore-drill.sh --isolated --keep`，完成后先读owner报告，按脚本精确owner清理；不得在有冲突时批量删Docker资源。当前脚本只覆盖合成PG数据库和uploads，保留恢复前后行内容、uploads SHA-256及完整脚本实测耗时；projects文件归档、真实备份数据窗口与production RTO/RPO仍需另行覆盖，不能填成production pass。
+2. 在隔离演练中使用`./deploy/tests/restore-drill.sh --isolated --keep`，完成后先读owner报告，按脚本精确owner清理；不得在有冲突时批量删Docker资源。当前脚本覆盖projects合成内容寻址blob、SQL引用、三件套manifest及两类恢复副本篡改检测，maintenance CI也执行真实隔离演练。保留恢复前后行内容、文件SHA-256及完整脚本实测耗时；真实备份数据窗口与production RTO/RPO仍需另行覆盖，不能填成production pass。
 3. 真实恢复演练另由部署所有者书面批准维护窗口、目标备份、回退责任和数据写入冻结。演练前核对三份归档与清单、同一stamp、恢复目标与业务影响。记录开始/完成UTC时间、恢复点、SQL/文件校验、RTO/RPO和人工复核。失败时停止并按既定应急方案处置，不自动重试破坏状态。
 4. 将`deploy/acceptance/deployment-acceptance.template.json`复制到仓库外，用脚本检查schema；version_identity和backup_restore_rto_rpo需production原始证据、人工核实后才能声明pass。其余缺证保持unknown。
 

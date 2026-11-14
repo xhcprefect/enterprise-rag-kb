@@ -87,6 +87,13 @@ jobs:
           docker pull python:3.12-slim
       - run: bash deploy/tests/test-monitoring.sh
       - run: bash deploy/tests/test-alerting.sh
+      # 隔离恢复演练需要真实的 PostgreSQL 镜像；先显式拉取，再执行一次扩展的
+      # --isolated 演练（真实 pg_dump/psql + uploads/projects 三件套 + 两种篡改负向）。
+      # 不带 --keep：脚本结束时自清理容器/卷/网络/临时目录，结果只算 local-synthetic。
+      - name: Prepare drill PostgreSQL image
+        run: docker pull pgvector/pgvector:pg18
+      - name: Run isolated restore drill (local-synthetic)
+        run: ./deploy/tests/restore-drill.sh --isolated
 
   browser:
     runs-on: ubuntu-latest

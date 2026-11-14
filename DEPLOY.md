@@ -338,10 +338,18 @@ ls -lt data/backups | head          # 最近一组时间戳应该是今天 03:20
 
 ### 恢复演练（隔离，不影响生产）
 
-`deploy/tests/restore-drill.sh` 在独立的临时 Compose 项目里做**真实**的 pg_dump + psql 恢复，
-再核对行内容与上传文件 SHA-256，不接触生产 `DATA_DIR`、不停生产服务、不写任何远端。
+`deploy/tests/restore-drill.sh` 在独立的临时 Compose 项目里做**真实的 pg_dump + psql 恢复**，
+再核对行内容、上传文件与项目 blob 的 SHA-256，不接触生产 `DATA_DIR`、不停生产服务、不写任何远端。
 它使用自带的 `deploy/tests/drill-compose.yml`（只含一个隔离 PostgreSQL）和自己的临时 env，
 **不加载仓库根的 `docker-compose.yml`**（后者带 `env_file: backend/.env`）。
+
+演练覆盖的合成数据：25 个普通文档行、4 条 `drill_project_blobs` 引用、4 个上传文件、
+4 个内容寻址 project blob（UTF8 文本、二进制、空文件、另一段不同内容；文件名 = 内容 SHA-256）。
+备份产物与生产同构：同一 stamp 的 `ragdb-drill.sql.gz`、`uploads-drill.tar.gz`、
+`projects-drill.tar.gz` 和恰好 3 项的 `manifest-drill.sha256`，并在删除原始合成数据**之前**
+用 `deploy/tests/drill-backup-check.sh` 校验三件套（缺失、损坏、清单缺项/重复/外来条目都拒绝）。
+恢复到全新空目录后逐列比对行与 blob 引用、每文件 SHA-256；最后分别篡改恢复出的 uploads
+文件与 project blob，验证两种检测都会失败。
 
 ```bash
 ./deploy/tests/restore-drill.sh                 # 默认 dry-run：只打印计划，不创建任何资源
@@ -354,9 +362,22 @@ ls -lt data/backups | head          # 最近一组时间戳应该是今天 03:20
 - 每次生成唯一 owner（`drill-<时间戳>-<pid>-<随机>`）和项目名前缀 `ragkb-drill-`；
   清理前逐项核对资源标签，任何不一致就停手并保留现场，**不使用 `compose down -v`** 按项目名批量删除。
 - 临时目录必须在仓库外且名字含 owner；端口默认 `127.0.0.1:55999`（可用 `DRILL_PG_PORT` 改）。
-- 只写测试库、测试上传文件；**不要指向真实数据库或生产上传目录**。
+- 只写测试库、测试上传文件与合成 blob；**不要指向真实数据库或生产上传目录**。
 
-这是"验证备份能恢复"的日常手段；真实业务恢复仍走上面的 `restore.sh`，两者不要混用。
+**结论口径：local-synthetic**。演练全部输入是脚本生成的合成数据，通过它**不**自动证明
+生产备份可恢复、production RTO/RPO 或应用层项目来源预览；CI 的 maintenance job 会跑一次
+同样的 `--isolated` 演练（结果同样只算 local-synthetic）。真实业务恢复仍走上面的 `restore.sh`，
+两者不要混用。
+
+`deploy/tests/drill-backup-check.sh` 是演练三件套的只读校验 helper（不读 .env、不调用
+Docker、不做恢复、不写文件）。CLI 只有一个显式 `<backup目录>`，校验固定
+`ragdb-drill.sql.gz / uploads-drill.tar.gz / projects-drill.tar.gz /
+manifest-drill.sha256` 的结构完整性与 SHA；清单恰好 3 行，同时接受 GNU text 空格与
+binary 星标标记，拒绝缺项/重复/外来条目。不提供逐文件模式或通用恢复器；演练在
+DROP 前与篡改负向后都用这同一个目录级入口复核。校验通过返回 `0`，校验失败返回 `1`，
+用法/参数错误返回 `2`，`--help` 返回 `0`；帮助与失败信息不回显任何环境凭据。
+`deploy/tests/test-drill-backup-check.sh` 覆盖它的成功/缺失/篡改/结构错/大 dump 完整流/
+清单缺项重复外来/只读性用例，并随 `test-drill-guard.sh` 一起在 CI 运行。
 
 演练结果与 RTO/RPO/校验证据需填入验收模板，工具不会自动判定生产验收；详见 [部署验收指南](deploy/acceptance/README.md)。
 
