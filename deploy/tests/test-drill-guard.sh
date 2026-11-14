@@ -74,4 +74,50 @@ grep -q 'envfile="$work/drill.env"' "$drill"
 grep -q 'drill.env' "$drill"
 echo "   ok: 只使用自建的 drill.env"
 
-echo '演练守卫回归通过：默认 dry-run、参数校验、失败清理、项目冲突拒绝、owner 守卫、不读真实 .env。'
+echo "== 8. 健康检查只在正式 TCP 服务 ready 后通过 =="
+# 官方镜像首次初始化的临时 postmaster 只监听 Unix socket；不带 -h 的 pg_isready
+# 会把这一阶段误判 healthy，up --wait 提前返回，随后的 psql 写库即撞上重启。
+# 只读解析真实 probe，用 shlex + subprocess(argv)（不经 shell）交给替身跑三个
+# 启动阶段；旧 probe 在 socket-only bootstrap 会假通过，从而让本项非零退出。
+python3 - "$root/deploy/tests/drill-compose.yml" <<'PY' || exit 1
+import os, re, shlex, subprocess, sys, tempfile
+
+text = open(sys.argv[1], encoding='utf-8').read()
+m = re.search(r'healthcheck:\s*\n(?:\s+[^\n]*\n)*?\s+test:\s*\[\s*"CMD-SHELL",\s*"(.+?)"\s*\]', text)
+assert m, 'drill-compose.yml 缺少 CMD-SHELL healthcheck'
+argv = shlex.split(m.group(1))
+assert argv[0] == 'pg_isready', f'healthcheck 必须直接调用 pg_isready: {argv[0]}'
+assert all(not any(c in a for c in ';|&\n') for a in argv), 'probe 含 shell 元字符'
+# 按 drill.env 的真实值把两个合成占位符换成字面量（在 argv 层，不做字符串替换）
+assert '${POSTGRES_USER}' in argv and '${POSTGRES_DB}' in argv, 'probe 缺少用户名/库名占位符'
+argv = [{'${POSTGRES_USER}': 'drilluser', '${POSTGRES_DB}': 'drilldb'}.get(a, a) for a in argv]
+
+with tempfile.TemporaryDirectory() as stub:
+    path = os.path.join(stub, 'pg_isready')
+    open(path, 'w', encoding='utf-8').write('''#!/usr/bin/env python3
+import os, sys
+a = sys.argv[1:]
+i = a.index('-h') if '-h' in a else -1
+# 仅 127.0.0.1 是目标 TCP；无 -h 或绝对路径仍是 socket；其余主机一律拒绝
+if i >= 0 and (i + 1 >= len(a) or (a[i+1] != '127.0.0.1' and not a[i+1].startswith('/'))):
+    sys.exit(2)
+tcp = i >= 0 and a[i+1] == '127.0.0.1'
+up = os.environ.get('PG_STUB_TCP' if tcp else 'PG_STUB_SOCK') == 'up'
+sys.exit(0 if up else 2)
+''')
+    os.chmod(path, 0o755)
+    env = dict(os.environ, PATH=stub + os.pathsep + os.environ['PATH'])
+    def run(sock, tcp):
+        # shell=False：argv 里任何 ; | & 等只是 pg_isready 的参数，不会被解释执行
+        return subprocess.run(argv, env=dict(env, PG_STUB_SOCK=sock, PG_STUB_TCP=tcp),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    bootstrap, shutdown, ready = run('up', 'down'), run('down', 'down'), run('up', 'up')
+    print('   probe:', shlex.join(argv))
+    print('   各阶段 healthy: bootstrap=%s shutdown=%s ready=%s' % (bootstrap, shutdown, ready))
+    assert not bootstrap, 'healthcheck 在仅 Unix socket 的 bootstrap 阶段就通过（旧竞争仍存在）'
+    assert not shutdown, 'healthcheck 在服务切换间隙（无服务监听）仍通过'
+    assert ready, 'healthcheck 在正式 TCP 服务 ready 后仍未通过'
+print('   ok: probe 在 socket-only bootstrap 拒绝、TCP ready 才通过')
+PY
+
+echo '演练守卫回归通过：默认 dry-run、参数校验、失败清理、项目冲突拒绝、owner 守卫、不读真实 .env、健康检查 TCP ready 门禁。'

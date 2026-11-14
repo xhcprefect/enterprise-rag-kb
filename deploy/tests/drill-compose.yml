@@ -21,8 +21,11 @@ services:
       - "127.0.0.1:${POSTGRES_PORT:-55999}:5432"
     volumes:
       - drill_pgdata:/var/lib/postgresql/data
+    # 首次初始化时官方镜像的临时 postmaster 只监听 Unix socket；不带 -h 的
+    # pg_isready 会把这个阶段误判 healthy。显式探测 TCP 127.0.0.1，只有正式
+    # 服务 ready 才放行 compose up --wait。
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h 127.0.0.1"]
       interval: 2s
       timeout: 3s
       retries: 30
