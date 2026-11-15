@@ -61,6 +61,7 @@ if [[ -n "$PROJECTS_BACKUP" ]]; then
   validate_projects_archive "$PROJECTS_BACKUP"
 fi
 
+show_maintenance_target
 echo "即将覆盖数据库: $DB_BACKUP"
 [[ -z "$FILES_BACKUP" ]] || echo "即将覆盖上传目录: $FILES_BACKUP"
 [[ -z "$PROJECTS_BACKUP" ]] || echo "即将覆盖项目存储: $PROJECTS_BACKUP"
@@ -158,7 +159,7 @@ if [[ -n "$PROJECTS_BACKUP" ]]; then
   touched_state[projects]=2
 fi
 # pg_dump 不带 --create，支持在同一事务里恢复；任意 SQL 错误均回滚整个数据库变更。
-gunzip -c "$DB_BACKUP" | docker compose -f "$COMPOSE_FILE" exec -T db \
+gunzip -c "$DB_BACKUP" | ragkb_compose exec -T db \
   psql -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-ragdb}" \
   --single-transaction -v ON_ERROR_STOP=1
 committed=1

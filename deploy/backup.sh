@@ -44,8 +44,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+show_maintenance_target
 stop_writers
-docker compose -f "$COMPOSE_FILE" exec -T db \
+ragkb_compose exec -T db \
   pg_dump -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-ragdb}" --clean --if-exists \
   | gzip -6 > "$work/$db_name"
 

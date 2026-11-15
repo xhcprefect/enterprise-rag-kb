@@ -8,10 +8,16 @@
 #   3. 恢复新格式、失败回滚（uploads 与 projects 都还原）；
 #   4. 恢复旧格式（清单只有两项、无 projects 行）；
 #   5. 损坏/缺项/混合批次/含链接的归档必须在停写前拒绝；
-#   6. 可配置停写预算、非法预算在停服务前拒绝。
+#   6. 可配置停写预算、非法预算在停服务前拒绝；
+#   7. staging/production 双 project 隔离：只停启选定项目的全部活跃 writer，
+#      compose config/db exec 都带显式 --env-file、-p、多个 -f，坏配置先拒绝；
+#   8. init 选定环境路径与旧单环境动态变量引用展开。
 #
-# 只在独占临时容器内执行：脚本使用固定的 /tmp 目录并在退出时删除。
+# 只在独占、无网络的临时 Linux 容器内执行：docker 是命令替身，仓库只读挂载；
+# 脚本使用容器私有的 /tmp 目录并在退出时删除。
 set -euo pipefail
+unset RAGKB_DEPLOY_ENVIRONMENT COMPOSE_PROJECT_NAME COMPOSE_FILE BACKEND_ENV_FILE \
+  FAKE_DOCKER_PROJECT_RUNNING RAGKB_INIT_SKIP_SOURCE_CHECK
 root=$(cd "$(dirname "$0")/../.." && pwd)
 bin=$(mktemp -d)
 work=/tmp/rag-maintenance-test
@@ -23,8 +29,10 @@ chmod +x "$bin/docker"
 export PATH="$bin:$PATH"
 export FAKE_DOCKER_STATE="$work/docker-state"
 export OPERATIONS_LOG="$work/operations.log"
+export FAKE_COMPOSE_LOG="$work/compose-calls.log"
 rm -rf "$FAKE_DOCKER_STATE"
 : > "$OPERATIONS_LOG"
+: > "$FAKE_COMPOSE_LOG"
 
 ENV="$work/fixture.env"
 cat > "$ENV" <<EOF
@@ -38,6 +46,30 @@ export ENV_FILE="$ENV"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_contains() { grep -q -- "$2" "$1" || fail "缺少输出: $2"; }
+compose_line() { grep -F "$1|" "$FAKE_COMPOSE_LOG" | tail -1; }
+assert_compose_call() { # 子命令 project env_file 文件列表 backend_env_file
+  local line
+  line=$(compose_line "$1") || fail "缺少 compose 调用: $1"
+  IFS='|' read -r -a fields <<< "$line"
+  [[ ${fields[1]} == "$2" ]] || fail "compose $1 project 错误: ${fields[*]}"
+  [[ ${fields[2]} == "$3" ]] || fail "compose $1 --env-file 错误: ${fields[*]}"
+  [[ ${fields[3]} == "$4" ]] || fail "compose $1 -f 列表错误: ${fields[*]}"
+  [[ ${fields[4]} == "$5" ]] || fail "compose $1 应用配置错误: ${fields[*]}"
+  for file in $4; do
+    grep -q -- "-f $file" "$OPERATIONS_LOG" || fail "compose $1 缺少显式 -f $file"
+  done
+  [[ $(grep -c -- '--env-file ' "$OPERATIONS_LOG") -ge 1 ]] \
+    || fail "compose $1 未显式传递 --env-file"
+  [[ $(grep -c -- "-p $2" "$OPERATIONS_LOG") -ge 1 ]] \
+    || fail "compose $1 未显式传递 -p"
+  grep -q -- "--env-file $3" "$OPERATIONS_LOG" || fail "compose $1 未显式传递 --env-file"
+  grep -q -- "-f ${4%% *} -f ${4##* }" "$OPERATIONS_LOG" \
+    || fail "compose $1 未把冒号 COMPOSE_FILE 拆成多个 -f"
+  if grep -qE '^compose .* -f [^ ]*:[^ ]* ' "$OPERATIONS_LOG"; then
+    fail "compose $1 把冒号路径作为单个 -f 参数"
+  fi
+}
+reset_calls() { : > "$OPERATIONS_LOG"; : > "$FAKE_COMPOSE_LOG"; }
 
 # ---------- 初始数据 ----------
 printf 'original-upload' > "$work/uploads/content.txt"
@@ -283,4 +315,228 @@ fi
 [[ -z "$(ls "$work"/backups/manifest-*.sha256 2>/dev/null)" ]] || fail '失败仍发布清单'
 grep -q '^start c-api$' "$OPERATIONS_LOG" || fail '失败后未恢复服务'
 
-echo '维护脚本回归通过：新格式三件产物、全角色停写/只恢复原运行、双目录恢复与回滚、旧格式兼容、缺项/链接/混合批次/篡改拒绝、可配置预算。'
+# ---------- 同机双环境：只维护显式选定的 project ----------
+# A 提供的 helper 已落盘；测试不复刻它。env 文件模拟 env.sh 的规范导出：
+# 绝对路径的 BACKEND_ENV_FILE 不得被部署 .env 中的相对/空值覆盖。
+echo "== 13. 双环境维护隔离（staging 与 production 双向） =="
+iso="$work/isolation"
+mkdir -p "$iso/staging"/{uploads,projects,backups} "$iso/production"/{uploads,projects,backups} "$iso/app"
+printf 'name: wrong-project-from-base\n' > "$iso/base.yml"
+printf 'services: {}\n' > "$iso/host.yml"
+printf 'staging' > "$iso/app/staging-backend.env"
+printf 'production' > "$iso/app/production-backend.env"
+for env_name in staging production; do
+  cat > "$iso/$env_name.env" <<EOF
+DATA_DIR=$iso/$env_name
+BACKUP_DIR=$iso/$env_name/backups
+POSTGRES_USER=postgres
+POSTGRES_DB=${env_name}_db
+KEEP_DAYS=7
+BACKEND_ENV_FILE=./relative-should-not-win.env
+COMPOSE_FILE=$iso/base.yml:$iso/host.yml
+ENV_FILE=/dev/null-should-not-win.env
+EOF
+done
+export FAKE_DOCKER_PROJECT_RUNNING="ragkb-staging:s-api:api ragkb-staging:s-ing:worker ragkb-staging:s-sum:worker-summary ragkb-staging:s-prj:worker-project ragkb-staging:s-reg:worker-regression ragkb-staging:s-web:web ragkb-prod:p-api:api ragkb-prod:p-ing:worker ragkb-prod:p-sum:worker-summary ragkb-prod:p-prj:worker-project ragkb-prod:p-reg:worker-regression ragkb-prod:p-web:web"
+unset FAKE_DOCKER_RUNNING
+rm -rf "$FAKE_DOCKER_STATE"
+
+run_isolated_backup() { # environment project data_dir
+  local environment=$1 project=$2 data_dir=$3 env_file=$4 backend=$5 log=$6
+  reset_calls
+  RAGKB_DEPLOY_ENVIRONMENT="$environment" \
+  ENV_FILE="$env_file" BACKEND_ENV_FILE="$backend" \
+  DATA_DIR="$data_dir" BACKUP_DIR="$data_dir/backups" \
+  POSTGRES_USER=postgres POSTGRES_DB="${environment}_db" \
+  COMPOSE_PROJECT_NAME="$project" COMPOSE_FILE="$iso/base.yml:$iso/host.yml" \
+    bash "$root/deploy/backup.sh" > "$log" 2>&1 \
+    || { cat "$log" >&2; fail "$environment 备份失败"; }
+}
+
+run_isolated_backup staging ragkb-staging "$iso/staging" "$iso/staging.env" \
+  "$iso/app/staging-backend.env" "$iso/staging.log"
+assert_contains "$iso/staging.log" '环境=staging'
+assert_contains "$iso/staging.log" '数据库=staging_db'
+assert_contains "$iso/staging.log" "$iso/staging/backups"
+for id in s-api s-ing s-sum s-prj s-reg; do
+  grep -q "^stop --timeout [0-9]* $id$" "$OPERATIONS_LOG" \
+    || fail "staging 未停止所有活跃 writer: $id"
+  grep -q "^start $id$" "$OPERATIONS_LOG" || fail "staging 未恢复 $id"
+done
+for id in p-api p-ing p-sum p-prj p-reg; do
+  if grep -qE "^(stop --timeout [0-9]*|start) $id$" "$OPERATIONS_LOG"; then
+    fail "staging 维护误操作 production 容器: $id"
+  fi
+done
+grep -q '^ps --filter label=com.docker.compose.project=ragkb-staging' "$OPERATIONS_LOG" \
+  || fail '停写未按 staging project 标签过滤'
+assert_compose_call pg_dump ragkb-staging "$iso/staging.env" \
+  "$iso/base.yml $iso/host.yml" "$iso/app/staging-backend.env"
+[[ $(awk -F'|' '$1=="pg_dump" {n++} END {print n+0}' "$FAKE_COMPOSE_LOG") -eq 1 ]] \
+  || fail 'staging pg_dump 的 compose 调用次数不正确'
+
+# 合成一次同批恢复：明确验证 psql 与 pg_dump 指向同一 project/配置，仍然只停 staging。
+db=$(ls -1t "$iso/staging"/backups/ragdb-*.sql.gz | head -1)
+up=$(ls -1t "$iso/staging"/backups/uploads-*.tar.gz | head -1)
+pr=$(ls -1t "$iso/staging"/backups/projects-*.tar.gz | head -1)
+reset_calls
+printf 'yes\n' | RAGKB_DEPLOY_ENVIRONMENT=staging ENV_FILE="$iso/staging.env" \
+  BACKEND_ENV_FILE="$iso/app/staging-backend.env" \
+  DATA_DIR="$iso/staging" BACKUP_DIR="$iso/staging/backups" \
+  POSTGRES_USER=postgres POSTGRES_DB=staging_db \
+  COMPOSE_PROJECT_NAME=ragkb-staging COMPOSE_FILE="$iso/base.yml:$iso/host.yml" \
+  bash "$root/deploy/restore.sh" "$db" "$up" "$pr" >/dev/null \
+  || fail 'staging 恢复失败'
+assert_compose_call psql ragkb-staging "$iso/staging.env" \
+  "$iso/base.yml $iso/host.yml" "$iso/app/staging-backend.env"
+for id in p-api p-ing p-sum; do
+  if grep -qE "^(stop --timeout [0-9]*|start) $id$" "$OPERATIONS_LOG"; then
+    fail "staging 恢复误操作 production 容器: $id"
+  fi
+done
+
+# 反向：production 也只停自己的 writer，state 中 staging 容器仍全部在运行。
+rm -rf "$FAKE_DOCKER_STATE"
+run_isolated_backup production ragkb-prod "$iso/production" "$iso/production.env" \
+  "$iso/app/production-backend.env" "$iso/production.log"
+assert_contains "$iso/production.log" '环境=production'
+for id in p-api p-ing p-sum p-prj p-reg; do
+  grep -q "^stop --timeout [0-9]* $id$" "$OPERATIONS_LOG" \
+    || fail "production 未停止所有活跃 writer: $id"
+done
+for id in s-api s-ing s-sum s-prj s-reg; do
+  if grep -qE "^(stop --timeout [0-9]*|start) $id$" "$OPERATIONS_LOG"; then
+    fail "production 维护误操作 staging 容器: $id"
+  fi
+done
+grep -q '^ps --filter label=com.docker.compose.project=ragkb-prod' "$OPERATIONS_LOG" \
+  || fail '停写未按 production project 标签过滤'
+assert_compose_call pg_dump ragkb-prod "$iso/production.env" \
+  "$iso/base.yml $iso/host.yml" "$iso/app/production-backend.env"
+
+# 坏配置必须在任何 stop/pg_dump 前拒绝；测试替身会在 compose config 阶段失败。
+reset_calls
+if FAIL_COMPOSE_CONFIG=1 COMPOSE_PROJECT_NAME= \
+  RAGKB_DEPLOY_ENVIRONMENT=staging ENV_FILE="$iso/staging.env" \
+  BACKEND_ENV_FILE="$iso/app/staging-backend.env" \
+  DATA_DIR="$iso/staging" BACKUP_DIR="$iso/staging/backups" \
+  COMPOSE_FILE="$iso/base.yml:$iso/host.yml" \
+  bash "$root/deploy/backup.sh" >/dev/null 2>&1; then
+  fail '坏配置仍被接受'
+fi
+if grep -qE '^(stop --timeout|start) |pg_dump' "$OPERATIONS_LOG"; then
+  fail '坏配置在停写/导出之后才被拒绝'
+fi
+
+# init 的选定环境路径：不读/生成 legacy 文件，不覆盖已有文件，不回显密钥。
+echo "== 14. init 选定环境路径与模板/占位/幂等 =="
+init_home="$iso/init-home"
+mkdir -p "$init_home/repo/backend" "$init_home/repo/deploy/environments/select" \
+  "$init_home/deploy/environments/select"
+cp "$root/deploy/init.sh" "$init_home/repo/deploy/init.sh"
+printf 'legacy-root-secret\n' > "$init_home/repo/.env"
+printf 'legacy-app-secret\n' > "$init_home/repo/backend/.env"
+cat > "$init_home/deploy/environments/select/.env.example" <<EOF
+DATA_DIR=$iso/init-data
+POSTGRES_PASSWORD=synthetic-strong-password-20261114
+WEB_PORT=18080
+WEB_BIND_IP=127.0.0.1
+WORKER_STOP_TIMEOUT_SECONDS=180
+EOF
+cat > "$init_home/deploy/environments/select/backend.env.example" <<EOF
+JWT_SECRET=synthetic-strong-jwt-secret-20261114
+ADMIN_PASSWORD=synthetic-strong-admin-password-20261114
+EOF
+init_env="$init_home/deploy/environments/select/.env"
+init_backend="$init_home/deploy/environments/select/backend.env"
+init_out="$iso/init.log"
+init_stub="$bin/isolation-init"
+mkdir -p "$init_stub"
+cat > "$init_stub/curl" <<'CURL'
+#!/usr/bin/env bash
+# 离线测试替身：记录探测但不访问公网，明确返回可达。
+printf '%s\n' "$*" >> "${FAKE_CURL_LOG:?}"
+exit 0
+CURL
+chmod +x "$init_stub/curl"
+export FAKE_CURL_LOG="$iso/curl.log"
+: > "$FAKE_CURL_LOG"
+init_run() { # 输出文件
+  (cd "$init_home/repo" && RAGKB_DEPLOY_ENVIRONMENT=staging \
+    ENV_FILE="$init_env" BACKEND_ENV_FILE="$init_backend" \
+    PATH="$init_stub:$PATH" bash deploy/init.sh > "$1" 2>&1)
+}
+init_run "$init_out" \
+  || { cat "$init_out" >&2; fail '选定环境的 init 成功路径执行失败'; }
+[[ -f "$init_env" && -f "$init_backend" ]] || fail 'init 未从所选模板生成文件'
+[[ $(grep -c 'https://' "$FAKE_CURL_LOG") -eq 3 ]] || fail 'init 未通过 curl 替身完成三项源探测'
+grep -q '环境入口' "$init_out" || fail 'init 未提示环境入口命令'
+grep -q -- 'compose up -d --no-build' "$init_out" || fail 'init 未提示不可变镜像启动'
+grep -q 'synthetic-strong' "$init_out" && fail 'init 日志泄露配置值'
+grep -q '环境=staging' "$init_out" && fail 'init 不应输出维护目标提示'
+[[ $(cat "$init_home/repo/.env") == legacy-root-secret ]] || fail 'init 改写了 legacy 根 .env'
+[[ $(cat "$init_home/repo/backend/.env") == legacy-app-secret ]] || fail 'init 改写了 legacy backend/.env'
+# 填写配置后必须报告占位/弱值、不覆盖已填文件、也不触碰 legacy 或公网。
+cat > "$init_env" <<EOF
+DATA_DIR=$iso/init-data
+POSTGRES_PASSWORD=change-me-strong-password
+WEB_PORT=18080
+WEB_BIND_IP=127.0.0.1
+EOF
+cat > "$init_backend" <<EOF
+JWT_SECRET=change-me-to-a-random-string
+ADMIN_PASSWORD=Admin@123456
+EOF
+if init_run "$init_out"; then
+  fail 'init 未拒绝选定环境的占位值'
+fi
+if grep -q 'change-me-strong-password\|change-me-to-a-random-string\|Admin@123456' "$init_out"; then
+  fail 'init 拒绝占位值时回显了密钥值'
+fi
+assert_contains "$init_out" '占位/弱值'
+[[ $(grep -c '^' "$init_env") -eq 4 ]] || fail 'init 覆盖了已有的部署配置'
+[[ $(grep -c '^' "$init_backend") -eq 2 ]] || fail 'init 覆盖了已有的应用配置'
+rm -f "$init_env" "$init_backend" "$init_home/deploy/environments/select/.env.example"
+if init_run "$init_out"; then
+  fail '缺少所选环境模板时 init 未明确失败'
+fi
+grep -q '对应模板不存在' "$init_out" || fail '缺模板失败原因不明确'
+[[ ! -e "$init_env" && ! -e "$init_backend" ]] || fail '缺模板时猜测并生成了 legacy 配置'
+
+# 旧单环境 init：保留 source 的变量展开语义，BACKUP_DIR=${DATA_DIR}/...
+# 不得变成字面目录，也不得把未展开值作为路径创建。
+echo "== 15. init legacy 动态 DATA_DIR/BACKUP_DIR 展开 =="
+legacy_home="$iso/legacy-init"
+legacy_data="$legacy_home/data"
+mkdir -p "$legacy_home/deploy" "$legacy_home/backend"
+cp "$root/deploy/init.sh" "$legacy_home/deploy/init.sh"
+cat > "$legacy_home/.env" <<EOF
+DATA_DIR=$legacy_data
+BACKUP_DIR=\${DATA_DIR}/custom-backups
+POSTGRES_PASSWORD=synthetic-strong-password-20261114
+JWT_SECRET=synthetic-strong-jwt-secret-20261114
+WEB_PORT=18080
+WEB_BIND_IP=127.0.0.1
+EOF
+cp "$legacy_home/.env" "$legacy_home/.env.expected"
+cat > "$legacy_home/backend/.env" <<EOF
+JWT_SECRET=synthetic-strong-jwt-secret-20261114
+ADMIN_PASSWORD=synthetic-strong-admin-password-20261114
+EOF
+cp "$legacy_home/backend/.env" "$legacy_home/backend/.env.expected"
+init_run_legacy() {
+  (cd "$legacy_home" && env -u ENV_FILE -u BACKEND_ENV_FILE -u RAGKB_DEPLOY_ENVIRONMENT \
+    -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE \
+    PATH="$init_stub:$PATH" bash deploy/init.sh > "$init_out" 2>&1)
+}
+init_run_legacy || { cat "$init_out" >&2; fail 'legacy init 成功路径执行失败'; }
+cmp -s "$legacy_home/.env" "$legacy_home/.env.expected" || fail 'legacy init 改写了已有 .env'
+cmp -s "$legacy_home/backend/.env" "$legacy_home/backend/.env.expected" \
+  || fail 'legacy init 改写了已有 backend/.env'
+[[ -d "$legacy_data/pgdata" && -d "$legacy_data/custom-backups" ]] \
+  || fail 'legacy init 未创建展开后的数据/备份目录'
+[[ ! -e "$legacy_home/\${DATA_DIR}" ]] || fail 'legacy init 创建了字面 ${DATA_DIR} 目录'
+[[ ! -e "$legacy_home/legacy/\${DATA_DIR}" ]] || fail 'legacy init 在仓库内创建了字面目录'
+grep -q "数据目录就绪: $legacy_data" "$init_out" || fail 'legacy init 输出未显示展开后的 DATA_DIR'
+
+echo '维护脚本回归通过：新格式三件产物、全角色停写/只恢复原运行、双目录恢复与回滚、旧格式兼容、缺项/链接/混合批次/篡改拒绝、可配置预算、staging/production 维护隔离、init 选定环境路径与 legacy 动态展开。'

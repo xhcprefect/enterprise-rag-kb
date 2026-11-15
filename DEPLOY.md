@@ -1,4 +1,13 @@
-# 生产部署手册
+# 生产部署手册（旧单环境）
+
+> 面向**旧单环境**部署（根 `.env` + `backend/.env`，Compose project `rag-kb`）的参考手册。
+> **单机同时运行 production / staging 两套**，请直接按 [DEPLOY-SAME-HOST.md](DEPLOY-SAME-HOST.md)
+> 执行：统一入口 `bash deploy/env.sh <production|staging> <command> [args]`，配置在
+> `deploy/environments/{production,staging}/`，不得把本页的根 `.env` 命令、`source .env`
+> 或 `docker compose -f ...` 用于新双环境；旧单环境命令仍保持兼容。
+> 双环境的 HTTPS 仍沿用本页「HTTPS」章节的证书与域名配置，但要把 `COMPOSE_FILE`
+> 追加 `docker-compose.https.yml` 后通过环境入口启动；备份/恢复章节可参考格式与清单规则，
+> 具体命令以新手册为准。
 
 面向 Ubuntu 22.04 LTS、2 核 4 GiB 的云服务器。全部组件用 Docker Compose 编排，
 对外只暴露一个 Nginx 端口。
@@ -68,7 +77,7 @@ cp backend/.env.example backend/.env   # 应用配置
 | `.env` | `POSTGRES_PASSWORD` | 数据库密码，只含字母数字，避免连接串转义问题；`testpw123`、`123456` 这类本地开发口令也会被拦下 |
 | `.env` | `JWT_SECRET` | `python3 -c "import secrets;print(secrets.token_urlsafe(48))"` |
 | `backend/.env` | `JWT_SECRET` | 同上，**两个文件保持一致** |
-| `backend/.env` | `ADMIN_PASSWORD` | 初始管理员密码 |
+| `backend/.env` | `ADMIN_PASSWORD` | 初始管理员密码（≥12 位、非默认；现有 `deploy/init.sh` 要求填初始化值，管理员创建成功后可从文件删除该行，改密码走「个人中心」） |
 | `backend/.env` | `EMBEDDING_API_KEY` / `LLM_API_KEY` | 云端密钥 |
 
 其余保持默认即可：`EMBEDDING_PROVIDER=cloud`、`LLM_PROVIDER=cloud`、
@@ -220,6 +229,11 @@ python backend/scripts/verify_deployment.py \
 统计记录的是应用内模型调用尝试，包含自动重试、文档/检索向量化、改写、重排与生成；已删除的会话不会扣减历史用量。失败或停止可能仍有费用；上游未报告的用量保持未知。统计是按配置单价计算的估算，不包含供应商折扣、套餐、税费、调用后继续产生的费用或应用外调用，不能代替供应商账单。详细口径见 [README 用量与费用](README.md#用量与费用)。
 
 ## 数据与备份
+
+> 本节的直接脚本与 Compose 命令适用于旧单环境。同机双环境从显式入口执行，
+> 例如 `bash deploy/env.sh production backup`、`bash deploy/env.sh staging compose ps`；
+> 恢复仍需提供实际同 stamp 归档并人工确认。配置、数据/备份目录与 project 由入口固定，
+> 完整步骤见 [DEPLOY-SAME-HOST.md](DEPLOY-SAME-HOST.md)。
 
 所有数据在 `${DATA_DIR}`（默认 `./data`）：
 
@@ -610,6 +624,11 @@ docker compose exec api python -c \
 
 ## HTTPS
 
+> 同机双环境使用本环境 `.env` 追加 `docker-compose.https.yml`，设置固定域名、
+> 仓库外证书目录和 `RAGKB_TLS_MODE=https`，再由显式环境入口启动。
+> ACME 默认目录为本环境 `${DATA_DIR}/acme`，其余 nginx 挂载与续期规则见下文；
+> 可执行步骤见 [DEPLOY-SAME-HOST.md](DEPLOY-SAME-HOST.md)。staging 保持回环绑定。
+
 HTTP 是默认形态；HTTPS 是一个**Compose 覆盖文件**，不需要改 `frontend/nginx.conf`，也不需要重新构建镜像。
 覆盖层 `docker-compose.https.yml` 会把 `/etc/nginx/conf.d/app.conf` 换成仓库里的 `frontend/nginx/tls.conf`：
 
@@ -800,8 +819,8 @@ curl -sSI https://kb.example.com | grep -i strict-transport-security
 - [ ] `JWT_SECRET` 已换成随机值（`.env` 与 `backend/.env` 两处）
 - [ ] `POSTGRES_PASSWORD` 已改，且数据库端口**没有**暴露到公网（当前配置只在内网）
 - [ ] `admin` 密码已改（首次登录后到个人中心修改）
-- [ ] 改完后把 `backend/.env` 的 `ADMIN_PASSWORD` **整行删掉**——它只在建号那一次
-      生效，留着只会让后来人误以为改它就能改密码（密码对不上时启动日志会告警提示）
+- [ ] 初始 `ADMIN_PASSWORD` 已改为强值；管理员建号后把 `backend/.env` 的 `ADMIN_PASSWORD` **整行删掉**——它只在建号那一次
+      生效，留着只会让后来人误以为改它就能改密码（密码对不上时启动日志会告警提示）。注意现有 `deploy/init.sh` 会检查该行不得为空/占位，首次初始化必须先填值，删除动作在建号成功之后。
 - [ ] 定时备份已配置且在跑：`crontab -l` 有输出、`data/logs/backup.log` 有记录
 - [ ] `backend/.env` 没有提交到 git（`.gitignore` 已包含）
 - [ ] 云服务器安全组只放行 80（以及要用的 443），**不要**放行 8000 / 5432

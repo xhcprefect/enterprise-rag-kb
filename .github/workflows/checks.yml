@@ -80,6 +80,7 @@ jobs:
       - run: bash deploy/tests/test-maintenance.sh
       - run: bash deploy/tests/test-remote-backup.sh
       - run: bash deploy/tests/test-drill-guard.sh
+      - run: bash deploy/tests/test-environments.sh
       - name: Prepare monitoring and alerting test images
         run: |
           docker pull prom/prometheus:v3.1.0

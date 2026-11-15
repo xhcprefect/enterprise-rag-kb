@@ -72,14 +72,18 @@ enterprise-rag-kb/
 │       ├── tls.conf       # 可选 HTTPS 入口（由 docker-compose.https.yml 挂载覆盖）
 │       └── snippets/      # 两套配置共用的 location / 代理 / TLS 参数
 ├── deploy/
+│   ├── env.sh             # 同机双环境统一入口（显式选择 production/staging）
+│   ├── environments/      # 两套 .env / backend.env 模板（实际配置不入库）
 │   ├── init.sh            # 首次部署检查
 │   ├── backup.sh          # 备份（数据库 + 上传文件 + 项目 blob + 校验清单）
 │   ├── restore.sh         # 恢复（1–3 个参数，校验清单后恢复）
 │   └── tests/
 │       └── restore-drill.sh   # 隔离恢复演练（专用临时 Compose 项目）
 ├── docker-compose.yml     # db / api / worker / web；summary、project、regression 可选 profile
+├── docker-compose.host.yml    # 同机双环境运行时资源覆盖
 ├── docker-compose.https.yml   # 可选 HTTPS 覆盖（80 跳转 + 443 站点）
-├── DEPLOY.md              # 生产部署手册
+├── DEPLOY-SAME-HOST.md    # 单机 production / staging 双环境部署手册
+├── DEPLOY.md              # 旧单环境生产部署手册
 ├── start-backend.bat
 └── start-frontend.bat
 ```
@@ -549,12 +553,15 @@ worker 相互独立，可单独启动。
 
 ## 生产部署
 
-- **从零开始**（买服务器 → 配安全组 → 装 Docker → 上线验收）：
+- **单机同时运行 production / staging 两套隔离环境**：[DEPLOY-SAME-HOST.md](DEPLOY-SAME-HOST.md)
+  （统一入口 `bash deploy/env.sh <production|staging> <command> [args]`，配置模板在 `deploy/environments/`）
+- **从零开始**（旧单环境：买服务器 → 配安全组 → 装 Docker → 上线验收）：
   [DEPLOY-FROM-SCRATCH.md](DEPLOY-FROM-SCRATCH.md)
-- **已有服务器、只想更新代码**：[DEPLOY.md](DEPLOY.md)
+- **已有服务器、只想更新代码**：[DEPLOY.md](DEPLOY.md)（旧单环境参考）
 - **部署验收（只读检查 + 人工证据）**：[deploy/acceptance/README.md](deploy/acceptance/README.md)
 
-一条命令拉起全部组件：
+一条命令拉起全部组件（**仅旧单环境**；同机双环境见上面新手册，首次 `init` 生成占位后非零退出是设计行为，
+不要 `source .env`）：
 
 ```bash
 cp .env.example .env && cp backend/.env.example backend/.env   # 填密钥
@@ -589,7 +596,7 @@ python backend/scripts/verify_deployment.py \
 备份产出同一 stamp 的 `ragdb`、`uploads`、`projects` 三份归档和最后发布的 `manifest-*.sha256` 清单；
 恢复按清单校验后覆盖，旧的两件套备份仍兼容（不改动现有 `projects/`）。日常维护入口见
 [DEPLOY.md](DEPLOY.md#数据与备份)，恢复能力用 `deploy/tests/restore-drill.sh` 在隔离环境演练。
-可选的 HTTPS 用 `docker-compose.https.yml` 覆盖启用，见 [DEPLOY.md](DEPLOY.md#https)。
+可选的 HTTPS 用 `docker-compose.https.yml` 覆盖启用，见 [DEPLOY.md](DEPLOY.md#https)；双环境按环境 `.env` 的 `COMPOSE_FILE` 追加并经 `deploy/env.sh <env> compose` 启动，见 [DEPLOY-SAME-HOST.md](DEPLOY-SAME-HOST.md)。
 
 评测工具支持完整本地语料、公开检索配置和可选索引清单的身份校验，旧身份基线会明确判为不可比；业务问题集可用 `--require-reviewed` 检查人工核验状态，并输出分层样本数与固定断言结果。用法见 [评测说明](backend/evaluation/README.md) 与 [业务标注模板](backend/evaluation/templates/README.md)。
 

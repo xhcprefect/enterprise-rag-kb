@@ -1,0 +1,11 @@
+# 同机入口仅在启用 docker-compose.monitoring.yml 时自动追加。
+# 不在 legacy 或默认核心部署中加载；值为单容器运行时上限。
+services:
+  prometheus:
+    cpus: ${RAGKB_PROMETHEUS_CPUS:-0.50}
+    mem_limit: ${RAGKB_PROMETHEUS_MEM_LIMIT:-256M}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RAGKB_LOG_MAX_SIZE:-10m}
+        max-file: ${RAGKB_LOG_MAX_FILE:-3}

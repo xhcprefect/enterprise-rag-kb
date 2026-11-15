@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # 异地备份回归：本地校验、crypt 类型、权限、失败保留本地、清单最后发布、不覆盖他人标识。
 # 用 fake-docker + fake-rclone 在临时目录里运行，不接触真实 Docker 或真实 remote。
-# 只在独占临时容器内执行：脚本使用固定的 /tmp 目录并在退出时删除。
+# 只在独占、无网络的临时 Linux 容器内执行：仓库只读挂载；脚本使用容器私有的
+# /tmp 目录并在退出时删除。
 set -euo pipefail
+unset RAGKB_DEPLOY_ENVIRONMENT COMPOSE_PROJECT_NAME COMPOSE_FILE BACKEND_ENV_FILE \
+  FAKE_DOCKER_PROJECT_RUNNING RAGKB_INIT_SKIP_SOURCE_CHECK
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work=/tmp/rag-remote-backup-test
 bin=$(mktemp -d)
@@ -24,6 +27,8 @@ POSTGRES_DB=remote_regression_test
 KEEP_DAYS=7
 EOF
 export OPERATIONS_LOG="$work/operations.log"
+export FAKE_COMPOSE_LOG="$work/compose-calls.log"
+export FAKE_DOCKER_STATE="$work/docker-state"
 export FAKE_RCLONE_ROOT="$work/remote"
 export RAGKB_REMOTE_BACKUP_ENABLED=true
 export RCLONE_CONFIG="$work/outside/rclone.conf"
@@ -32,6 +37,7 @@ printf '[crypt_remote]\ntype = crypt\n' > "$RCLONE_CONFIG"
 chmod 600 "$RCLONE_CONFIG"
 # rclone 替身不读真实配置，但要求路径在仓库外且权限合规。
 : > "$OPERATIONS_LOG"
+: > "$FAKE_COMPOSE_LOG"
 printf 'payload' > "$work/uploads/a.txt"
 printf 'blob' > "$work/projects/blob1"
 
@@ -43,6 +49,8 @@ if RAGKB_REMOTE_BACKUP_ENABLED=false bash "$root/deploy/backup.sh" >/dev/null; t
   echo '默认关闭时备份失败' >&2; exit 1
 fi
 [[ -z "$(ls -A "$work/remote")" ]]
+grep -q -- '--env-file ' "$OPERATIONS_LOG" || { echo '异地备份 compose 未显式使用选中 ENV_FILE' >&2; exit 1; }
+grep -q -- ' -f ' "$OPERATIONS_LOG" || { echo '异地备份 compose 未使用 helper 的 -f' >&2; exit 1; }
 echo "   ok: 未启用时不接触 remote"
 
 echo "== 2. 缺少 RCLONE_CONFIG =="
