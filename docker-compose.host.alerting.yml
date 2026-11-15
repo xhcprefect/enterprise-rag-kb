@@ -1,0 +1,11 @@
+# 同机入口仅在启用 docker-compose.alerting.yml 时自动追加。
+# 不在 legacy 或默认核心部署中加载；值为单容器运行时上限。
+services:
+  alertmanager:
+    cpus: ${RAGKB_ALERTMANAGER_CPUS:-0.25}
+    mem_limit: ${RAGKB_ALERTMANAGER_MEM_LIMIT:-128M}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RAGKB_LOG_MAX_SIZE:-10m}
+        max-file: ${RAGKB_LOG_MAX_FILE:-3}

@@ -3,6 +3,13 @@
 本文是一条**线性可执行**的路径：从在云控制台点下"购买"，到浏览器里能登录问答，
 中间每一步都给出命令和**验收标准**。
 
+> 本文只覆盖**旧单环境**部署（根 `.env` + `backend/.env`，Compose project `rag-kb`）。
+> **单机同时运行 production / staging 两套**，请从 [DEPLOY-SAME-HOST.md](DEPLOY-SAME-HOST.md)
+> 开始：统一入口 `bash deploy/env.sh <production|staging> <command> [args]`，配置在
+> `deploy/environments/{production,staging}/`，首次 `init` 生成占位后以非零退出是设计行为；
+> 不要按本文复制根 `.env` / `backend/.env` 或 `source .env`。旧单环境流程仍保持兼容。
+> 两套环境的 HTTPS 证书/域名前置条件、备份清单与恢复格式可参考本文 §9–§10，但操作命令以新手册为准。
+
 > 已有服务器、只想更新代码的，看 [DEPLOY.md](DEPLOY.md) 的「日常运维」。
 > 本文假设**一台全新的空机器**。
 
@@ -434,12 +441,12 @@ echo "（以上无输出 = 全部就绪）"
 | 步骤 | 内容 | 失败会怎样 |
 |---|---|---|
 | 1 | 检查 `.env` / `backend/.env` 是否存在 | 缺失则从 `.example` 复制并提示 |
-| 2 | **占位值检查** | 仍是 `change-me-*` / `Admin@123456` 则**直接退出** |
-| 3 | 建数据目录 `data/{pgdata,uploads,logs,backups}` | 若无权限会失败 |
+| 2 | **占位值检查** | 仍是 `change-me-*` / `Admin@123456` / `change-me-on-first-login` 则**直接退出**（`ADMIN_PASSWORD` 必须填实际初始化值，不能留空） |
+| 3 | 建 `${DATA_DIR}/{pgdata,uploads,projects,logs}` 与 `${BACKUP_DIR}`（默认 `data/backups`） | 若无权限会失败 |
 | 4 | 探测 apt / pip / npm 源连通性 | **仅警告**，不阻断 |
 | 5 | 检查 `WEB_PORT` 是否被占用 | 仅警告 |
 
-**验收**：最后一行输出 `✓ 配置检查通过`，并提示下一步命令。
+**验收**：脚本退出码为 0，输出包含 `✓ 配置检查通过（仅检查选定配置文件）` 与数据目录就绪提示，结尾给出下一步命令。
 
 若第 2 步失败，说明有占位值没换，按提示改完再跑一次。
 
@@ -491,7 +498,9 @@ db (pg_isready 健康) → api (curl /health 健康) → worker
 
 `worker` 特意排在 `api` 之后，是因为**初始管理员由 api 创建**。
 若 worker 先起，它会抢着建表建管理员，导致 `backend/.env` 里的
-`ADMIN_PASSWORD` 不生效——这是个容易被忽略的坑。
+`ADMIN_PASSWORD` 不生效——这是个容易被忽略的坑。现有 `deploy/init.sh` 要求
+`ADMIN_PASSWORD` 先填一个非占位的初始化值；管理员建成后可从 `backend/.env`
+删除该行，之后改密码走「个人中心」。
 
 ---
 

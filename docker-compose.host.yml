@@ -1,0 +1,53 @@
+# 同机 production / staging 共用运行时资源覆盖。
+#
+# 用法：COMPOSE_FILE=docker-compose.yml:docker-compose.host.yml 通过统一入口调用。
+# 只影响运行中的容器，不限制 docker compose build 构建阶段；下面每个数字是
+# 单个容器的上限，不是整个环境的总预算，也不是内存预留。启用可选 profile 或
+# 提高额度前，先按 4C8G 主机重新核算全部容器的合计用量。
+#
+# 所有值可在本环境 .env 覆盖。内存格式由 Docker Compose 解析（如 512M/2G），
+# CPU 用小数核数（如 0.50），日志选项按容器滚动，防止单容器耗尽宿主磁盘。
+# 这里的默认额偏向 staging；production 模板显式给出更大的生产建议值。
+
+x-ragkb-logging: &ragkb-logging
+  driver: json-file
+  options:
+    max-size: ${RAGKB_LOG_MAX_SIZE:-10m}
+    max-file: ${RAGKB_LOG_MAX_FILE:-3}
+
+services:
+  db:
+    cpus: ${DB_CPUS:-1.00}
+    mem_limit: ${DB_MEM_LIMIT:-512M}
+    logging: *ragkb-logging
+
+  api:
+    cpus: ${API_CPUS:-1.00}
+    mem_limit: ${API_MEM_LIMIT:-384M}
+    logging: *ragkb-logging
+
+  worker:
+    cpus: ${WORKER_CPUS:-0.75}
+    mem_limit: ${WORKER_MEM_LIMIT:-512M}
+    logging: *ragkb-logging
+
+  # 可选角色仍由 base 文件的 profiles 控制，此文件不会让它们自动启动。
+  worker-summary:
+    cpus: ${WORKER_SUMMARY_CPUS:-0.25}
+    mem_limit: ${WORKER_SUMMARY_MEM_LIMIT:-192M}
+    logging: *ragkb-logging
+
+  worker-project:
+    cpus: ${WORKER_PROJECT_CPUS:-0.25}
+    mem_limit: ${WORKER_PROJECT_MEM_LIMIT:-192M}
+    logging: *ragkb-logging
+
+  worker-regression:
+    cpus: ${WORKER_REGRESSION_CPUS:-0.25}
+    mem_limit: ${WORKER_REGRESSION_MEM_LIMIT:-192M}
+    logging: *ragkb-logging
+
+  web:
+    cpus: ${WEB_CPUS:-0.25}
+    mem_limit: ${WEB_MEM_LIMIT:-64M}
+    logging: *ragkb-logging

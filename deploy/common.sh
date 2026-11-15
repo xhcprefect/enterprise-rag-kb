@@ -1,17 +1,69 @@
 #!/usr/bin/env bash
-# 由 backup.sh / restore.sh / remote-backup.sh 引入。配置文件必须由管理员维护，不能接受外部输入。
+# 由 backup.sh / restore.sh / remote-backup.sh 引入。配置文件必须由管理员维护。
+#
+# 兼容旧单环境：默认读取根 .env 中形如 KEY=VALUE 的行（保留原有 source 语义），
+# 默认使用 docker-compose.yml；ENV_FILE=/dev/null 表示不读取配置文件，仅用显式变量。
+# 同机双环境：deploy/env.sh 已规范并导出所有控制变量，本脚本不再重读配置，
+# 避免相对路径或配置中的同名变量覆盖所选环境身份；维护锁、停写与 compose exec
+# 都固定使用这套变量。
 set -euo pipefail
 umask 077
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+common_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$common_dir/.."
+explicit_environment=0
+[[ -n "${RAGKB_DEPLOY_ENVIRONMENT:-}" ]] && explicit_environment=1
 ENV_FILE=${ENV_FILE:-.env}
-[[ -f "$ENV_FILE" ]] || { echo '缺少部署环境配置' >&2; exit 1; }
-set -a; source <(grep -E '^[A-Z_]+=' "$ENV_FILE" | sed 's/[[:space:]]*$//'); set +a
+if [[ $explicit_environment -eq 0 && "$ENV_FILE" != /dev/null ]]; then
+  [[ -f "$ENV_FILE" ]] || { echo '缺少部署环境配置' >&2; exit 1; }
+  # source 兼容旧配置中的引号/转义等 shell 赋值；不回显配置内容。
+  set -a
+  # shellcheck disable=SC1090
+  source <(grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_FILE" | sed 's/[[:space:]]*$//')
+  set +a
+fi
+# shellcheck source=compose-command.sh
+source "$common_dir/compose-command.sh"
 DATA_DIR=${DATA_DIR:-./data}
 BACKUP_DIR=${BACKUP_DIR:-$DATA_DIR/backups}
 COMPOSE_FILE=${COMPOSE_FILE:-docker-compose.yml}
+BACKEND_ENV_FILE=${BACKEND_ENV_FILE:-}
+COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-}
+RAGKB_DEPLOY_ENVIRONMENT=${RAGKB_DEPLOY_ENVIRONMENT:-}
 
-# 维护停写预算：根 .env 的 WORKER_STOP_TIMEOUT_SECONDS 同时决定
+# 配置加载后统一导出：stop_writers 发现的 project 与随后 pg_dump/psql 使用的
+# project 必须是同一个，cron / backup.sh 派生的 remote-backup.sh 也继承同一身份。
+# 维护开始前由 resolve_compose_project 在父 shell 中固定解析出的 project。
+export ENV_FILE BACKEND_ENV_FILE DATA_DIR BACKUP_DIR COMPOSE_FILE RAGKB_DEPLOY_ENVIRONMENT
+export COMPOSE_PROJECT_NAME
+
+# show_maintenance_target 在调用前确定 project（父 shell 作用域），保证停写标签、
+# 提示与后续 pg_dump/psql 的 compose project 一致。显式 project 为空时 helper
+# 不传 -p，由同一份 compose config 解析顶层 name，而不是猜一个默认名字。
+resolve_compose_project() {
+  if [[ -n "$COMPOSE_PROJECT_NAME" ]]; then
+    return 0
+  fi
+  local cfg name
+  cfg=$(ragkb_compose config 2>/dev/null) \
+    || { echo '无法读取 compose 项目配置（compose config 失败）' >&2; return 1; }
+  name=$(printf '%s\n' "$cfg" \
+    | sed -n 's/^name:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
+  [[ -n "$name" ]] || { echo '无法确定 compose 项目名，拒绝在未知状态下维护' >&2; return 1; }
+  COMPOSE_PROJECT_NAME=$name
+  export COMPOSE_PROJECT_NAME
+}
+
+show_maintenance_target() {
+  resolve_compose_project || return 1
+  local environment=${RAGKB_DEPLOY_ENVIRONMENT:-legacy}
+  local files=${COMPOSE_FILE//:/,}
+  printf '[维护目标] 环境=%s 配置文件=%s project=%s 数据目录=%s 备份目录=%s 数据库=%s compose=%s\n' \
+    "$environment" "$ENV_FILE" "$COMPOSE_PROJECT_NAME" \
+    "$DATA_DIR" "$BACKUP_DIR" "${POSTGRES_DB:-ragdb}" "$files" >&2
+}
+
+# 维护停写预算：部署 .env 的 WORKER_STOP_TIMEOUT_SECONDS 同时决定
 #   1) worker 服务的 stop_grace_period（docker-compose.yml）
 #   2) 备份/恢复时 docker stop --timeout 的等待时间
 # 管理员可以配大（例如入库大文件需要更久），但必须是正整数。
@@ -27,6 +79,7 @@ API_STOP_TIMEOUT_SECONDS=${API_STOP_TIMEOUT_SECONDS:-30}
 [[ "$API_STOP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,5}$ ]] || {
   echo 'API_STOP_TIMEOUT_SECONDS 必须是 1-999999 的正整数（秒）' >&2; exit 1;
 }
+export WORKER_STOP_TIMEOUT_SECONDS API_STOP_TIMEOUT_SECONDS
 
 mkdir -p "$DATA_DIR" "$BACKUP_DIR"
 command -v flock >/dev/null || { echo '需要 flock（util-linux），拒绝无锁维护' >&2; exit 1; }
@@ -49,12 +102,12 @@ writers_stopped=0
 # 会写数据库/上传目录/项目存储的服务。历史版本只有一个 `worker`，新版本按角色拆成
 # `worker`（ingest）+ `worker-summary` + `worker-project` + `worker-regression`
 # （见 docker-compose.yml）。
-# 这里按**容器标签**识别，而不是 `docker compose config --services`：后者会隐藏
+# 这里按**容器标签**识别，而不是 `compose config --services`：后者会隐藏
 # profile 服务（worker-summary/worker-project/worker-regression），导致启用后维护时漏停。
 WRITER_CANDIDATES=(api worker worker-summary worker-project worker-regression)
 
 compose_project() {
-  if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  if [[ -n "$COMPOSE_PROJECT_NAME" ]]; then
     printf '%s' "$COMPOSE_PROJECT_NAME"
     return 0
   fi
@@ -62,8 +115,8 @@ compose_project() {
   # 必须显式捕获退出码：管道 + $(...) 会让调用方只看得到 sed/head 的成功，
   # docker 不可用/配置损坏时会被误当成“没有写服务”继续备份。
   local cfg name
-  cfg=$(docker compose -f "$COMPOSE_FILE" config 2>/dev/null) \
-    || { echo '无法读取 compose 项目配置（docker compose config 失败）' >&2; return 1; }
+  cfg=$(ragkb_compose config 2>/dev/null) \
+    || { echo '无法读取 compose 项目配置（compose config 失败）' >&2; return 1; }
   name=$(printf '%s\n' "$cfg" \
     | sed -n 's/^name:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
   printf '%s' "$name"

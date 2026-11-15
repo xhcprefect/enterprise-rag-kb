@@ -34,6 +34,10 @@ _testdata/
 backend/evaluation-results/
 compose-test.yml
 
+# 同机双环境实际配置（切勿提交凭据）
+deploy/environments/*/.env
+backend.env
+
 # 本地临时文件
 *.save
 *.orig

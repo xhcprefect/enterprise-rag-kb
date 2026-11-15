@@ -19,8 +19,8 @@ services:
       RAGKB_TRUSTED_PROXIES: ${RAGKB_TRUSTED_PROXIES:-}
     ports:
       # 覆盖基础文件里的 "${WEB_PORT}:80"：80 只保留 ACME 校验与跳转，443 承载站点。
-      - "${WEB_PORT:-80}:80"
-      - "${WEB_TLS_PORT:-443}:443"
+      - "${WEB_BIND_IP:-0.0.0.0}:${WEB_PORT:-80}:80"
+      - "${WEB_TLS_BIND_IP:-${WEB_BIND_IP:-0.0.0.0}}:${WEB_TLS_PORT:-443}:443"
     volumes:
       # 证书与私钥：仓库外目录，只读。缺变量时 compose 直接报错而不是用默认路径。
       - ${RAGKB_TLS_CERT_DIR:?HTTPS 模式必须把 RAGKB_TLS_CERT_DIR 指向仓库外的证书目录}:/etc/nginx/certs:ro

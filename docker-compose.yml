@@ -47,10 +47,10 @@ services:
     # 让它们共享同一个镜像 tag 而不是各自打一个。否则 compose 会按服务名分别 tag
     # （rag-kb-api / rag-kb-worker），构建时间不同就会留下两份指向不同代码的镜像，
     # worker 悄悄跑旧代码而 api 已是新的——之前就踩过这个坑。
-    image: rag-kb-backend:latest
+    image: ${BACKEND_IMAGE:-rag-kb-backend:latest}
     restart: unless-stopped
     env_file:
-      - ./backend/.env
+      - ${BACKEND_ENV_FILE:-./backend/.env}
     environment:
       # 覆盖 .env 里面向本机开发的连接串与相对路径。
       # API 不发布宿主端口，只接受受控内部网络；Nginx 会覆盖而非追加转发 IP。
@@ -98,7 +98,7 @@ services:
       context: ./backend
     # 与 api 同一个镜像 tag：compose 会复用同一次构建产物，
     # `docker compose build` 也只构建一次，不会再出现 api/worker 代码版本不一致。
-    image: rag-kb-backend:latest
+    image: ${BACKEND_IMAGE:-rag-kb-backend:latest}
     restart: unless-stopped
     command: ["python", "worker.py"]
     # 停写预算：与 deploy/common.sh 的 WORKER_STOP_TIMEOUT_SECONDS 同源（默认 180s）。
@@ -107,7 +107,7 @@ services:
     # 因此这里只承诺“等待上限”，不能承诺每个解析/慢流任务都在该秒数内优雅完成。
     stop_grace_period: ${WORKER_STOP_TIMEOUT_SECONDS:-180}s
     env_file:
-      - ./backend/.env
+      - ${BACKEND_ENV_FILE:-./backend/.env}
     environment:
       ENVIRONMENT: production
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
@@ -148,13 +148,13 @@ services:
   worker-summary:
     build:
       context: ./backend
-    image: rag-kb-backend:latest
+    image: ${BACKEND_IMAGE:-rag-kb-backend:latest}
     restart: unless-stopped
     profiles: ["summary"]
     command: ["python", "worker.py", "--role", "summary"]
     stop_grace_period: ${WORKER_STOP_TIMEOUT_SECONDS:-180}s
     env_file:
-      - ./backend/.env
+      - ${BACKEND_ENV_FILE:-./backend/.env}
     environment:
       ENVIRONMENT: production
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
@@ -175,13 +175,13 @@ services:
   worker-project:
     build:
       context: ./backend
-    image: rag-kb-backend:latest
+    image: ${BACKEND_IMAGE:-rag-kb-backend:latest}
     restart: unless-stopped
     profiles: ["project"]
     command: ["python", "worker.py", "--role", "project"]
     stop_grace_period: ${WORKER_STOP_TIMEOUT_SECONDS:-180}s
     env_file:
-      - ./backend/.env
+      - ${BACKEND_ENV_FILE:-./backend/.env}
     environment:
       ENVIRONMENT: production
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
@@ -208,7 +208,7 @@ services:
     build:
       context: ./backend
     # 与 api 及 ingest/summary/project worker 同一个镜像 tag，只差启动命令。
-    image: rag-kb-backend:latest
+    image: ${BACKEND_IMAGE:-rag-kb-backend:latest}
     restart: unless-stopped
     # 显式 profile：默认 `docker compose up -d` 不会启动它。
     profiles: ["regression"]
@@ -216,7 +216,7 @@ services:
     # 停写预算与 ingest/summary/project 相同，见 deploy/common.sh 的说明。
     stop_grace_period: ${WORKER_STOP_TIMEOUT_SECONDS:-180}s
     env_file:
-      - ./backend/.env
+      - ${BACKEND_ENV_FILE:-./backend/.env}
     environment:
       ENVIRONMENT: production
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ragdb}
@@ -238,13 +238,14 @@ services:
   web:
     build:
       context: ./frontend
+    image: ${FRONTEND_IMAGE:-rag-kb-web:latest}
     restart: unless-stopped
     environment:
       # 默认 HTTP；HTTPS 由 docker-compose.https.yml 覆盖为 https 并补齐其余变量。
       RAGKB_TLS_MODE: ${RAGKB_TLS_MODE:-http}
       RAGKB_TRUSTED_PROXIES: ${RAGKB_TRUSTED_PROXIES:-}
     ports:
-      - "${WEB_PORT:-80}:80"
+      - "${WEB_BIND_IP:-0.0.0.0}:${WEB_PORT:-80}:80"
     # 对外承接所有浏览器连接，同样是镜像默认的 1024 会先于 worker_connections 撞墙。
     # Nginx 主进程需要更高上限才能把 worker 的 fd 拉到 65536。
     ulimits:
